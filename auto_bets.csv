@@ -1,0 +1,2 @@
+timestamp,order_id,ticker,side,teams,market_type,pick,qualifier,ev_percent,expected_price_cents,executed_price_cents,american_odds,contracts,cost,payout,win_amount,sport,status,result,pnl,settled
+2026-01-06T23:10:30.007233,918098f6-cdb4-4300-a20e-d884ac0d8d3a,KXNBATOTAL-26JAN06DALSAC-222,yes,Dallas Mavericks @ Sacramento Kings,Total Points,Over,222.5,10.42,44,44,+118,217,99.23,217.00,117.77,NBA,executed,PENDING,0.00,False

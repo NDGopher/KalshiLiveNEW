@@ -1,0 +1,19 @@
+[Unit]
+Description=Kalshi Betting Bot
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/BBKalshiLiveDEV
+Environment="PATH=/home/ubuntu/BBKalshiLiveDEV/venv/bin"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/home/ubuntu/BBKalshiLiveDEV/venv/bin/python main.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+

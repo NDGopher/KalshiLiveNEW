@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Live odds — Kalshi Dashboard</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <style>
+        .live-odds-wrap { max-width: 1600px; margin: 0 auto; padding: 16px; }
+        .live-odds-toolbar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 16px; }
+        .live-odds-toolbar label { font-weight: 600; margin-right: 6px; }
+        .live-odds-toolbar select, .live-odds-toolbar button { padding: 6px 10px; }
+        .live-odds-meta { font-size: 0.9rem; opacity: 0.85; margin-bottom: 12px; }
+        .odds-table-wrap { overflow-x: auto; border: 1px solid #ccc; border-radius: 8px; }
+        table.live-odds { border-collapse: collapse; width: 100%; font-size: 0.85rem; }
+        table.live-odds th, table.live-odds td { border: 1px solid #ddd; padding: 6px 8px; text-align: right; }
+        table.live-odds th:first-child, table.live-odds td:first-child { text-align: left; min-width: 220px; }
+        table.live-odds tr:nth-child(even) { background: rgba(0,0,0,0.03); }
+        .best-pill { font-weight: 700; color: #0a7; }
+        .err { color: #c00; }
+    </style>
+</head>
+<body>
+    <div class="live-odds-wrap container">
+        <header style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
+            <h1>Live odds (all books)</h1>
+            <div>
+                <a href="/" class="btn btn-secondary">← Dashboard</a>
+                <a href="/control" class="btn btn-secondary">Control</a>
+            </div>
+        </header>
+        <div class="live-odds-toolbar">
+            <div>
+                <label for="sport-sel">Sport (API slug)</label>
+                <select id="sport-sel">
+                    <option value="all">All (live / list)</option>
+                    <option value="baseball">MLB (baseball)</option>
+                    <option value="icehockey">NHL (icehockey)</option>
+                    <option value="basketball">NBA (basketball)</option>
+                    <option value="americanfootball">NFL (americanfootball)</option>
+                </select>
+            </div>
+            <div>
+                <label for="timing-sel">Live / Pregame</label>
+                <select id="timing-sel">
+                    <option value="live">Live only</option>
+                    <option value="pregame">Pregame only</option>
+                    <option value="both">Both (merged)</option>
+                </select>
+            </div>
+            <div>
+                <label><input type="checkbox" id="auto-refresh" checked> Auto-refresh (5s)</label>
+            </div>
+            <button type="button" class="btn btn-primary" id="refresh-btn">Refresh now</button>
+        </div>
+        <div id="meta" class="live-odds-meta"></div>
+        <div id="err" class="err"></div>
+        <div class="odds-table-wrap">
+            <table class="live-odds" id="odds-table">
+                <thead id="odds-head"></thead>
+                <tbody id="odds-body"></tbody>
+            </table>
+        </div>
+    </div>
+    <script>
+        const sportSel = document.getElementById('sport-sel');
+        const timingSel = document.getElementById('timing-sel');
+        const autoRefresh = document.getElementById('auto-refresh');
+        const meta = document.getElementById('meta');
+        const errBox = document.getElementById('err');
+        const thead = document.getElementById('odds-head');
+        const tbody = document.getElementById('odds-body');
+
+        function fmtAm(v) {
+            if (v === null || v === undefined) return '—';
+            const n = Number(v);
+            if (!Number.isFinite(n)) return '—';
+            return (n > 0 ? '+' : '') + n;
+        }
+
+        function render(data) {
+            errBox.textContent = '';
+            if (!data.ok) {
+                errBox.textContent = data.error || 'Unknown error';
+                thead.innerHTML = '';
+                tbody.innerHTML = '';
+                return;
+            }
+            const books = data.books || [];
+            const evs = data.events || [];
+            const t = new Date((data.updated || 0) * 1000);
+            meta.textContent = `Updated ${t.toLocaleString()} · ${evs.length} event(s) · timing=${data.timing || ''} · sport=${data.sport || ''}`;
+
+            const hdr = document.createElement('tr');
+            hdr.innerHTML = '<th>Event</th><th>League</th><th>Live</th><th>Market</th>' +
+                books.map(b => `<th>${b} (H)</th><th>${b} (A)</th>`).join('') +
+                '<th>Best H</th><th>Best A</th>';
+            thead.innerHTML = '';
+            thead.appendChild(hdr);
+            tbody.innerHTML = '';
+            for (const row of evs) {
+                const tr = document.createElement('tr');
+                const pr = row.books || {};
+                let cells = `<td>${escapeHtml(row.teams || '')}</td>` +
+                    `<td>${escapeHtml(row.league || '')}</td>` +
+                    `<td>${row.live ? 'Yes' : 'No'}</td>` +
+                    `<td>${escapeHtml(row.market || '')}</td>`;
+                for (const b of books) {
+                    const p = pr[b] || {};
+                    cells += `<td>${fmtAm(p.home_am)}</td><td>${fmtAm(p.away_am)}</td>`;
+                }
+                const best = row.best || {};
+                cells += `<td class="best-pill">${escapeHtml(best.home_book || '')} ${fmtAm(best.home_am)}</td>`;
+                cells += `<td class="best-pill">${escapeHtml(best.away_book || '')} ${fmtAm(best.away_am)}</td>`;
+                tr.innerHTML = cells;
+                tbody.appendChild(tr);
+            }
+        }
+
+        function escapeHtml(s) {
+            return String(s || '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;');
+        }
+
+        async function loadOdds() {
+            const sport = sportSel.value;
+            const timing = timingSel.value;
+            const url = `/api/live_odds?sport=${encodeURIComponent(sport)}&timing=${encodeURIComponent(timing)}`;
+            const r = await fetch(url);
+            const data = await r.json();
+            render(data);
+        }
+
+        document.getElementById('refresh-btn').addEventListener('click', loadOdds);
+        sportSel.addEventListener('change', loadOdds);
+        timingSel.addEventListener('change', loadOdds);
+
+        let timer = null;
+        function bumpTimer() {
+            if (timer) clearInterval(timer);
+            timer = null;
+            if (autoRefresh.checked) {
+                timer = setInterval(loadOdds, 5000);
+            }
+        }
+        autoRefresh.addEventListener('change', bumpTimer);
+
+        loadOdds();
+        bumpTimer();
+    </script>
+</body>
+</html>

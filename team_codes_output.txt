@@ -1,0 +1,27 @@
+Traceback (most recent call last):
+  File "C:\UnifiedBetting\GeminiBot\KalshiLiveBetting\abbreviation_finder.py", line 506, in main
+    team_mapping = await extract_team_codes()
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\UnifiedBetting\GeminiBot\KalshiLiveBetting\abbreviation_finder.py", line 176, in extract_team_codes
+    print(f"\u2713 Extracted {len(sport_mapping)} team entries, {len(seen_codes)} unique codes")
+    ~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\steph\AppData\Local\Programs\Python\Python313\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2713' in position 0: character maps to <undefined>
+Unclosed client session
+client_session: <aiohttp.client.ClientSession object at 0x000001BE76C88C20>
+Unclosed connector
+connections: ['deque([(<aiohttp.client_proto.ResponseHandler object at 0x000001BE76C7DF10>, 44769.2162412)])']
+connector: <aiohttp.connector.TCPConnector object at 0x000001BE76C88D70>
+Kalshi auth initialized: Key ID = 50a41a9f..., Key loaded = Yes
+================================================================================
+ABBREVIATION FINDER - Extracting Team Codes from Kalshi API
+================================================================================
+
+[NCAAB] Extracting team codes...
+  KXNCAAMBGAME: Found 500 markets
+  KXNCAAMBSPREAD: Found 500 markets
+  KXNCAAMBTOTAL: Found 500 markets
+
+[ERROR] 'charmap' codec can't encode character '\u2713' in position 0: character maps to <undefined>

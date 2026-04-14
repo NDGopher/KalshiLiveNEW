@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bot Control Panel</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        
+        .card {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            padding: 30px;
+            margin-bottom: 20px;
+        }
+        
+        h1 {
+            color: #333;
+            margin-bottom: 10px;
+            font-size: 28px;
+        }
+        
+        .subtitle {
+            color: #666;
+            margin-bottom: 30px;
+            font-size: 14px;
+        }
+        
+        .status-section {
+            margin-bottom: 30px;
+        }
+        
+        .status-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 15px;
+            background: #f8f9fa;
+            border-radius: 10px;
+            margin-bottom: 10px;
+        }
+        
+        .status-label {
+            font-weight: 600;
+            color: #333;
+        }
+        
+        .status-value {
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-weight: 600;
+            font-size: 14px;
+        }
+        
+        .status-value.running {
+            background: #d4edda;
+            color: #155724;
+        }
+        
+        .status-value.stopped {
+            background: #f8d7da;
+            color: #721c24;
+        }
+        
+        .status-value.enabled {
+            background: #d1ecf1;
+            color: #0c5460;
+        }
+        
+        .status-value.disabled {
+            background: #fff3cd;
+            color: #856404;
+        }
+        
+        .btn {
+            padding: 14px 28px;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+            margin-right: 10px;
+            margin-bottom: 10px;
+        }
+        
+        .btn-primary {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+        
+        .btn-danger {
+            background: #dc3545;
+            color: white;
+        }
+        
+        .btn-success {
+            background: #28a745;
+            color: white;
+        }
+        
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+        }
+        
+        .btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .alert {
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            display: none;
+        }
+        
+        .alert.success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+            display: block;
+        }
+        
+        .alert.error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+            display: block;
+        }
+        
+        .alert.info {
+            background: #d1ecf1;
+            color: #0c5460;
+            border: 1px solid #bee5eb;
+            display: block;
+        }
+        
+        .links {
+            margin-top: 30px;
+            padding-top: 20px;
+            border-top: 1px solid #e0e0e0;
+        }
+        
+        .links a {
+            display: inline-block;
+            margin-right: 15px;
+            margin-bottom: 10px;
+            color: #667eea;
+            text-decoration: none;
+            font-weight: 600;
+        }
+        
+        .links a:hover {
+            text-decoration: underline;
+        }
+        
+        .token-update-link.token-expired {
+            outline: 2px solid #e53935;
+            outline-offset: 2px;
+        }
+        
+        .refresh-btn {
+            background: #6c757d;
+            color: white;
+            padding: 8px 16px;
+            font-size: 14px;
+        }
+        
+        .auto-refresh {
+            margin-top: 20px;
+            padding: 15px;
+            background: #f8f9fa;
+            border-radius: 10px;
+        }
+        
+        .auto-refresh label {
+            display: flex;
+            align-items: center;
+            cursor: pointer;
+        }
+        
+        .auto-refresh input {
+            margin-right: 10px;
+            width: 20px;
+            height: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="card">
+            <h1>🤖 Bot Control Panel</h1>
+            <p class="subtitle">Manage your betting bot from anywhere</p>
+            
+            <div id="alert" class="alert"></div>
+            
+            <div class="status-section">
+                <h2 style="margin-bottom: 15px; font-size: 20px;">Status</h2>
+                
+                <div class="status-item">
+                    <span class="status-label">Bot Service</span>
+                    <span id="bot-status" class="status-value">Loading...</span>
+                </div>
+                
+                <div class="status-item">
+                    <span class="status-label">Auto-Betting</span>
+                    <span id="auto-bet-status" class="status-value">Loading...</span>
+                </div>
+                
+                <div class="status-item">
+                    <span class="status-label">Monitor Thread</span>
+                    <span id="monitor-status" class="status-value">Loading...</span>
+                </div>
+            </div>
+            
+            <div class="status-section">
+                <h2 style="margin-bottom: 15px; font-size: 20px;">Controls</h2>
+                
+                <div style="margin-bottom: 15px;">
+                    <h3 style="font-size: 16px; margin-bottom: 10px; color: #666;">Auto-Betting</h3>
+                    <button id="enable-auto-bet-btn" class="btn btn-success">Enable Auto-Betting</button>
+                    <button id="disable-auto-bet-btn" class="btn btn-danger">Disable Auto-Betting</button>
+                </div>
+                
+                <div style="margin-bottom: 15px;">
+                    <h3 style="font-size: 16px; margin-bottom: 10px; color: #666;">Bot Service</h3>
+                    <button id="start-service-btn" class="btn btn-success">Start Bot</button>
+                    <button id="stop-service-btn" class="btn btn-danger">Stop Bot</button>
+                    <button id="restart-service-btn" class="btn btn-primary">Restart Bot</button>
+                </div>
+                
+                <button id="refresh-btn" class="btn refresh-btn">Refresh Status</button>
+            </div>
+            
+            <div class="auto-refresh">
+                <label>
+                    <input type="checkbox" id="auto-refresh-checkbox" checked>
+                    Auto-refresh status every 5 seconds
+                </label>
+            </div>
+            
+            <div class="links">
+                <a href="/">📊 Dashboard</a>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        let autoRefreshInterval = null;
+        
+        function showAlert(message, type) {
+            const alert = document.getElementById('alert');
+            alert.textContent = message;
+            alert.className = 'alert ' + type;
+            setTimeout(() => {
+                alert.className = 'alert';
+            }, 5000);
+        }
+        
+        async function updateStatus() {
+            try {
+                const response = await fetch('/api/bot_status');
+                const data = await response.json();
+                
+                // Update bot status
+                const botStatus = document.getElementById('bot-status');
+                if (data.service_running !== undefined ? data.service_running : data.running) {
+                    botStatus.textContent = 'Running';
+                    botStatus.className = 'status-value running';
+                } else {
+                    botStatus.textContent = 'Stopped';
+                    botStatus.className = 'status-value stopped';
+                }
+                
+                // Update service control buttons
+                const serviceRunning = data.service_running !== undefined ? data.service_running : data.running;
+                document.getElementById('start-service-btn').disabled = serviceRunning;
+                document.getElementById('stop-service-btn').disabled = !serviceRunning;
+                document.getElementById('restart-service-btn').disabled = false; // Can always restart
+                
+                // Update auto-bet status
+                const autoBetStatus = document.getElementById('auto-bet-status');
+                if (data.auto_bet_enabled) {
+                    autoBetStatus.textContent = 'Enabled';
+                    autoBetStatus.className = 'status-value enabled';
+                } else {
+                    autoBetStatus.textContent = 'Disabled';
+                    autoBetStatus.className = 'status-value disabled';
+                }
+                
+                // Update monitor status
+                const monitorStatus = document.getElementById('monitor-status');
+                if (data.monitor_thread_alive && data.monitor_running) {
+                    monitorStatus.textContent = 'Active';
+                    monitorStatus.className = 'status-value running';
+                } else {
+                    monitorStatus.textContent = 'Inactive';
+                    monitorStatus.className = 'status-value stopped';
+                }
+                
+                // Update button states
+                document.getElementById('enable-auto-bet-btn').disabled = data.auto_bet_enabled;
+                document.getElementById('disable-auto-bet-btn').disabled = !data.auto_bet_enabled;
+                
+            } catch (error) {
+                console.error('Error fetching status:', error);
+                showAlert('Error fetching status. Make sure the bot is running.', 'error');
+            }
+        }
+        
+        async function controlBot(action) {
+            try {
+                const response = await fetch('/api/bot_control', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ action: action })
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    showAlert(data.message, 'success');
+                    updateStatus();
+                } else {
+                    showAlert(data.error || 'Failed to control bot', 'error');
+                }
+            } catch (error) {
+                console.error('Error controlling bot:', error);
+                showAlert('Error controlling bot. Make sure the bot is running.', 'error');
+            }
+        }
+        
+        // Event listeners
+        document.getElementById('enable-auto-bet-btn').addEventListener('click', () => {
+            controlBot('enable_auto_bet');
+        });
+        
+        document.getElementById('disable-auto-bet-btn').addEventListener('click', () => {
+            controlBot('disable_auto_bet');
+        });
+        
+        document.getElementById('start-service-btn').addEventListener('click', () => {
+            if (confirm('Start the bot service? This will begin monitoring and betting.')) {
+                controlBot('start_service');
+            }
+        });
+        
+        document.getElementById('stop-service-btn').addEventListener('click', () => {
+            if (confirm('Stop the bot service? This will stop all monitoring and betting.')) {
+                controlBot('stop_service');
+            }
+        });
+        
+        document.getElementById('restart-service-btn').addEventListener('click', () => {
+            if (confirm('Restart the bot service? This will restart the entire bot.')) {
+                controlBot('restart_service');
+            }
+        });
+        
+        document.getElementById('refresh-btn').addEventListener('click', () => {
+            updateStatus();
+        });
+        
+        // Auto-refresh
+        document.getElementById('auto-refresh-checkbox').addEventListener('change', (e) => {
+            if (e.target.checked) {
+                autoRefreshInterval = setInterval(updateStatus, 5000);
+            } else {
+                if (autoRefreshInterval) {
+                    clearInterval(autoRefreshInterval);
+                    autoRefreshInterval = null;
+                }
+            }
+        });
+        
+        // Initial load
+        updateStatus();
+        
+        // Start auto-refresh if enabled
+        if (document.getElementById('auto-refresh-checkbox').checked) {
+            autoRefreshInterval = setInterval(updateStatus, 5000);
+        }
+    </script>
+</body>
+</html>
+

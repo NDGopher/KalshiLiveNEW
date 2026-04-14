@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kalshi Live Betting Dashboard</title>
+    <!-- Inline: tab row must show even if an old style.css is cached in the browser -->
+    <style>
+        .app-main-view-switcher{display:flex!important;flex-wrap:wrap;align-items:center;gap:12px 18px;padding:14px 18px 16px!important;background:#f1f5f9!important;border-top:1px solid #e2e8f0}
+        body.dark .app-main-view-switcher{background:#1a1a1a!important;border-top-color:#1e293b}
+        .app-view-tabs.app-view-tabs--prominent{display:flex!important;flex:1;min-width:min(100%,260px);gap:4px;padding:5px!important;border:2px solid #1fd59a!important;border-radius:10px;background:#fff!important;box-sizing:border-box}
+        body.dark .app-view-tabs.app-view-tabs--prominent{background:#111!important}
+        .app-view-tabs.app-view-tabs--prominent .app-view-tab{flex:1;text-align:center;font-size:1rem!important;font-weight:600;padding:12px 14px!important;min-height:46px;border:none;border-radius:8px;cursor:pointer;font-family:inherit}
+        .app-view-tabs.app-view-tabs--prominent .app-view-tab.active{color:#fff!important;background:linear-gradient(135deg,#1fd59a,#0abf7e)!important}
+        .app-view-tabs.app-view-tabs--prominent .app-view-tab:not(.active){color:#475569;background:transparent}
+        body.dark .app-view-tabs.app-view-tabs--prominent .app-view-tab:not(.active){color:#cbd5e1}
+        .app-main-view-switcher-label{font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#0a8f6a;flex-shrink:0}
+        body.dark .app-main-view-switcher-label{color:#1fd59a}
+        .dashboard-ui-fingerprint{width:100%;margin:0;padding:8px 18px 12px;font-size:11px;line-height:1.4;color:#64748b;font-family:ui-monospace,Consolas,monospace;border-top:1px dashed #cbd5e1;background:#fff}
+        body.dark .dashboard-ui-fingerprint{color:#94a3b8;background:#111}
+    </style>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=6">
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+</head>
+<body>
+    <div class="container">
+        <div class="app-top-sticky-wrap">
+            <header class="app-header">
+                <div class="app-header-main">
+                    <h1 class="app-header-title">⚡ Kalshi Live Betting</h1>
+                </div>
+                <div class="header-right">
+                    <div class="status">
+                        <span id="status-indicator" class="status-dot"></span>
+                        <span id="status-text">Connecting...</span>
+                    </div>
+                    <a href="/control" class="btn-icon" title="Control Panel" style="text-decoration: none; margin-right: 5px;">
+                        <span>⚙️</span>
+                    </a>
+                    <a href="/logs" class="btn-icon" title="View Logs" style="text-decoration: none; margin-right: 5px;">
+                        <span>📋</span>
+                    </a>
+                    <a href="/failed-bets" class="btn-icon" title="Failed Auto-Bets" style="text-decoration: none; margin-right: 5px;">
+                        <span>❌</span>
+                    </a>
+                    <button id="dark-mode-toggle" class="btn-icon" title="Toggle dark mode">
+                        <span id="dark-mode-icon">🌙</span>
+                    </button>
+                </div>
+            </header>
+            <nav class="app-main-view-switcher" role="tablist" aria-label="Switch between betting dashboard and odds board">
+                <span class="app-main-view-switcher-label">Switch view</span>
+                <div class="app-view-tabs app-view-tabs--prominent">
+                    <button type="button" role="tab" aria-selected="true" id="tab-btn-dashboard" class="app-view-tab active">Betting dashboard</button>
+                    <button type="button" role="tab" aria-selected="false" id="tab-btn-odds" class="app-view-tab">Live odds board</button>
+                </div>
+            </nav>
+            <p class="dashboard-ui-fingerprint" id="kalshi-dashboard-ui-fingerprint" title="Shown only on the latest dashboard template. If missing, you are not loading this server’s HTML.">
+                Server UI <strong>{{ dashboard_ui_build }}</strong>
+                · request <code>{{ request_correlation }}</code>
+            </p>
+        </div>
+
+        <div id="panel-alerts" class="dashboard-main-panel">
+        <details class="controls-wrapper">
+            <summary class="controls-toggle">
+                <span>Settings</span>
+                <span class="toggle-arrow">▼</span>
+            </summary>
+        <div class="controls">
+            <div class="controls-top">
+                <button id="refresh-btn" class="btn btn-secondary">Refresh</button>
+                <div class="filter-selection-setting">
+                    <div class="filter-group">
+                        <label>Dashboard Filters:</label>
+                        <div id="dashboard-filters-checkboxes" class="filter-checkboxes">
+                            <!-- Populated by JavaScript -->
+                        </div>
+                    </div>
+                    <div style="flex: 1;"></div>
+                    <button id="save-filter-selection-btn" class="btn btn-primary">Save Filters</button>
+                </div>
+            </div>
+            <div class="controls-bottom">
+                <div class="settings-row">
+                    <div class="max-bet-setting">
+                        <label for="max-bet-input">Max Bet: $</label>
+                        <input type="number" id="max-bet-input" class="max-bet-input" value="200" min="1" step="1">
+                        <button id="set-max-bet-btn" class="btn btn-secondary">Set</button>
+                    </div>
+                    <div class="filter-setting">
+                        <label for="min-ev-input">Min EV: </label>
+                        <input type="number" id="min-ev-input" class="filter-input" value="0" min="0" max="100" step="0.1">
+                        <span>%</span>
+                        <button id="set-filters-btn" class="btn btn-secondary">Update Filters</button>
+                    </div>
+                    <div class="portfolio">
+                        <span>Balance: $<span id="balance">--</span></span>
+                    </div>
+                </div>
+                <details class="auto-bet-setting">
+                    <summary class="auto-bet-header">
+                        <label class="auto-bet-toggle-label">
+                            <input type="checkbox" id="auto-bet-enabled" class="auto-bet-toggle">
+                            <span>Auto-Bet</span>
+                        </label>
+                    </summary>
+                    <div id="auto-bet-config" class="auto-bet-config">
+                        <!-- Per-filter auto-bet settings will be dynamically generated here -->
+                        <div id="per-filter-auto-bet-settings"></div>
+                        <div class="auto-bet-row" style="grid-column: 1 / -1; margin-top: 15px; padding-top: 15px; border-top: 1px solid #ddd;">
+                            <label>NHL Overs Amount (Shared): $</label>
+                            <input type="number" id="auto-bet-nhl-overs-amount" class="auto-bet-input" value="200" min="1" step="1">
+                            <label style="margin-left: 20px;">ProphetX + Novig Multiplier: </label>
+                            <input type="number" id="auto-bet-px-novig-multiplier" class="auto-bet-input" value="2.0" min="1" max="10" step="0.1" title="Multiplier applied when both ProphetX and Novig are in devig books (e.g., 2.0 = 2.0x bet size)">
+                            <button id="save-auto-bet-btn" class="btn btn-primary">Save All Settings</button>
+                        </div>
+                    </div>
+                </details>
+            </div>
+        </div>
+        </details>
+
+        <!-- Toast notification container -->
+        <div id="toast-container" class="toast-container"></div>
+
+        <div class="alerts-container">
+            <h2>Live Alerts</h2>
+            <div id="alerts-list" class="alerts-list">
+                <div class="loading">Loading alerts...</div>
+            </div>
+        </div>
+        </div>
+
+        <div id="panel-odds" class="dashboard-main-panel" hidden>
+            <div class="pto-odds-board">
+            <div class="odds-screen-toolbar">
+                <div class="odds-screen-field">
+                    <label for="odds-sport-sel">Sport</label>
+                    <select id="odds-sport-sel">
+                        <option value="all">All sports</option>
+                        <option value="baseball">MLB (baseball)</option>
+                        <option value="icehockey">NHL (icehockey)</option>
+                        <option value="basketball">NBA (basketball)</option>
+                        <option value="americanfootball">NFL (americanfootball)</option>
+                        <option value="soccer">Soccer</option>
+                        <option value="tennis">Tennis</option>
+                    </select>
+                </div>
+                <div class="odds-screen-field">
+                    <label for="odds-timing-sel">Schedule</label>
+                    <select id="odds-timing-sel">
+                        <option value="live">Live only</option>
+                        <option value="pregame">Pregame only</option>
+                        <option value="both">Live + pregame</option>
+                    </select>
+                </div>
+                <div class="odds-screen-field">
+                    <label for="odds-date-sel">Pregame date</label>
+                    <select id="odds-date-sel" title="Applies when Schedule is Pregame or Live + pregame">
+                        <option value="all">All upcoming</option>
+                        <option value="today">Today</option>
+                        <option value="tomorrow">Tomorrow</option>
+                    </select>
+                </div>
+                <div class="odds-screen-field">
+                    <label><input type="checkbox" id="odds-auto-refresh" checked> Auto-refresh (6s)</label>
+                </div>
+                <button type="button" class="btn btn-primary" id="odds-refresh-btn">Refresh</button>
+            </div>
+            <p id="odds-meta" class="odds-screen-meta"></p>
+            <p id="odds-error" class="odds-screen-error"></p>
+            <div class="odds-table-scroll">
+                <table class="odds-screen-table" id="odds-screen-table">
+                    <thead id="odds-table-head"></thead>
+                    <tbody id="odds-table-body"></tbody>
+                </table>
+            </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='script.js') }}?v=6"></script>
+</body>
+</html>
+

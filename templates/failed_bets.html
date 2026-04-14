@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Failed Auto-Bets</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <style>
+        .failed-bets-container {
+            max-width: 1600px;
+            margin: 0 auto;
+            padding: 24px;
+        }
+        
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 24px;
+            padding: 20px;
+            background: var(--bg-secondary);
+            border-radius: 12px;
+            box-shadow: 0 4px 6px var(--shadow);
+        }
+        
+        .header h1 {
+            color: var(--text-primary);
+            font-size: 24px;
+            font-weight: 700;
+        }
+        
+        .header-actions {
+            display: flex;
+            gap: 12px;
+        }
+        
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 8px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        
+        .btn-primary {
+            background: linear-gradient(135deg, var(--accent) 0%, var(--accent-dark) 100%);
+            color: white;
+        }
+        
+        .btn-secondary {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            border: 1px solid var(--border);
+        }
+        
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px var(--shadow-hover);
+        }
+        
+        .failed-bet-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 16px;
+            box-shadow: 0 2px 4px var(--shadow);
+            transition: all 0.3s ease;
+        }
+        
+        .successful-bet-card {
+            background: var(--bg-secondary);
+            border: 1px solid #00ff88;
+            border-left: 4px solid #00ff88;
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 16px;
+            box-shadow: 0 2px 4px var(--shadow);
+            transition: all 0.3s ease;
+        }
+        
+        .failed-bet-card:hover, .successful-bet-card:hover {
+            box-shadow: 0 4px 12px var(--shadow);
+        }
+        
+        .bet-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 16px;
+            padding-bottom: 12px;
+            border-bottom: 1px solid var(--border);
+        }
+        
+        .bet-info {
+            flex: 1;
+        }
+        
+        .bet-title {
+            font-size: 18px;
+            font-weight: 700;
+            color: var(--text-primary);
+            margin-bottom: 8px;
+        }
+        
+        .bet-meta {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 16px;
+            font-size: 13px;
+            color: var(--text-secondary);
+        }
+        
+        .bet-meta-item {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+        
+        .bet-meta-label {
+            font-weight: 600;
+            color: var(--text-tertiary);
+        }
+        
+        .bet-error {
+            background: rgba(255, 68, 68, 0.1);
+            border-left: 4px solid #ff4444;
+            padding: 12px;
+            border-radius: 6px;
+            margin-bottom: 16px;
+        }
+        
+        .bet-success {
+            background: rgba(0, 255, 136, 0.1);
+            border-left: 4px solid #00ff88;
+            padding: 12px;
+            border-radius: 6px;
+            margin-bottom: 16px;
+        }
+        
+        .bet-success-title {
+            font-size: 16px;
+            font-weight: 700;
+            color: #00ff88;
+            margin-bottom: 4px;
+        }
+        
+        .bet-success-reason {
+            font-size: 13px;
+            color: var(--text-secondary);
+            margin-top: 4px;
+            margin: 12px 0;
+        }
+        
+        .bet-error-title {
+            font-weight: 700;
+            color: #ff4444;
+            margin-bottom: 4px;
+        }
+        
+        .bet-error-reason {
+            color: var(--text-secondary);
+            font-size: 13px;
+        }
+        
+        .bet-details {
+            margin-top: 16px;
+        }
+        
+        .details-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 12px;
+            margin-bottom: 16px;
+        }
+        
+        .detail-item {
+            padding: 10px;
+            background: var(--bg-tertiary);
+            border-radius: 6px;
+        }
+        
+        .detail-label {
+            font-size: 11px;
+            font-weight: 600;
+            color: var(--text-tertiary);
+            text-transform: uppercase;
+            margin-bottom: 4px;
+        }
+        
+        .detail-value {
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+        
+        .logs-section {
+            margin-top: 16px;
+        }
+        
+        .logs-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+        
+        .logs-title {
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+        
+        .copy-btn {
+            padding: 6px 12px;
+            font-size: 12px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            cursor: pointer;
+            color: var(--text-primary);
+        }
+        
+        .copy-btn:hover {
+            background: var(--bg-secondary);
+            border-color: var(--accent);
+        }
+        
+        .logs-content {
+            background: #1a1a1a;
+            color: #e0e0e0;
+            padding: 16px;
+            border-radius: 8px;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            line-height: 1.6;
+            max-height: 400px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+        
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: var(--text-tertiary);
+        }
+        
+        .empty-state-icon {
+            font-size: 48px;
+            margin-bottom: 16px;
+        }
+        
+        .timestamp {
+            font-size: 12px;
+            color: var(--text-tertiary);
+        }
+        
+        @media (max-width: 768px) {
+            .header {
+                flex-direction: column;
+                gap: 12px;
+                align-items: stretch;
+            }
+            
+            .header-actions {
+                width: 100%;
+            }
+            
+            .btn {
+                flex: 1;
+            }
+            
+            .bet-header {
+                flex-direction: column;
+            }
+            
+            .details-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="failed-bets-container">
+        <div class="header">
+            <div>
+                <h1>❌ Failed Auto-Bets & ✅ Successful Auto-Bets</h1>
+                <p style="color: var(--text-secondary); font-size: 14px; margin-top: 4px;">
+                    Last 100 failed and successful auto-bet attempts with full diagnostic logs and timing comparisons
+                </p>
+            </div>
+            <div class="header-actions">
+                <a href="/" class="btn btn-secondary" style="text-decoration: none; display: inline-block;">← Dashboard</a>
+                <button class="btn btn-secondary" onclick="refreshFailedBets()">🔄 Refresh</button>
+                <button class="btn btn-primary" onclick="clearFailedBets()">🗑️ Clear All</button>
+            </div>
+        </div>
+        
+        <div class="bets-container" style="display: grid; grid-template-columns: 1fr 1fr; gap: 24px;">
+            <div class="bets-column">
+                <div class="column-header" style="background: rgba(255, 68, 68, 0.1); border-left: 4px solid #ff4444; padding: 16px; border-radius: 8px; margin-bottom: 16px;">
+                    <h2 style="margin: 0; color: #ff4444; font-size: 20px;">❌ Failed Auto-Bets</h2>
+                    <p style="margin: 4px 0 0 0; color: var(--text-secondary); font-size: 14px;">Count: <span id="failed-count">0</span></p>
+                </div>
+                <div id="failed-bets-list">
+                    <div class="loading">Loading failed bets...</div>
+                </div>
+            </div>
+            <div class="bets-column">
+                <div class="column-header" style="background: rgba(0, 255, 136, 0.1); border-left: 4px solid #00ff88; padding: 16px; border-radius: 8px; margin-bottom: 16px;">
+                    <h2 style="margin: 0; color: #00ff88; font-size: 20px;">✅ Successful Auto-Bets</h2>
+                    <p style="margin: 4px 0 0 0; color: var(--text-secondary); font-size: 14px;">Count: <span id="successful-count">0</span></p>
+                </div>
+                <div id="successful-bets-list">
+                    <div class="loading">Loading successful bets...</div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        let failedBets = [];
+        let successfulBets = [];
+        
+        async function loadFailedBets() {
+            try {
+                console.log('[FAILED-BETS] Fetching data from /api/failed_bets...');
+                const response = await fetch('/api/failed_bets');
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                }
+                const data = await response.json();
+                console.log('[FAILED-BETS] Received data:', {
+                    failed_count: (data.failed_bets || []).length,
+                    successful_count: (data.successful_bets || []).length,
+                    failed_sample: (data.failed_bets || []).slice(0, 2),
+                    successful_sample: (data.successful_bets || []).slice(0, 2)
+                });
+                failedBets = data.failed_bets || [];
+                successfulBets = data.successful_bets || [];
+                console.log('[FAILED-BETS] Setting arrays:', {
+                    failedBets_length: failedBets.length,
+                    successfulBets_length: successfulBets.length
+                });
+                renderFailedBets();
+            } catch (error) {
+                console.error('[FAILED-BETS] Error loading failed bets:', error);
+                document.getElementById('failed-bets-list').innerHTML = 
+                    '<div class="empty-state"><div class="empty-state-icon">⚠️</div><p>Error loading failed bets: ' + escapeHtml(error.message) + '</p></div>';
+            }
+        }
+        
+        function renderFailedBets() {
+            console.log('[FAILED-BETS] renderFailedBets called:', {
+                failedBets_length: failedBets.length,
+                successfulBets_length: successfulBets.length
+            });
+            const failedContainer = document.getElementById('failed-bets-list');
+            const successfulContainer = document.getElementById('successful-bets-list');
+            
+            // Update counts
+            document.getElementById('failed-count').textContent = failedBets.length;
+            document.getElementById('successful-count').textContent = successfulBets.length;
+            
+            // Sort by timestamp (most recent first)
+            const sortedFailed = [...failedBets].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+            const sortedSuccessful = [...successfulBets].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+            
+            // Render failed bets
+            if (sortedFailed.length === 0) {
+                failedContainer.innerHTML = `
+                    <div class="empty-state">
+                        <div class="empty-state-icon">✅</div>
+                        <h2>No Failed Bets</h2>
+                        <p>All auto-bet attempts have been successful!</p>
+                    </div>
+                `;
+            } else {
+                failedContainer.innerHTML = sortedFailed.map((bet, index) => {
+                    return renderBetCard(bet, index, 'failed');
+                }).join('');
+            }
+            
+            // Render successful bets
+            if (sortedSuccessful.length === 0) {
+                successfulContainer.innerHTML = `
+                    <div class="empty-state">
+                        <div class="empty-state-icon">📊</div>
+                        <h2>No Successful Bets</h2>
+                        <p>No successful auto-bets have been recorded yet.</p>
+                    </div>
+                `;
+            } else {
+                successfulContainer.innerHTML = sortedSuccessful.map((bet, index) => {
+                    return renderBetCard(bet, index, 'successful');
+                }).join('');
+            }
+        }
+        
+        function renderBetCard(bet, index, type) {
+            const timestamp = new Date(bet.timestamp).toLocaleString();
+            const evDisplay = bet.ev_percent !== undefined ? `${bet.ev_percent.toFixed(2)}%` : 'N/A';
+            const oddsDisplay = bet.odds || 'N/A';
+            const expectedPriceDisplay = bet.expected_price !== undefined ? `${bet.expected_price}¢ (${(bet.expected_price/100).toFixed(2)}¢)` : 'N/A';
+            const currentPriceDisplay = bet.current_price !== undefined ? `${bet.current_price}¢ (${(bet.current_price/100).toFixed(2)}¢)` : 'N/A';
+            const executedPriceDisplay = bet.executed_price !== undefined ? `${bet.executed_price}¢ (${(bet.executed_price/100).toFixed(2)}¢)` : 'N/A';
+            const deltaDisplay = bet.price_delta !== undefined ? `${bet.price_delta > 0 ? '+' : ''}${bet.price_delta}¢` : 'N/A';
+            
+            // Get timing info
+            const timings = bet.trade_timings || {};
+            const totalTime = timings.total_trade_duration_ms !== undefined && timings.total_trade_duration_ms !== 'N/A' ? `${timings.total_trade_duration_ms.toFixed(1)}ms` : 'N/A';
+            const lockTime = timings.lock_acquisition_ms !== undefined && timings.lock_acquisition_ms !== 'N/A' ? `${timings.lock_acquisition_ms.toFixed(1)}ms` : 'N/A';
+            const lockHeldTime = timings.lock_held_duration_ms !== undefined && timings.lock_held_duration_ms !== 'N/A' ? `${timings.lock_held_duration_ms.toFixed(1)}ms` : 'N/A';
+            const rmTime = timings.reverse_middle_check_ms !== undefined && timings.reverse_middle_check_ms !== 'N/A' ? `${timings.reverse_middle_check_ms.toFixed(1)}ms` : 'N/A';
+            const orderTime = timings.order_placement_api_ms !== undefined && timings.order_placement_api_ms !== 'N/A' ? `${timings.order_placement_api_ms.toFixed(1)}ms` : 'N/A';
+            
+            // Build comprehensive logs text with ALL available information
+            const prefix = type === 'successful' ? '[SUCCESSFUL AUTO-BET]' : '[FAILED AUTO-BET]';
+            const logs = [
+                `${prefix} ${bet.timestamp}`,
+                `Alert ID: ${bet.alert_id}`,
+                `Teams: ${bet.teams}`,
+                `Pick: ${bet.pick}`,
+                `Market Type: ${bet.market_type}`,
+                `Qualifier: ${bet.qualifier}`,
+                `EV: ${evDisplay}`,
+                `Odds: ${oddsDisplay}`,
+                `Filter: ${bet.filter_name}`,
+                ``,
+                `Ticker: ${bet.ticker}`,
+                `Side: ${bet.side}`,
+                `Expected Price: ${expectedPriceDisplay}`,
+                type === 'successful' ? `Executed Price: ${executedPriceDisplay}` : `Current Price: ${currentPriceDisplay}`,
+                `Price Delta: ${deltaDisplay}`,
+                ``,
+                `========== TIMING BREAKDOWN ==========`,
+                `Total trade time: ${totalTime}`,
+                `Lock acquisition: ${lockTime}`,
+                `Lock held duration: ${lockHeldTime}`,
+                `Reverse middle check: ${rmTime}`,
+                `Order placement API: ${orderTime}`,
+                `=====================================`,
+                ``,
+                type === 'successful' ? `✅ SUCCESS` : `Error: ${bet.error || 'Unknown error'}`,
+                bet.reason ? `Reason: ${bet.reason}` : '',
+                ...(bet.additional_logs || [])
+            ].filter(line => line !== '').join('\n');
+            
+            const cardClass = type === 'successful' ? 'successful-bet-card' : 'failed-bet-card';
+            const icon = type === 'successful' ? '✅' : '❌';
+            const titleClass = type === 'successful' ? 'bet-success-title' : 'bet-error-title';
+            
+            return `
+                    <div class="${cardClass}">
+                        <div class="bet-header">
+                            <div class="bet-info">
+                                <div class="bet-title">${escapeHtml(bet.teams)} - ${escapeHtml(bet.pick)}</div>
+                                <div class="bet-meta">
+                                    <div class="bet-meta-item">
+                                        <span class="bet-meta-label">EV:</span>
+                                        <span>${evDisplay}</span>
+                                    </div>
+                                    <div class="bet-meta-item">
+                                        <span class="bet-meta-label">Odds:</span>
+                                        <span>${oddsDisplay}</span>
+                                    </div>
+                                    <div class="bet-meta-item">
+                                        <span class="bet-meta-label">Filter:</span>
+                                        <span>${escapeHtml(bet.filter_name)}</span>
+                                    </div>
+                                    <div class="bet-meta-item">
+                                        <span class="bet-meta-label">Time:</span>
+                                        <span class="timestamp">${timestamp}</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        ${type === 'successful' ? `
+                        <div class="bet-success">
+                            <div class="bet-success-title">✅ SUCCESS - Bet Placed</div>
+                            ${bet.reason ? `<div class="bet-success-reason">${escapeHtml(bet.reason)}</div>` : ''}
+                        </div>
+                        ` : `
+                        <div class="bet-error">
+                            <div class="bet-error-title">❌ ${escapeHtml(bet.error || 'Unknown error')}</div>
+                            ${bet.reason ? `<div class="bet-error-reason">${escapeHtml(bet.reason)}</div>` : ''}
+                        </div>
+                        `}
+                        
+                        <div class="bet-details">
+                            <div class="details-grid">
+                                <div class="detail-item">
+                                    <div class="detail-label">Ticker</div>
+                                    <div class="detail-value">${escapeHtml(bet.ticker)}</div>
+                                </div>
+                                <div class="detail-item">
+                                    <div class="detail-label">Side</div>
+                                    <div class="detail-value">${escapeHtml(bet.side)}</div>
+                                </div>
+                                <div class="detail-item">
+                                    <div class="detail-label">Market Type</div>
+                                    <div class="detail-value">${escapeHtml(bet.market_type)}</div>
+                                </div>
+                                <div class="detail-item">
+                                    <div class="detail-label">Qualifier</div>
+                                    <div class="detail-value">${escapeHtml(bet.qualifier)}</div>
+                                </div>
+                                ${bet.expected_price !== undefined ? `
+                                <div class="detail-item">
+                                    <div class="detail-label">Expected Price</div>
+                                    <div class="detail-value">${expectedPriceDisplay}</div>
+                                </div>
+                                ` : ''}
+                                ${bet.current_price !== undefined ? `
+                                <div class="detail-item">
+                                    <div class="detail-label">Current Price</div>
+                                    <div class="detail-value">${currentPriceDisplay}</div>
+                                </div>
+                                ` : ''}
+                                ${bet.price_delta !== undefined ? `
+                                <div class="detail-item">
+                                    <div class="detail-label">Price Delta</div>
+                                    <div class="detail-value" style="color: ${bet.price_delta > 0 ? '#ff4444' : '#00ff88'}">${deltaDisplay}</div>
+                                </div>
+                                ` : ''}
+                            </div>
+                        </div>
+                        
+                        <div class="logs-section">
+                            <div class="logs-header">
+                                <div class="logs-title">📋 Full Logs (Click to Copy)</div>
+                                <button class="copy-btn" data-type="${type}" data-index="${index}" onclick="copyLogs(this.dataset.type, parseInt(this.dataset.index))">📋 Copy Logs</button>
+                            </div>
+                            <div class="logs-content" id="logs-${type}-${index}" data-type="${type}" data-index="${index}" onclick="selectLogs(this.dataset.type, parseInt(this.dataset.index))">${escapeHtml(logs)}</div>
+                        </div>
+                    </div>
+                `;
+        }
+        
+        function escapeHtml(text) {
+            if (text === null || text === undefined) return 'N/A';
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+        
+        function copyLogs(type, index) {
+            const logsElement = document.getElementById(`logs-${type}-${index}`);
+            const text = logsElement.textContent;
+            
+            navigator.clipboard.writeText(text).then(() => {
+                const btn = document.querySelector(`#logs-${type}-${index}`).parentElement.querySelector('.copy-btn');
+                const originalText = btn.textContent;
+                btn.textContent = '✅ Copied!';
+                btn.style.background = 'var(--accent)';
+                btn.style.color = 'white';
+                setTimeout(() => {
+                    btn.textContent = originalText;
+                    btn.style.background = '';
+                    btn.style.color = '';
+                }, 2000);
+            }).catch(err => {
+                console.error('Failed to copy:', err);
+                // Fallback: select text for manual copy
+                selectLogs(type, index);
+                alert('Clipboard API failed. Text selected - press Ctrl+C to copy.');
+            });
+        }
+        
+        function selectLogs(type, index) {
+            const logsElement = document.getElementById(`logs-${type}-${index}`);
+            const range = document.createRange();
+            range.selectNodeContents(logsElement);
+            const selection = window.getSelection();
+            selection.removeAllRanges();
+            selection.addRange(range);
+        }
+        
+        async function refreshFailedBets() {
+            await loadFailedBets();
+        }
+        
+        async function clearFailedBets() {
+            if (!confirm('Are you sure you want to clear all failed bet records?')) {
+                return;
+            }
+            
+            try {
+                const response = await fetch('/api/clear_failed_bets', {
+                    method: 'POST'
+                });
+                const data = await response.json();
+                if (data.success) {
+                    failedBets = [];
+                    renderFailedBets();
+                }
+            } catch (error) {
+                console.error('Error clearing failed bets:', error);
+                alert('Failed to clear failed bets');
+            }
+        }
+        
+        // Load on page load
+        loadFailedBets();
+        
+        // Auto-refresh every 10 seconds
+        setInterval(loadFailedBets, 10000);
+    </script>
+</body>
+</html>
