@@ -48,6 +48,20 @@ function priceToAmericanOdds(priceCents) {
     }
 }
 
+/** Odds-API limit / stake on Kalshi row (USD); show — when unknown. */
+function formatLiquidityUsd(n) {
+    const x = Number(n);
+    if (!x || x <= 0 || Number.isNaN(x)) return '—';
+    if (x < 10000) return `$${Math.round(x)}`;
+    return `$${(x / 1000).toFixed(1)}k`;
+}
+
+function toTitleCaseWords(s) {
+    const t = String(s || '').trim();
+    if (!t) return '';
+    return t.replace(/\w\S*/g, (w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase());
+}
+
 // DOM elements
 const statusIndicator = document.getElementById('status-indicator');
 const statusText = document.getElementById('status-text');
@@ -83,6 +97,8 @@ socket.on('connect', () => {
     fetchPortfolio();
     loadFilterSettings();
     loadAutoBetSettings();
+    loadAlertFeedPrefs();
+    loadBroadScanPregame();
 });
 
 socket.on('disconnect', () => {
@@ -456,7 +472,7 @@ socket.on('alert_update', (data) => {
                     // Update liquidity display if it exists
                     const liquidityEl = alertCard.querySelector('.liquidity, .kalshi-liquidity');
                     if (liquidityEl) {
-                        liquidityEl.textContent = `$${(newLiq / 1000).toFixed(1)}k`;
+                        liquidityEl.textContent = formatLiquidityUsd(newLiq);
                     }
                 }
             }
@@ -525,11 +541,23 @@ const bookLogos = {
     'Polymarket': '/logos/poly.png'  // For future use
 };
 
+/** Loose match so API keys like "Circa Sports" align with devig list "Circa". */
+function bookMatchesDevigOrSharp(bookName, devigList, sharpList) {
+    const n = String(bookName || '').toLowerCase().replace(/[\s.]+/g, '');
+    const lists = [...(devigList || []), ...(sharpList || [])];
+    return lists.some((u) => {
+        const uu = String(u || '').toLowerCase().replace(/[\s.]+/g, '');
+        if (!uu) return false;
+        return n.includes(uu) || uu.includes(n) || n === uu;
+    });
+}
+
 // Create alert card element (live multi-book layout)
 function createAlertCard(alert) {
     const card = document.createElement('div');
-    // Add high-ev class for alerts with EV >= 8%
-    const evClass = (alert.ev_percent || 0) >= 8.0 ? 'high-ev' : '';
+    const evN = Number(alert.ev_percent) || 0;
+    const strictOk = alert.strict_pass !== false;
+    const evClass = strictOk && evN >= 8.0 && evN <= 20.0 ? 'high-ev' : '';
     card.className = `alert-card new ${evClass}`;
     card.setAttribute('data-alert-id', alert.id);
     
@@ -545,7 +573,7 @@ function createAlertCard(alert) {
     const evDisplay = `${alert.ev_percent >= 0 ? '+' : ''}${alert.ev_percent.toFixed(2)}%`;
     
     // Get Kalshi price (our betting book) - use display_books if available, otherwise fallback
-    const kalshiLiquidity = alert.liquidity ? `$${(alert.liquidity / 1000).toFixed(1)}k` : '$0';
+    const liqBadge = formatLiquidityUsd(alert.liquidity);
     
     // Build book prices table if display_books data is available
     let booksTableHtml = '';
@@ -555,10 +583,6 @@ function createAlertCard(alert) {
         // Get the selection we're betting on
         const ourSelection = alert.pick;
         const ourBooks = alert.display_books[ourSelection] || [];
-        
-        // Get sharp books from filter (books used for EV calculation)
-        const sharpBooks = alert.sharp_books || [];
-        const sharpBookNames = new Set(sharpBooks);
         
         // Find Kalshi book first to get actual Kalshi odds for comparison
         const kalshiBook = ourBooks.find(book => (book.book || 'Unknown') === 'Kalshi');
@@ -576,11 +600,8 @@ function createAlertCard(alert) {
             }
         }
         
-        // Only show: Kalshi + sharp books from filter
-        const booksToShow = ourBooks.filter(book => {
-            const bookName = book.book || 'Unknown';
-            return bookName === 'Kalshi' || sharpBookNames.has(bookName);
-        });
+        // Kalshi + every book that participated in devig (devig_books) or is configured sharp
+        const booksToShow = ourBooks;
         
         if (booksToShow.length > 0) {
             booksTableHtml = '<div class="books-table"><div class="books-header">';
@@ -588,14 +609,13 @@ function createAlertCard(alert) {
                 const bookName = book.book || 'Unknown';
                 const bookOdds = book.odds || 0;
                 const bookLimit = book.limit || 0;
-                const bookLimitDisplay = bookLimit ? `$${(bookLimit / 1000).toFixed(1)}k` : '';
+                const bookLimitDisplay = bookLimit ? formatLiquidityUsd(bookLimit) : '';
                 const bookLogoPath = bookLogos[bookName];
                 const bookLogoText = bookName.substring(0, 2).toUpperCase();  // Fallback text if no logo
                 const isKalshi = bookName === 'Kalshi';
-                const isSharpBook = sharpBookNames.has(bookName);
-                
-                // Gray out if not Kalshi and not a sharp book (shouldn't happen due to filter, but safety check)
-                let isGrayedOut = !isKalshi && !isSharpBook;
+                const usedForLine =
+                    isKalshi || bookMatchesDevigOrSharp(bookName, alert.devig_books, alert.sharp_books);
+                let isGrayedOut = !usedForLine;
                 
                 // Check if this book has BETTER odds than Kalshi (for red outline)
                 // Red box = book is BETTER than Kalshi (we're missing out on a better price)
@@ -650,19 +670,41 @@ function createAlertCard(alert) {
     
     // Get filter name (if available)
     const filterName = alert.filter_name || '';
-    const filterNameDisplay = filterName ? `<div class="filter-name-badge" style="position: absolute; top: 4px; right: 4px; background: rgba(0, 255, 136, 0.2); color: #00ff88; padding: 3px 6px; border-radius: 4px; font-size: 10px; font-weight: 600; border: 1px solid rgba(0, 255, 136, 0.3); z-index: 10;">${escapeHtml(filterName)}</div>` : '';
-    
+    const filterNameDisplay = filterName
+        ? `<div class="filter-name-badge-block">${escapeHtml(filterName)}</div>`
+        : '';
+    const evSrc = alert.ev_source || 'odds_api_value_bets';
+    let evSourceLabel = '';
+    let evSourceTitle = '';
+    if (evSrc === 'local_odds_scan') {
+        evSourceLabel = 'Local scan';
+        evSourceTitle = 'Candidate from event/odds scan; EV from your devig rules.';
+    } else if (evSrc === 'live_event_scan') {
+        evSourceLabel = 'Scan + devig';
+        evSourceTitle =
+            'Row from live/pregame odds scan; EV uses multi-sharp fair (POWER with relaxed fallback on heavy favorites) vs Kalshi.';
+    } else {
+        evSourceLabel = 'Value-bet + devig';
+        evSourceTitle = 'Candidate from Odds-API /value-bets; EV from your multi-sharp devig vs Kalshi.';
+    }
+    const mt = (alert.market_type || '').trim();
+    const marketTitle = mt ? toTitleCaseWords(mt) : 'Market';
+
     card.innerHTML = `
-        <div class="alert-header-bb" style="position: relative;">
-            ${filterNameDisplay}
-            <div class="alert-main-info">
-                <div class="market-type-bb">${escapeHtml(alert.market_type)}</div>
+        <div class="alert-header-bb alert-header-bb--grid">
+            <div class="alert-header-main-col">
+                <div class="market-row-bb">
+                    <span class="market-type-bb">${escapeHtml(marketTitle)}</span>
+                    <span class="alert-liq-badge" title="Kalshi line limit / stake from Odds-API (if provided)">Liq ${escapeHtml(liqBadge)}</span>
+                    <span class="ev-source-sub" title="${escapeHtml(evSourceTitle)}">${escapeHtml(evSourceLabel)}</span>
+                </div>
                 <div class="teams-bb">${escapeHtml(alert.teams)}</div>
                 <div class="ev-display-left">
                     <div class="ev-value ${alert.ev_percent >= 0 ? 'positive' : 'negative'}">${evDisplay}</div>
                     <div class="ev-team">${escapeHtml(submarketName)}</div>
                 </div>
             </div>
+            ${filterNameDisplay}
         </div>
         
         ${booksTableHtml}
@@ -1196,6 +1238,84 @@ if (saveFilterSelectionBtn) {
 }
 
 // Auto-bet functions
+async function loadBroadScanPregame() {
+    const el = document.getElementById('broad-scan-include-pregame');
+    if (!el) return;
+    try {
+        const response = await fetch('/api/broad_scan_pregame');
+        const data = await response.json();
+        if (data.include !== undefined) {
+            el.checked = !!data.include;
+        }
+    } catch (error) {
+        console.error('Error loading broad scan pregame toggle:', error);
+    }
+}
+
+async function saveBroadScanPregame(include) {
+    try {
+        const response = await fetch('/api/broad_scan_pregame', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ include: !!include }),
+        });
+        const data = await response.json();
+        if (data.include !== undefined) {
+            showToast(
+                'success',
+                include ? 'Broad scan will include pregame MLB/NBA/NHL' : 'Broad scan: live events only',
+                null
+            );
+        }
+    } catch (error) {
+        console.error('Error saving broad scan pregame toggle:', error);
+        showToast('error', 'Failed to update broad scan toggle', null);
+    }
+}
+
+async function loadAlertFeedPrefs() {
+    const el = document.getElementById('include-pregame-value-bets');
+    if (!el) {
+        return;
+    }
+    try {
+        const response = await fetch('/api/alert_feed_prefs');
+        const data = await response.json();
+        if (data.include_pregame_value_bets !== undefined) {
+            el.checked = !!data.include_pregame_value_bets;
+        }
+    } catch (error) {
+        console.error('Error loading alert feed prefs:', error);
+    }
+}
+
+async function saveAlertFeedPrefs(includePregame) {
+    try {
+        const response = await fetch('/api/alert_feed_prefs', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ include_pregame_value_bets: !!includePregame })
+        });
+        const data = await response.json();
+        if (data.success) {
+            showToast(
+                'success',
+                includePregame
+                    ? 'Pregame value opportunities included in the alert pipeline'
+                    : 'Live-only pipeline (pregame rows gated out)',
+                null
+            );
+        } else {
+            showToast('error', data.error || 'Failed to update alert feed prefs', null);
+        }
+    } catch (error) {
+        console.error('Error saving alert feed prefs:', error);
+        showToast('error', 'Failed to update alert feed prefs', null);
+    }
+}
+
 async function loadAutoBetSettings() {
     try {
         const response = await fetch('/api/get_auto_bet');
@@ -1414,6 +1534,20 @@ if (saveAutoBetBtn) {
     });
 }
 
+const includePregameValueBetsCb = document.getElementById('include-pregame-value-bets');
+if (includePregameValueBetsCb) {
+    includePregameValueBetsCb.addEventListener('change', () => {
+        saveAlertFeedPrefs(includePregameValueBetsCb.checked);
+    });
+}
+
+const broadScanPregameCb = document.getElementById('broad-scan-include-pregame');
+if (broadScanPregameCb) {
+    broadScanPregameCb.addEventListener('change', () => {
+        saveBroadScanPregame(broadScanPregameCb.checked);
+    });
+}
+
 // --- Dashboard | Odds board tabs (header; uses /api/live_odds) ---
 (function () {
     const tabAlerts = document.getElementById('tab-btn-dashboard');
@@ -1503,11 +1637,15 @@ if (saveAutoBetBtn) {
             DraftKings: 'DK',
             Circa: 'CI',
             BookMaker: 'BM',
+            'BookMaker.eu': 'BM',
             Novig: 'NV',
+            NoVig: 'NV',
             ProphetX: 'PX',
             SportTrade: 'ST',
             Polymarket: 'PM',
             Betfair: 'BF',
+            'Betfair Exchange': 'BFX',
+            BetMGM: 'MGM',
             Caesars: 'CZ',
             PointsBet: 'PB',
             Pinnacle: 'PN',
@@ -1530,8 +1668,14 @@ if (saveAutoBetBtn) {
         const evs = data.events || [];
         const t = new Date((data.updated || 0) * 1000);
         const pairRows = evs.length ? evs.length * 2 : 0;
+        const bwl = data.books_with_lines || [];
+        const breq = books.length;
+        const bmeta =
+            bwl.length > 0
+                ? ` · API books with any line this refresh: ${bwl.length}/${breq} (${bwl.join(', ')})`
+                : '';
         meta.textContent =
-            `Updated ${t.toLocaleString()} · ${evs.length} game(s) (${pairRows} lines) · ${data.timing || ''} · sport=${data.sport || ''} · date=${data.date_filter || ''}`;
+            `Updated ${t.toLocaleString()} · ${evs.length} game(s) (${pairRows} lines) · ${data.timing || ''} · sport=${data.sport || ''} · api=${data.sport_api || '-'} · league=${data.league_focus || 'all'} · league_api=${data.league_api || '-'} · date=${data.date_filter || ''}${bmeta}`;
 
         const hdr = document.createElement('tr');
         let h = '<th class="pto-col-match">Game</th><th class="pto-col-side">Team</th>';
@@ -1582,13 +1726,21 @@ if (saveAutoBetBtn) {
         });
     }
 
+    function oddsBoardSportLeague() {
+        const raw = (sportSel && sportSel.value) ? sportSel.value : 'all|all';
+        const parts = String(raw).split('|');
+        const sport = (parts[0] || 'all').trim();
+        const league = (parts.length > 1 ? parts[1] : 'all').trim() || 'all';
+        return { sport, league };
+    }
+
     async function loadOddsOnce() {
         if (panelOdds.hidden) return;
-        const sport = sportSel ? sportSel.value : 'all';
+        const { sport, league } = oddsBoardSportLeague();
         const timing = timingSel ? timingSel.value : 'live';
         const dateF = dateSel ? dateSel.value : 'all';
         const url =
-            `/api/live_odds?sport=${encodeURIComponent(sport)}&timing=${encodeURIComponent(timing)}&date=${encodeURIComponent(dateF)}`;
+            `/api/live_odds?sport=${encodeURIComponent(sport)}&timing=${encodeURIComponent(timing)}&date=${encodeURIComponent(dateF)}&league=${encodeURIComponent(league)}`;
         try {
             const r = await fetch(url);
             const data = await r.json();

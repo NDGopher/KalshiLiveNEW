@@ -32,12 +32,14 @@
         <div class="live-odds-toolbar">
             <div>
                 <label for="sport-sel">Sport (API slug)</label>
-                <select id="sport-sel">
-                    <option value="all">All (live / list)</option>
-                    <option value="baseball">MLB (baseball)</option>
-                    <option value="icehockey">NHL (icehockey)</option>
-                    <option value="basketball">NBA (basketball)</option>
-                    <option value="americanfootball">NFL (americanfootball)</option>
+                <select id="sport-sel" title="Major leagues: sport slug + league filter">
+                    <option value="all|all">All sports</option>
+                    <option value="baseball|mlb">MLB</option>
+                    <option value="basketball|nba">NBA</option>
+                    <option value="icehockey|nhl">NHL</option>
+                    <option value="americanfootball|nfl">NFL</option>
+                    <option value="baseball|all">All baseball</option>
+                    <option value="basketball|all">All basketball</option>
                 </select>
             </div>
             <div>
@@ -89,7 +91,7 @@
             const books = data.books || [];
             const evs = data.events || [];
             const t = new Date((data.updated || 0) * 1000);
-            meta.textContent = `Updated ${t.toLocaleString()} · ${evs.length} event(s) · timing=${data.timing || ''} · sport=${data.sport || ''}`;
+            meta.textContent = `Updated ${t.toLocaleString()} · ${evs.length} event(s) · timing=${data.timing || ''} · sport=${data.sport || ''} · league=${data.league_focus || 'all'}`;
 
             const hdr = document.createElement('tr');
             hdr.innerHTML = '<th>Event</th><th>League</th><th>Live</th><th>Market</th>' +
@@ -126,9 +128,12 @@
         }
 
         async function loadOdds() {
-            const sport = sportSel.value;
+            const raw = sportSel.value || 'all|all';
+            const parts = String(raw).split('|');
+            const sport = (parts[0] || 'all').trim();
+            const league = (parts.length > 1 ? parts[1] : 'all').trim() || 'all';
             const timing = timingSel.value;
-            const url = `/api/live_odds?sport=${encodeURIComponent(sport)}&timing=${encodeURIComponent(timing)}`;
+            const url = `/api/live_odds?sport=${encodeURIComponent(sport)}&timing=${encodeURIComponent(timing)}&league=${encodeURIComponent(league)}`;
             const r = await fetch(url);
             const data = await r.json();
             render(data);

@@ -2,7 +2,7 @@
 Normalized live EV alert for Kalshi matching and dashboard display.
 
 Populated by OddsEVMonitor (Odds-API.io) or legacy tooling; same shape as the
-historical alert model used across the codebase.
+historical alert record used across the codebase.
 """
 from __future__ import annotations
 
@@ -34,6 +34,8 @@ class EvAlert:
         self.line = None
         # False = diagnostic display candidate (failed strict minRoi/minEv but passed relaxed gates)
         self.strict_pass = bool(data.get("strict_pass", True))
+        # How the opportunity was discovered: e.g. odds_api_value_bets vs local_odds_scan (future).
+        self.ev_source = str(data.get("ev_source") or "odds_api_value_bets")
 
     def extract_ticker_from_url(self):
         """Extract Kalshi ticker from market URL."""
@@ -60,4 +62,5 @@ class EvAlert:
             "ticker": self.ticker or self.extract_ticker_from_url(),
             "timestamp": self.timestamp.isoformat(),
             "strict_pass": self.strict_pass,
+            "ev_source": self.ev_source,
         }

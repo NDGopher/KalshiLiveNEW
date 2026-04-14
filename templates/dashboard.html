@@ -19,7 +19,7 @@
         .dashboard-ui-fingerprint{width:100%;margin:0;padding:8px 18px 12px;font-size:11px;line-height:1.4;color:#64748b;font-family:ui-monospace,Consolas,monospace;border-top:1px dashed #cbd5e1;background:#fff}
         body.dark .dashboard-ui-fingerprint{color:#94a3b8;background:#111}
     </style>
-    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=6">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=8">
     <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
 </head>
 <body>
@@ -62,7 +62,14 @@
         </div>
 
         <div id="panel-alerts" class="dashboard-main-panel">
-        <details class="controls-wrapper">
+        <div class="settings-scan-row">
+        <div class="scan-toolbar" title="When Odds-API diagnostic broad scan runs, merge pregame MLB/NBA/NHL /events (server class toggle, no .env).">
+            <label class="scan-toggle-label">
+                <input type="checkbox" id="broad-scan-include-pregame" checked>
+                <span>Broad scan: include pregame</span>
+            </label>
+        </div>
+        <details class="controls-wrapper controls-wrapper--flex">
             <summary class="controls-toggle">
                 <span>Settings</span>
                 <span class="toggle-arrow">▼</span>
@@ -94,6 +101,12 @@
                         <span>%</span>
                         <button id="set-filters-btn" class="btn btn-secondary">Update Filters</button>
                     </div>
+                    <div class="filter-setting" title="When off, only in-play rows pass the pipeline (ODDS_API_LIVE_ONLY). When on, pregame Kalshi value-bets are included for display and devig.">
+                        <label class="auto-bet-toggle-label" style="display: inline-flex; align-items: center; gap: 0.35rem;">
+                            <input type="checkbox" id="include-pregame-value-bets">
+                            <span>Show pregame value opportunities</span>
+                        </label>
+                    </div>
                     <div class="portfolio">
                         <span>Balance: $<span id="balance">--</span></span>
                     </div>
@@ -120,6 +133,7 @@
             </div>
         </div>
         </details>
+        </div>
 
         <!-- Toast notification container -->
         <div id="toast-container" class="toast-container"></div>
@@ -137,14 +151,16 @@
             <div class="odds-screen-toolbar">
                 <div class="odds-screen-field">
                     <label for="odds-sport-sel">Sport</label>
-                    <select id="odds-sport-sel">
-                        <option value="all">All sports</option>
-                        <option value="baseball">MLB (baseball)</option>
-                        <option value="icehockey">NHL (icehockey)</option>
-                        <option value="basketball">NBA (basketball)</option>
-                        <option value="americanfootball">NFL (americanfootball)</option>
-                        <option value="soccer">Soccer</option>
-                        <option value="tennis">Tennis</option>
+                    <select id="odds-sport-sel" title="Odds-API uses sport slugs; MLB/NBA/NHL/NFL narrow by league">
+                        <option value="all|all">All sports</option>
+                        <option value="baseball|mlb">MLB</option>
+                        <option value="basketball|nba">NBA</option>
+                        <option value="icehockey|nhl">NHL</option>
+                        <option value="americanfootball|nfl">NFL</option>
+                        <option value="baseball|all">All baseball</option>
+                        <option value="basketball|all">All basketball</option>
+                        <option value="football|all">Soccer (football)</option>
+                        <option value="tennis|all">Tennis</option>
                     </select>
                 </div>
                 <div class="odds-screen-field">
@@ -180,7 +196,7 @@
         </div>
     </div>
 
-    <script src="{{ url_for('static', filename='script.js') }}?v=6"></script>
+    <script src="{{ url_for('static', filename='script.js') }}?v=13"></script>
 </body>
 </html>
 

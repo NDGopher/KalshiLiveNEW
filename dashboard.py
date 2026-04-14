@@ -18,6 +18,11 @@ _DOTENV_PROJECT = Path(__file__).resolve().parent / ".env"
 _DOTENV_CWD = Path.cwd() / ".env"
 load_dotenv(_DOTENV_PROJECT, override=True, encoding="utf-8-sig")
 load_dotenv(_DOTENV_CWD, override=True, encoding="utf-8-sig")
+# Some setups use `.env.env` only; load after `.env` so explicit `.env` wins on conflicts.
+_DOTENV_ALT_PROJECT = Path(__file__).resolve().parent / ".env.env"
+_DOTENV_ALT_CWD = Path.cwd() / ".env.env"
+load_dotenv(_DOTENV_ALT_PROJECT, override=False, encoding="utf-8-sig")
+load_dotenv(_DOTENV_ALT_CWD, override=False, encoding="utf-8-sig")
 
 # Fix Unicode encoding for Windows console
 if sys.platform == 'win32':
@@ -50,7 +55,10 @@ from odds_ev_monitor import OddsEVMonitor as EvMonitorImpl, _market_names_match
 from odds_api_client import (
     get_shared_odds_client,
     _norm_book,
+    major_league_slug_for_events,
+    normalize_sport_slug_key,
     odds_api_master_bookmakers,
+    sport_slug_query_for_api,
 )
 from ev_calculator import decimal_to_american
 
@@ -446,7 +454,7 @@ _merge_min_sharp_limits(DEFAULT_FILTER_PAYLOAD, sharps_list)
 _merge_min_sharp_limits(CBB_FILTER_PAYLOAD, cbb_sharps)
 # By default, both filters should be selected for both dashboard and auto-bettor
 selected_dashboard_filters = [DEFAULT_FILTER_NAME, CBB_FILTER_NAME]
-selected_auto_bettor_filters = [DEFAULT_FILTER_NAME, CBB_FILTER_NAME]
+selected_auto_bettor_filters = []
 
 
 def _live_odds_display_books() -> List[str]:
@@ -459,6 +467,60 @@ def _sport_slug_event(ev: Dict[str, Any]) -> str:
     if isinstance(sp, dict):
         return str(sp.get("slug") or "").lower()
     return str(sp or "").lower()
+
+
+def _league_slug_name(ev: Dict[str, Any]) -> Tuple[str, str]:
+    """Lower slug and upper name for Odds-API.io ``league`` object."""
+    lg = ev.get("league")
+    if isinstance(lg, dict):
+        return (str(lg.get("slug") or "").lower(), str(lg.get("name") or "").upper())
+    return ("", str(lg or "").upper())
+
+
+def _sport_ui_matches_event(ui_sport: str, ev: Dict[str, Any]) -> bool:
+    """Match UI / URL sport to Odds-API ``event.sport.slug`` (hyphen vs legacy forms)."""
+    if not ui_sport or ui_sport == "all":
+        return True
+    return normalize_sport_slug_key(_sport_slug_event(ev)) == normalize_sport_slug_key(ui_sport)
+
+
+def _event_matches_league_focus(ev: Dict[str, Any], focus: str) -> bool:
+    """
+    Narrow Odds-API.io events to major leagues (client-side) when /events?league=…
+    is not used or returns mixed leagues. Compares league slug/name to MLB/NBA/NHL/NFL.
+    """
+    f = (focus or "all").strip().lower()
+    if f in ("", "all"):
+        return True
+    slug, name = _league_slug_name(ev)
+    sk = normalize_sport_slug_key(_sport_slug_event(ev))
+    if f == "mlb":
+        return sk == "baseball" and (
+            "mlb" in slug or "mlb" in name or "MAJOR LEAGUE" in name
+        )
+    if f == "nba":
+        if sk != "basketball":
+            return False
+        if "wnba" in slug or "WNBA" in name:
+            return False
+        if "g-league" in slug or "GLEAGUE" in name.replace(" ", "") or "G LEAGUE" in name:
+            return False
+        return (
+            "nba" in slug
+            or name == "NBA"
+            or ("NBA" in name and "EURO" not in name)
+        )
+    if f == "nhl":
+        return sk == "icehockey" and (
+            "nhl" in slug or "NHL" in name or "NATIONAL HOCKEY" in name
+        )
+    if f == "nfl":
+        if sk != "americanfootball":
+            return False
+        if "ncaa" in slug or "NCAA" in name or "COLLEGE" in name:
+            return False
+        return "nfl" in slug or "NFL" in name or "NATIONAL FOOTBALL" in name
+    return True
 
 
 def _event_is_live(ev: Dict[str, Any]) -> bool:
@@ -498,25 +560,34 @@ def _live_float_dec(x: Any) -> Optional[float]:
 
 
 def _live_pick_ml_name(bks: Dict[str, Any]) -> str:
+    """Odds-API.io docs use market name ``ML`` for match winner; fall back to Moneyline synonyms."""
     for pref in ("Kalshi", "FanDuel", "DraftKings"):
         for m in _live_mkts_for_book(bks, pref):
-            n = str(m.get("name") or "")
+            n = str(m.get("name") or "").strip()
             u = n.upper()
             if "PLAYER" in u:
                 continue
-            if "MONEY" in u or u in ("ML", "MONEYLINE") or "WINNER" in u:
+            if u == "ML":
+                return n
+    for pref in ("Kalshi", "FanDuel", "DraftKings"):
+        for m in _live_mkts_for_book(bks, pref):
+            n = str(m.get("name") or "").strip()
+            u = n.upper()
+            if "PLAYER" in u:
+                continue
+            if "MONEY" in u or u in ("MONEYLINE",) or "WINNER" in u:
                 return n
     for _bk, mkts in (bks or {}).items():
         if not isinstance(mkts, list):
             continue
         for m in mkts:
-            n = str(m.get("name") or "")
+            n = str(m.get("name") or "").strip()
             u = n.upper()
             if "PLAYER" in u:
                 continue
-            if "MONEY" in u or "WINNER" in u:
+            if u == "ML" or "MONEY" in u or "WINNER" in u:
                 return n
-    return "Moneyline"
+    return "ML"
 
 
 def _live_find_market(book_odds: List[Dict[str, Any]], name: str) -> Optional[Dict[str, Any]]:
@@ -544,12 +615,13 @@ def _live_best_side(prices: Dict[str, Dict[str, Any]], side_key: str) -> Tuple[O
 
 
 def _default_odds_screen_sports() -> List[str]:
+    """Sport slugs passed to Odds-API /events (hyphenated where required by API docs)."""
     raw = os.getenv(
         "ODDS_API_SPORTS",
-        "baseball,basketball,icehockey,americanfootball,soccer,tennis",
+        "baseball,basketball,ice-hockey,american-football,football,tennis",
     )
-    out = [x.strip().lower() for x in raw.split(",") if x.strip()]
-    return out[:15] if out else ["baseball", "basketball", "icehockey"]
+    out = [sport_slug_query_for_api(x) for x in raw.split(",") if x.strip()]
+    return out[:15] if out else ["baseball", "basketball", "ice-hockey"]
 
 
 def _parse_event_start(ev: Dict[str, Any]) -> Optional[datetime]:
@@ -612,12 +684,51 @@ def _event_matches_date_filter(ev: Dict[str, Any], filt: str) -> bool:
     return True
 
 
+def _log_live_odds_book_flow_and_pipeline(
+    books: List[str],
+    rows_out: List[Dict[str, Any]],
+    timing_l: str,
+    sport_l: str,
+) -> None:
+    """Console visibility: how many of the configured books have ML prices on the odds grid."""
+    m = len(books)
+    if not rows_out:
+        print(f"[PIPELINE] live_odds timing={timing_l} sport={sport_l} rows=0 | master_books={m}")
+        print(f"[BOOK FLOW] live_odds: no rows | configured={books}")
+        return
+
+    def npriced(r: Dict[str, Any]) -> int:
+        pr = r.get("books") or {}
+        return sum(
+            1
+            for b in books
+            if (pr.get(b) or {}).get("home_am") is not None or (pr.get(b) or {}).get("away_am") is not None
+        )
+
+    live_rows = [r for r in rows_out if r.get("live")]
+    counts = [npriced(r) for r in rows_out]
+    live_counts = [npriced(r) for r in live_rows] if live_rows else []
+
+    def fmt(cs: List[int]) -> str:
+        if not cs:
+            return "n/a"
+        return f"min={min(cs)}/{m} max={max(cs)}/{m} avg={sum(cs) / len(cs):.2f}"
+
+    print(
+        f"[PIPELINE] live_odds timing={timing_l} sport={sport_l} rows={len(rows_out)} "
+        f"live_rows={len(live_rows)} | master={m} ML_price_hit {fmt(counts)} | live_only {fmt(live_counts)}"
+    )
+    sample = ", ".join(f"{(r.get('teams') or '')[:22]}={npriced(r)}" for r in rows_out[:5])
+    print(f"[BOOK FLOW] live_odds master=[{', '.join(books)}] | sample_priced_books (first 5): {sample}")
+
+
 async def _live_odds_build_snapshot_with_client(
     client: Any,
     sport: str,
     timing: str,
     books: List[str],
     date_filter: str,
+    league_focus: str = "all",
 ) -> Dict[str, Any]:
     if not getattr(client, "api_key", ""):
         return {
@@ -638,19 +749,22 @@ async def _live_odds_build_snapshot_with_client(
     sport_l = (sport or "all").strip().lower()
     timing_l = (timing or "live").strip().lower()
     date_f = (date_filter or "all").strip().lower()
+    lf = (league_focus or "all").strip().lower()
     events: List[Dict[str, Any]] = []
 
     # --- gather events (live / pregame / both) ---
+    # Docs: GET /events/live?sport={slug} filters server-side (optional).
     if timing_l in ("live", "both"):
         try:
-            liv = await client.list_live_events()
+            live_sport_arg = sport_l if sport_l and sport_l != "all" else None
+            liv = await client.list_live_events(live_sport_arg)
         except Exception as e:
             liv = []
             err_l = str(e)
         else:
             err_l = ""
         for e in liv or []:
-            if sport_l and sport_l != "all" and _sport_slug_event(e) != sport_l:
+            if not _sport_ui_matches_event(sport_l, e):
                 continue
             events.append(e)
         if err_l and not events and timing_l == "live":
@@ -661,6 +775,7 @@ async def _live_odds_build_snapshot_with_client(
                 "books": books,
                 "timing": timing_l,
                 "sport": sport_l,
+                "league_focus": lf,
                 "date_filter": date_f,
                 "events": [],
             }
@@ -673,7 +788,20 @@ async def _live_odds_build_snapshot_with_client(
         )
         for slug in slugs:
             try:
-                evs = await client.list_events_for_sport(slug)
+                s_api = sport_slug_query_for_api(slug)
+                lg_slug = major_league_slug_for_events(s_api, lf) if lf != "all" else None
+                try:
+                    evs = await client.list_events_for_sport(
+                        slug,
+                        league=lg_slug,
+                        status="pending",
+                    )
+                except Exception:
+                    # Some accounts use different league slugs; retry without league filter.
+                    if lg_slug:
+                        evs = await client.list_events_for_sport(slug, status="pending")
+                    else:
+                        raise
             except Exception:
                 continue
             for e in evs or []:
@@ -681,9 +809,12 @@ async def _live_odds_build_snapshot_with_client(
                     continue
                 if not _event_matches_date_filter(e, date_f):
                     continue
-                if sport_l and sport_l != "all" and _sport_slug_event(e) != sport_l:
+                if not _sport_ui_matches_event(sport_l if sport_l != "all" else slug, e):
                     continue
                 events.append(e)
+
+    if lf != "all":
+        events = [e for e in events if _event_matches_league_focus(e, lf)]
 
     by_id: Dict[int, Dict[str, Any]] = {}
     for e in events:
@@ -694,7 +825,9 @@ async def _live_odds_build_snapshot_with_client(
         if eid not in by_id:
             by_id[eid] = e
     ev_sorted = sorted(by_id.values(), key=_event_sort_tuple)
-    max_ev = 50 if timing_l in ("pregame", "both") else 30
+    # Live-only: pull a wider pool before league/sport filters so major-league games are not pushed
+    # out by unrelated live fixtures (Odds-API returns one global live list).
+    max_ev = 50 if timing_l in ("pregame", "both") else 80
     ev_list = ev_sorted[:max_ev]
     ids = [int(e["id"]) for e in ev_list if e.get("id") is not None]
     odds_by_id: Dict[int, Dict[str, Any]] = {}
@@ -711,11 +844,23 @@ async def _live_odds_build_snapshot_with_client(
                 "books": books,
                 "timing": timing_l,
                 "sport": sport_l,
+                "league_focus": lf,
                 "date_filter": date_f,
                 "events": [],
             }
+    # Odds-API.io omits bookmaker keys when that book has no markets for the event — not a UI bug.
+    books_with_lines: List[str] = []
+    _seen_bl: set = set()
+    for _doc in odds_by_id.values():
+        for raw_key in (_doc.get("bookmakers") or {}):
+            canon = _norm_book(str(raw_key))
+            lk = canon.lower()
+            if lk not in _seen_bl:
+                _seen_bl.add(lk)
+                books_with_lines.append(canon)
+    books_with_lines.sort(key=lambda s: s.lower())
     rows_out: List[Dict[str, Any]] = []
-    max_rows = 40 if timing_l in ("pregame", "both") else 25
+    max_rows = 45 if timing_l in ("pregame", "both") else 40
     for e in ev_list[:max_rows]:
         eid = int(e["id"])
         doc = odds_by_id.get(eid) or {}
@@ -765,33 +910,46 @@ async def _live_odds_build_snapshot_with_client(
                 },
             }
         )
+    _log_live_odds_book_flow_and_pipeline(books, rows_out, timing_l, sport_l)
     return {
         "ok": True,
         "updated": time.time(),
         "books": books,
         "timing": timing_l,
         "sport": sport_l,
+        "sport_api": sport_slug_query_for_api(sport_l) if sport_l != "all" else None,
+        "league_focus": lf,
+        "league_api": major_league_slug_for_events(
+            sport_slug_query_for_api(sport_l), lf
+        )
+        if sport_l != "all" and lf != "all"
+        else None,
         "date_filter": date_f,
         "events": rows_out,
+        "books_with_lines": books_with_lines,
     }
 
 
 async def _live_odds_build_snapshot(
-    sport: str, timing: str, books: List[str], date_filter: str
+    sport: str, timing: str, books: List[str], date_filter: str, league_focus: str = "all"
 ) -> Dict[str, Any]:
     """Uses shared Odds-API client (must run on the same asyncio loop that owns the client)."""
     client = await get_shared_odds_client()
-    return await _live_odds_build_snapshot_with_client(client, sport, timing, books, date_filter)
+    return await _live_odds_build_snapshot_with_client(
+        client, sport, timing, books, date_filter, league_focus
+    )
 
 
 async def _live_odds_build_snapshot_isolated(
-    sport: str, timing: str, books: List[str], date_filter: str
+    sport: str, timing: str, books: List[str], date_filter: str, league_focus: str = "all"
 ) -> Dict[str, Any]:
     from odds_api_client import OddsAPIClient
 
     c = OddsAPIClient()
     try:
-        return await _live_odds_build_snapshot_with_client(c, sport, timing, books, date_filter)
+        return await _live_odds_build_snapshot_with_client(
+            c, sport, timing, books, date_filter, league_focus
+        )
     finally:
         await c.close()
 
@@ -1429,7 +1587,10 @@ def create_alert_id(alert: EvAlert) -> str:
     # Use ticker, pick, qualifier, and market_type to create stable ID
     # Also include filter_name if available to distinguish same alert from different filters
     filter_name = getattr(alert, 'filter_name', '') or ''
-    key = f"{alert.ticker}|{alert.pick}|{alert.qualifier}|{alert.market_type}|{filter_name}"
+    ev_source = getattr(alert, "ev_source", "") or "odds_api_value_bets"
+    # Same edge from API feed vs local scan must not collide; keep legacy IDs for default feed.
+    src_part = f"|{ev_source}" if ev_source != "odds_api_value_bets" else ""
+    key = f"{alert.ticker}|{alert.pick}|{alert.qualifier}|{alert.market_type}|{filter_name}{src_part}"
     # Use MD5 hash and take first 10 digits for consistent ID
     hash_obj = hashlib.md5(key.encode('utf-8'))
     hash_hex = hash_obj.hexdigest()
@@ -1651,6 +1812,7 @@ async def handle_new_alert(alert: EvAlert):
                 'match_failed': True,  # Flag to indicate matching failed
                 'match_failure_reason': 'Could not find matching submarket',
                 'strict_pass': getattr(alert, 'strict_pass', True),
+                'ev_source': getattr(alert, 'ev_source', 'odds_api_value_bets'),
             }
             
             # Store in active_alerts (for dashboard display)
@@ -2004,6 +2166,7 @@ async def handle_new_alert(alert: EvAlert):
             'expiry': (datetime.now() + timedelta(seconds=30)).timestamp(),  # TTL: 30 seconds
             'last_seen': time.time(),  # Track when alert was last seen for stale detection
             'strict_pass': getattr(alert, 'strict_pass', True),
+            'ev_source': getattr(alert, 'ev_source', 'odds_api_value_bets'),
         }
         
         # CRITICAL: Check if this alert_id is already being processed (prevent duplicate processing)
@@ -2043,6 +2206,9 @@ async def handle_new_alert(alert: EvAlert):
                 updated = True
             if hasattr(alert, 'strict_pass'):
                 existing_alert['strict_pass'] = alert.strict_pass
+                updated = True
+            if getattr(alert, "ev_source", None) and alert.ev_source != existing_alert.get("ev_source"):
+                existing_alert["ev_source"] = alert.ev_source
                 updated = True
             
             # CRITICAL: Preserve filter_name - use existing if new alert doesn't have it, otherwise update
@@ -3671,23 +3837,36 @@ def api_live_odds():
     Odds-API.io's shared async client is bound to the monitor event loop; scheduling
     snapshot work on api_loop caused broken/empty responses. We use monitor_loop
     when available, otherwise a one-shot isolated client + asyncio.run().
+
+    Query ``league`` narrows to major leagues: ``mlb``, ``nba``, ``nhl``, ``nfl``, or ``all``.
+    If ``league`` is omitted, it defaults to the major league matching ``sport`` when
+    ``sport`` is baseball / basketball / icehockey / americanfootball (so "MLB" is not all baseball).
     """
     global monitor_loop
     sport = (request.args.get('sport') or 'all').strip().lower()
     timing = (request.args.get('timing') or 'live').strip().lower()
     date_filter = (request.args.get('date') or 'all').strip().lower()
+    if "league" in request.args and (request.args.get("league") or "").strip() != "":
+        league_focus = (request.args.get("league") or "all").strip().lower()
+    else:
+        league_focus = {
+            "baseball": "mlb",
+            "basketball": "nba",
+            "icehockey": "nhl",
+            "americanfootball": "nfl",
+        }.get(sport, "all")
     books = _live_odds_display_books()
     loop = monitor_loop if (monitor_loop and not monitor_loop.is_closed()) else None
     try:
         if loop is not None:
             fut = asyncio.run_coroutine_threadsafe(
-                _live_odds_build_snapshot(sport, timing, books, date_filter),
+                _live_odds_build_snapshot(sport, timing, books, date_filter, league_focus),
                 loop,
             )
             data = fut.result(timeout=90)
         else:
             data = asyncio.run(
-                _live_odds_build_snapshot_isolated(sport, timing, books, date_filter)
+                _live_odds_build_snapshot_isolated(sport, timing, books, date_filter, league_focus)
             )
     except Exception as e:
         return jsonify(
@@ -6968,6 +7147,17 @@ def get_max_bet():
     return jsonify({'max_bet_amount': user_max_bet_amount})
 
 
+@app.route("/api/broad_scan_pregame", methods=["GET", "POST"])
+def broad_scan_pregame():
+    """Read/update whether diagnostic broad scan merges pregame MLB/NBA/NHL /events (class-level, no .env)."""
+    from odds_ev_monitor import OddsEVMonitor
+
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        OddsEVMonitor.broad_scan_include_pregame = bool(data.get("include", True))
+    return jsonify({"include": OddsEVMonitor.broad_scan_include_pregame})
+
+
 @app.route('/api/get_auto_bet', methods=['GET'])
 def get_auto_bet():
     """Get auto-bet settings (per-filter)"""
@@ -6987,6 +7177,32 @@ def get_auto_bet():
         'odds_max': auto_bet_odds_max,
         'amount': auto_bet_amount
     })
+
+
+@app.route("/api/alert_feed_prefs", methods=["GET", "POST"])
+def alert_feed_prefs():
+    """Read/set pipeline toggle: include pregame Kalshi value-bets (relaxes ODDS_API_LIVE_ONLY)."""
+    if request.method == "GET":
+        return jsonify(
+            {
+                "include_pregame_value_bets": bool(
+                    getattr(EvMonitorImpl, "include_pregame_value_bets", False)
+                )
+            }
+        )
+    data = request.get_json(silent=True) or {}
+    if "include_pregame_value_bets" not in data:
+        return jsonify({"error": "include_pregame_value_bets required"}), 400
+    EvMonitorImpl.include_pregame_value_bets = bool(data["include_pregame_value_bets"])
+    print(
+        f"[DASHBOARD] Alert feed prefs: include_pregame_value_bets={EvMonitorImpl.include_pregame_value_bets}"
+    )
+    return jsonify(
+        {
+            "success": True,
+            "include_pregame_value_bets": EvMonitorImpl.include_pregame_value_bets,
+        }
+    )
 
 
 @app.route("/token-update")
@@ -8763,7 +8979,20 @@ def initialize_dashboard():
     print(
         f" Production Mode — Odds-API.io {n_books} book(s): {', '.join(_bm)} — {poll_sec:g}s live polling — Kalshi 3-sharp POWER devig"
     )
-    
+
+    _pre_ui = os.getenv("ODDS_UI_INCLUDE_PREGAME_VALUE_BETS", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    EvMonitorImpl.include_pregame_value_bets = _pre_ui
+    if _pre_ui:
+        print(
+            "[DASHBOARD] ODDS_UI_INCLUDE_PREGAME_VALUE_BETS enabled — "
+            "pregame Kalshi value-bets pass the live-only gate (override in Settings)"
+        )
+
     # Initialize monitors for all selected dashboard filters
     for filter_name in selected_dashboard_filters:
         if filter_name not in odds_ev_monitors:
@@ -9409,6 +9638,14 @@ def send_shutdown_notification():
 
 
 if __name__ == '__main__':
+    print()
+    print(
+        "Note: Using your current 10 books (DK, FD, Betfair Exchange, Circa, Polymarket, MGM, "
+        "Bookmaker, Caesars, Kalshi, NoVig). Recommended future swaps when you can reset key: "
+        "replace MGM and Caesars with ProphetX and SportTrade for sharper live edges."
+    )
+    print()
+
     import signal
     import atexit
     
