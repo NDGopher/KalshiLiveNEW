@@ -776,6 +776,103 @@ def _three_way_draw_decimals(row: Dict[str, Any]) -> Optional[Tuple[float, float
     return None
 
 
+def _ml_median_dec(vals: List[Optional[float]]) -> Optional[float]:
+    good: List[float] = []
+    for v in vals:
+        if v is None:
+            continue
+        try:
+            d = float(v)
+        except (TypeError, ValueError):
+            continue
+        if d > 1.0:
+            good.append(d)
+    if not good:
+        return None
+    good.sort()
+    mid = len(good) // 2
+    if len(good) % 2:
+        return good[mid]
+    return (good[mid - 1] + good[mid]) / 2.0
+
+
+def _betmgm_ml_home_away_swapped_book(book_name: str) -> bool:
+    """
+    Odds-API.io can return BetMGM match-winner rows with ``home``/``away`` prices
+    flipped vs event home/away (other books agree). Detect via consensus medians.
+    """
+    n = _norm_book(str(book_name)).lower().replace(" ", "").replace(".", "")
+    return "betmgm" in n or n == "mgm"
+
+
+def _maybe_swap_ml_decimals_to_consensus(
+    dh: float, da: float, med_home: float, med_away: float
+) -> Tuple[float, float]:
+    err_normal = (float(dh) - med_home) ** 2 + (float(da) - med_away) ** 2
+    err_swapped = (float(dh) - med_away) ** 2 + (float(da) - med_home) ** 2
+    if err_swapped < err_normal * 0.75:
+        return da, dh
+    return dh, da
+
+
+def apply_betmgm_ml_grid_consensus_fix(prices: Dict[str, Dict[str, Any]], books: List[str]) -> None:
+    """
+    Mutate per-book ``home_dec`` / ``away_dec`` / American fields when BetMGM (or MGM)
+    clearly fits the inverted-key pattern vs other books. Used by ``/api/live_odds``.
+    """
+    ref_books = [b for b in books if not _betmgm_ml_home_away_swapped_book(b)]
+    if len(ref_books) < 2:
+        return
+    med_home = _ml_median_dec([prices.get(b, {}).get("home_dec") for b in ref_books])
+    med_away = _ml_median_dec([prices.get(b, {}).get("away_dec") for b in ref_books])
+    if med_home is None or med_away is None:
+        return
+    for bk in books:
+        if not _betmgm_ml_home_away_swapped_book(bk):
+            continue
+        p = prices.get(bk) or {}
+        dh = p.get("home_dec")
+        da = p.get("away_dec")
+        if dh is None or da is None or dh <= 1.0 or da <= 1.0:
+            continue
+        ndh, nda = _maybe_swap_ml_decimals_to_consensus(float(dh), float(da), med_home, med_away)
+        if ndh != dh or nda != da:
+            p["home_dec"] = ndh
+            p["away_dec"] = nda
+            p["home_am"] = int(decimal_to_american(ndh))
+            p["away_am"] = int(decimal_to_american(nda))
+
+
+def _moneyline_market_name(mname: str) -> bool:
+    mu = (mname or "").upper()
+    if "PLAYER" in mu or "SPREAD" in mu or "HANDICAP" in mu or "TOTAL" in mu:
+        return False
+    if "PUCK LINE" in mu or "PUCKLINE" in mu.replace(" ", ""):
+        return False
+    return mu == "ML" or "MONEY" in mu or "WINNER" in mu
+
+
+def _consensus_ml_home_away_medians(
+    bks: Dict[str, Any], mname: str, ref_row: Optional[Dict[str, Any]]
+) -> Tuple[Optional[float], Optional[float]]:
+    """Median home/away decimals from non-BetMGM books (BetMGM inversion correction)."""
+    if not _moneyline_market_name(mname):
+        return None, None
+    h_acc: List[float] = []
+    a_acc: List[float] = []
+    for bk_key in bks:
+        if _betmgm_ml_home_away_swapped_book(str(bk_key)):
+            continue
+        mk0 = _find_market_block(_markets_list_for_book(bks, str(bk_key)), mname)
+        r0 = _sharp_row_for_market(mk0 or {}, mname, ref_row) if ref_row else (_first_odds_row(mk0 or {}) or {})
+        dh0 = _float_dec(r0.get("home"))
+        da0 = _float_dec(r0.get("away"))
+        if dh0 and da0 and dh0 > 1.0 and da0 > 1.0:
+            h_acc.append(dh0)
+            a_acc.append(da0)
+    return _ml_median_dec(h_acc), _ml_median_dec(a_acc)
+
+
 def _build_display_books_payload(
     pick: str,
     bks: Optional[Dict[str, Any]],
@@ -791,11 +888,42 @@ def _build_display_books_payload(
     if not bks or not isinstance(bks, dict):
         return {pick: rows_out}
     ref = k_row if isinstance(k_row, dict) and k_row else None
+    is_ml = _moneyline_market_name(mname)
+    med_home: Optional[float] = None
+    med_away: Optional[float] = None
+    if is_ml:
+        h_acc: List[float] = []
+        a_acc: List[float] = []
+        for bk_key in bks:
+            bk_s = str(bk_key)
+            if _betmgm_ml_home_away_swapped_book(bk_s):
+                continue
+            mk0 = _find_market_block(_markets_list_for_book(bks, bk_s), mname)
+            r0 = _sharp_row_for_market(mk0 or {}, mname, ref) if ref else (_first_odds_row(mk0 or {}) or {})
+            dh0 = _float_dec(r0.get("home"))
+            da0 = _float_dec(r0.get("away"))
+            if dh0 and da0 and dh0 > 1.0 and da0 > 1.0:
+                h_acc.append(dh0)
+                a_acc.append(da0)
+        med_home = _ml_median_dec(h_acc)
+        med_away = _ml_median_dec(a_acc)
     for nm in display_names:
         if _norm_book(str(nm)).lower() == "kalshi":
             continue
         mk = _find_market_block(_markets_list_for_book(bks, nm), mname)
         row = _sharp_row_for_market(mk or {}, mname, ref) if ref else (_first_odds_row(mk or {}) or {})
+        if (
+            is_ml
+            and med_home is not None
+            and med_away is not None
+            and _betmgm_ml_home_away_swapped_book(str(nm))
+        ):
+            dh = _float_dec(row.get("home"))
+            da = _float_dec(row.get("away"))
+            if dh and da and dh > 1.0 and da > 1.0:
+                ndh, nda = _maybe_swap_ml_decimals_to_consensus(dh, da, med_home, med_away)
+                if ndh != dh or nda != da:
+                    row = {**row, "home": ndh, "away": nda}
         d = _decimal_for_side(row, bet_side)
         if d and d > 1.0:
             rows_out.append(
@@ -1370,6 +1498,7 @@ class OddsEVMonitor:
             return panels, triples, bet_side, mname, min_sharp
         bks = odds_doc["bookmakers"]
         canon = vb.get("_canonical_kalshi_row") if isinstance(vb.get("_canonical_kalshi_row"), dict) else None
+        ml_med_h_d, ml_med_a_d = _consensus_ml_home_away_medians(bks, mname, canon)
         if bet_side == "draw":
             for sn in sharp_names:
                 mk = _find_market_block(_markets_list_for_book(bks, sn), mname)
@@ -1387,6 +1516,19 @@ class OddsEVMonitor:
             for sn in sharp_names:
                 mk = _find_market_block(_markets_list_for_book(bks, sn), mname)
                 row = _sharp_row_for_market(mk or {}, mname, canon) if canon else (_first_odds_row(mk or {}) or {})
+                if (
+                    ml_med_h_d is not None
+                    and ml_med_a_d is not None
+                    and _betmgm_ml_home_away_swapped_book(sn)
+                ):
+                    dh_r = _float_dec(row.get("home"))
+                    da_r = _float_dec(row.get("away"))
+                    if dh_r and da_r and dh_r > 1.0 and da_r > 1.0:
+                        ndh, nda = _maybe_swap_ml_decimals_to_consensus(
+                            dh_r, da_r, ml_med_h_d, ml_med_a_d
+                        )
+                        if ndh != dh_r or nda != da_r:
+                            row = {**row, "home": ndh, "away": nda}
                 tw = _two_way_pick_opp_decimals(row, bet_side)
                 if not tw:
                     continue
@@ -2028,6 +2170,10 @@ class OddsEVMonitor:
         triples: List[Tuple[float, float, float, str]] = []
 
         ref_for_sharps = canon_vb or (k_row if k_row else None)
+        ml_med_h: Optional[float] = None
+        ml_med_a: Optional[float] = None
+        if bks and isinstance(bks, dict):
+            ml_med_h, ml_med_a = _consensus_ml_home_away_medians(bks, mname, ref_for_sharps)
         if bks and sharp_names:
             if bet_side == "draw":
                 triples.clear()
@@ -2066,6 +2212,19 @@ class OddsEVMonitor:
                     row = _sharp_row_for_market(mk or {}, mname, ref_for_sharps) if ref_for_sharps else (
                         _first_odds_row(mk or {}) or {}
                     )
+                    if (
+                        ml_med_h is not None
+                        and ml_med_a is not None
+                        and _betmgm_ml_home_away_swapped_book(sn)
+                    ):
+                        dh_r = _float_dec(row.get("home"))
+                        da_r = _float_dec(row.get("away"))
+                        if dh_r and da_r and dh_r > 1.0 and da_r > 1.0:
+                            ndh, nda = _maybe_swap_ml_decimals_to_consensus(
+                                dh_r, da_r, ml_med_h, ml_med_a
+                            )
+                            if ndh != dh_r or nda != da_r:
+                                row = {**row, "home": ndh, "away": nda}
                     tw = _two_way_pick_opp_decimals(row, bet_side)
                     if not tw:
                         continue

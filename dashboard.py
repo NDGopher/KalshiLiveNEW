@@ -51,7 +51,11 @@ warnings.filterwarnings('ignore', message='.*SSL.*')
 from ev_alert import EvAlert
 from market_matcher import MarketMatcher
 from kalshi_client import KalshiClient
-from odds_ev_monitor import OddsEVMonitor as EvMonitorImpl, _market_names_match
+from odds_ev_monitor import (
+    OddsEVMonitor as EvMonitorImpl,
+    _market_names_match,
+    apply_betmgm_ml_grid_consensus_fix,
+)
 from odds_api_client import (
     get_shared_odds_client,
     _norm_book,
@@ -880,6 +884,7 @@ async def _live_odds_build_snapshot_with_client(
                 "home_am": int(decimal_to_american(dh)) if dh else None,
                 "away_am": int(decimal_to_american(da)) if da else None,
             }
+        apply_betmgm_ml_grid_consensus_fix(prices, books)
         bh, ham = _live_best_side(prices, "home_dec")
         ba, aam = _live_best_side(prices, "away_dec")
         league = e.get("league")
