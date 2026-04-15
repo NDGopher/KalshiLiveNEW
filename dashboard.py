@@ -62,6 +62,7 @@ from odds_api_client import (
     major_league_slug_for_events,
     normalize_sport_slug_key,
     odds_api_master_bookmakers,
+    odds_api_sports_list,
     sport_slug_query_for_api,
 )
 from ev_calculator import decimal_to_american
@@ -79,6 +80,7 @@ INITIAL_DEPOSIT_DOLLARS = float(os.getenv('INITIAL_DEPOSIT', '980.0'))  # Defaul
 # package root and load a stale templates/dashboard.html from cwd or elsewhere. Pin paths to
 # this file's directory so the served page always matches templates/ on disk.
 _APP_ROOT = os.path.dirname(os.path.abspath(__file__))
+USER_FILTERS_STATE_FILE = os.path.join(_APP_ROOT, "user_filters_state.json")
 app = Flask(
     __name__,
     root_path=_APP_ROOT,
@@ -311,8 +313,8 @@ selected_auto_bettor_filters = []  # List of filter names selected for auto-bett
 odds_ev_monitors: Dict[str, EvMonitorImpl] = {}  # filter_name -> OddsEVMonitor
 odds_ev_monitor = None  # primary monitor (first selected dashboard filter)
 
-# Default filter: "Kalshi All Sports (3 Sharps Live)" — BookieBeats-style; displayBooks/sharps from .env
-# (ODDS_API_BOOKMAKERS / ODDS_API_DEVIG_SHARPS). No Pinnacle; Polymarket + Betfair included.
+# Default filter: "Kalshi All Sports (3 Sharps Live)" — displayBooks = ODDS_API_BOOKMAKERS master list.
+# Sharps: all subscribed books except Kalshi unless ODDS_API_DEVIG_SHARPS is set (filter JSON can still override).
 DEFAULT_FILTER_NAME = "Kalshi All Sports (3 Sharps Live)"
 _DEFAULT_SHARPS_ORDER = [
     "Circa", "BookMaker", "Novig", "ProphetX", "SportTrade",
@@ -343,7 +345,7 @@ DEFAULT_FILTER_PAYLOAD = {
         "minSharpBooks": 3,
         "hold": [{"book": "Any", "max": 8}],
     },
-    "oddsRanges": [{"book": "Any", "min": -200, "max": 200}],
+    "oddsRanges": [{"book": "Any", "min": -500, "max": 500}],
     "minLimits": [{"book": "Kalshi", "min": 75}],
     "minSharpLimits": [
         {"book": "BookMaker", "min": 250},
@@ -385,7 +387,7 @@ CBB_FILTER_PAYLOAD = {
         "minSharpBooks": 2,
         "hold": [{"book": "Any", "max": 8}],
     },
-    "oddsRanges": [{"book": "Any", "min": -200, "max": 200}],
+    "oddsRanges": [{"book": "Any", "min": -500, "max": 500}],
     "minLimits": [{"book": "Any", "min": 25}, {"book": "Kalshi", "min": 75}],
     "minSharpLimits": [
         {"book": "Novig", "min": 1000},
@@ -423,10 +425,8 @@ if _sharps_csv:
         if x.strip() and _dnorm(x) != "pinnacle"
     ]
 else:
-    sharps_list = [
-        b for b in _DEFAULT_SHARPS_ORDER
-        if _dnorm(b) in _disp_set and _dnorm(b) != "kalshi"
-    ]
+    # Pool for minSharpBooks: every book in ODDS_API_BOOKMAKERS except Kalshi (target leg).
+    sharps_list = [b for b in display_books_list if _dnorm(b) != "kalshi"]
 if not sharps_list:
     sharps_list = ["FanDuel", "DraftKings", "Circa"]
 
@@ -459,6 +459,58 @@ _merge_min_sharp_limits(CBB_FILTER_PAYLOAD, cbb_sharps)
 # By default, both filters should be selected for both dashboard and auto-bettor
 selected_dashboard_filters = [DEFAULT_FILTER_NAME, CBB_FILTER_NAME]
 selected_auto_bettor_filters = []
+
+
+def _persist_filters_state() -> None:
+    """Write ``saved_filters`` and selection lists to ``USER_FILTERS_STATE_FILE`` (atomic replace)."""
+    try:
+        payload = {
+            "version": 1,
+            "saved_filters": dict(saved_filters),
+            "selected_dashboard_filters": list(selected_dashboard_filters),
+            "selected_auto_bettor_filters": list(selected_auto_bettor_filters),
+        }
+        tmp = USER_FILTERS_STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, USER_FILTERS_STATE_FILE)
+    except OSError as exc:
+        print(f"[DASHBOARD] Could not persist filter state ({USER_FILTERS_STATE_FILE}): {exc}")
+
+
+def _load_filters_state() -> None:
+    """Overlay disk state onto ``saved_filters`` / selections (invalid names dropped)."""
+    global saved_filters, selected_dashboard_filters, selected_auto_bettor_filters
+    if not os.path.isfile(USER_FILTERS_STATE_FILE):
+        return
+    try:
+        with open(USER_FILTERS_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"[DASHBOARD] Could not load filter state ({USER_FILTERS_STATE_FILE}): {exc}")
+        return
+    sf = data.get("saved_filters")
+    if isinstance(sf, dict):
+        for name, pl in sf.items():
+            if not isinstance(pl, dict):
+                continue
+            sharps = list((pl.get("devigFilter") or {}).get("sharps") or [])
+            if sharps:
+                _merge_min_sharp_limits(pl, sharps)
+            saved_filters[name] = pl
+    dash = data.get("selected_dashboard_filters")
+    if isinstance(dash, list):
+        validated = [str(x) for x in dash if isinstance(x, str) and x in saved_filters]
+        if validated:
+            selected_dashboard_filters = validated
+    auto_sel = data.get("selected_auto_bettor_filters")
+    if isinstance(auto_sel, list):
+        selected_auto_bettor_filters = [
+            str(x) for x in auto_sel if isinstance(x, str) and x in saved_filters
+        ]
+
+
+_load_filters_state()
 
 
 def _live_odds_display_books() -> List[str]:
@@ -619,12 +671,8 @@ def _live_best_side(prices: Dict[str, Dict[str, Any]], side_key: str) -> Tuple[O
 
 
 def _default_odds_screen_sports() -> List[str]:
-    """Sport slugs passed to Odds-API /events (hyphenated where required by API docs)."""
-    raw = os.getenv(
-        "ODDS_API_SPORTS",
-        "baseball,basketball,ice-hockey,american-football,football,tennis",
-    )
-    out = [sport_slug_query_for_api(x) for x in raw.split(",") if x.strip()]
+    """Sport slugs for Odds-API /events UI paths — same resolution as ``odds_api_sports_list`` (max 15 for safety)."""
+    out = odds_api_sports_list()
     return out[:15] if out else ["baseball", "basketball", "ice-hockey"]
 
 
@@ -3405,6 +3453,7 @@ def run_monitor_loop():
         for filter_name in all_selected_filters:
             if filter_name in odds_ev_monitors:
                 monitor = odds_ev_monitors[filter_name]
+                monitor.monitor_label = filter_name
                 monitors_to_start.append((filter_name, monitor))
             else:
                 # Create monitor if it doesn't exist
@@ -3412,6 +3461,7 @@ def run_monitor_loop():
                 if filter_payload:
                     monitor = EvMonitorImpl(auth_token=None)
                     monitor.set_filter(filter_payload)
+                    monitor.monitor_label = filter_name
                     monitor.poll_interval = monitor_poll_seconds()
                     odds_ev_monitors[filter_name] = monitor
                     monitors_to_start.append((filter_name, monitor))
@@ -7154,12 +7204,12 @@ def get_max_bet():
 
 @app.route("/api/broad_scan_pregame", methods=["GET", "POST"])
 def broad_scan_pregame():
-    """Read/update whether diagnostic broad scan merges pregame MLB/NBA/NHL /events (class-level, no .env)."""
+    """Read/update whether the live diagnostic scan merges pregame /events (off by default; enable in Settings)."""
     from odds_ev_monitor import OddsEVMonitor
 
     if request.method == "POST":
         data = request.get_json(silent=True) or {}
-        OddsEVMonitor.broad_scan_include_pregame = bool(data.get("include", True))
+        OddsEVMonitor.broad_scan_include_pregame = bool(data.get("include", False))
     return jsonify({"include": OddsEVMonitor.broad_scan_include_pregame})
 
 
@@ -7352,6 +7402,7 @@ def bot_control():
                     for filter_name in all_selected_filters:
                         if filter_name in odds_ev_monitors:
                             monitor = odds_ev_monitors[filter_name]
+                            monitor.monitor_label = filter_name
                             if not monitor.running:
                                 success = await monitor.start()
                                 if success:
@@ -7362,6 +7413,7 @@ def bot_control():
                             if filter_payload:
                                 monitor = EvMonitorImpl(auth_token=None)
                                 monitor.set_filter(filter_payload)
+                                monitor.monitor_label = filter_name
                                 monitor.poll_interval = monitor_poll_seconds()
                                 odds_ev_monitors[filter_name] = monitor
                                 success = await monitor.start()
@@ -8153,15 +8205,21 @@ def set_filters():
 def save_filter():
     """Save a new filter or update an existing one"""
     global saved_filters
-    data = request.json
-    filter_name = data.get('name')
-    filter_payload = data.get('payload')
-    
+    data = request.json or {}
+    filter_name = str(data.get("name") or "").strip()
+    filter_payload = data.get("payload")
+
     if not filter_name or not filter_payload:
         return jsonify({'error': 'Name and payload required'}), 400
-    
+    if not isinstance(filter_payload, dict):
+        return jsonify({'error': 'payload must be a JSON object'}), 400
+
+    sharps = list((filter_payload.get("devigFilter") or {}).get("sharps") or [])
+    _merge_min_sharp_limits(filter_payload, sharps)
+
     saved_filters[filter_name] = filter_payload
     print(f"Saved filter: {filter_name}")
+    _persist_filters_state()
     return jsonify({'success': True, 'saved_filters': saved_filters})
 
 
@@ -8169,12 +8227,12 @@ def save_filter():
 def delete_filter():
     """Delete a saved filter"""
     global saved_filters, selected_dashboard_filters, selected_auto_bettor_filters
-    data = request.json
-    filter_name = data.get('name')
-    
+    data = request.json or {}
+    filter_name = str(data.get("name") or "").strip()
+
     if not filter_name:
         return jsonify({'error': 'Filter name required'}), 400
-    
+
     if filter_name == DEFAULT_FILTER_NAME or filter_name == CBB_FILTER_NAME:
         return jsonify({'error': 'Cannot delete default filters'}), 400
     
@@ -8190,8 +8248,9 @@ def delete_filter():
             odds_ev_monitors[filter_name].running = False
             del odds_ev_monitors[filter_name]
         print(f"Deleted filter: {filter_name}")
+        _persist_filters_state()
         return jsonify({'success': True, 'saved_filters': saved_filters})
-    
+
     return jsonify({'error': 'Filter not found'}), 404
 
 
@@ -8229,6 +8288,7 @@ def set_selected_filters():
             del odds_ev_monitors[filter_name]
     
     # Restart monitors with new selections (will be handled by monitor restart logic)
+    _persist_filters_state()
     return jsonify({
         'success': True,
         'selected_dashboard_filters': selected_dashboard_filters,
@@ -9005,6 +9065,7 @@ def initialize_dashboard():
             if filter_payload:
                 monitor = EvMonitorImpl(auth_token=None)
                 monitor.set_filter(filter_payload)
+                monitor.monitor_label = filter_name
                 monitor.poll_interval = monitor_poll_seconds()
                 odds_ev_monitors[filter_name] = monitor
                 print(f"Initialized monitor for filter: {filter_name}")
@@ -9019,6 +9080,7 @@ def initialize_dashboard():
         # Fallback to default monitor
         odds_ev_monitor = EvMonitorImpl(auth_token=None)
         odds_ev_monitor.set_filter(DEFAULT_FILTER_PAYLOAD)
+        odds_ev_monitor.monitor_label = DEFAULT_FILTER_NAME
         odds_ev_monitor.poll_interval = monitor_poll_seconds()
     
     # Connect WebSocket for real-time updates

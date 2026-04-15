@@ -1,22 +1,25 @@
 """
 Async client for Odds-API.io (https://odds-api.io).
 
-FREE TIER SAFE — default sports focus MLB/NBA via league filtering; tune with ODDS_API_SPORTS.
+FREE TIER SAFE — default sports are liquidity-focused majors when ``ODDS_API_SPORTS`` is unset; override with a comma list.
 UPGRADE PATH: add WebSocket here (see https://docs.odds-api.io/guides/websockets) instead of polling.
 
 Env:
   ODDS_API_KEY          — required for authenticated endpoints
   ODDS_API_BASE         — default https://api.odds-api.io/v3
   ODDS_API_BOOKMAKERS   — comma list, e.g. Kalshi,FanDuel (display names for API)
-  ODDS_API_SPORTS       — comma sport slugs (API or legacy); see sport_slug_query_for_api()
+  ODDS_API_SPORTS       — comma sport slugs; unset / empty / ``all`` → MLB/NBA/NHL/NFL+CBB+CFB/soccer only (see LIQUIDITY_DEFAULT_ODDS_API_SPORTS)
   ODDS_API_LEAGUE_MLB   — optional /events league slug for MLB (default usa-mlb)
   ODDS_API_LEAGUE_NBA   — optional (default usa-nba)
   ODDS_API_LEAGUE_NHL   — optional (default usa-nhl)
   ODDS_API_LEAGUE_NFL   — optional (default usa-nfl)
   ODDS_API_MAX_REQUESTS_PER_HOUR — soft cap (default 100)
   ODDS_API_VALUE_BETS_TTL_SEC    — cache TTL for /value-bets (default 25)
-  ODDS_API_ODDS_TTL_SEC          — cache TTL for /odds and /odds/multi (default 35)
+  ODDS_API_ODDS_TTL_SEC          — cache TTL for /odds and /odds/multi when not using live-odds TTL (default 35)
   ODDS_API_EVENTS_TTL_SEC        — cache TTL for /events (default 120)
+  ODDS_API_LIVE_EVENTS_TTL_SEC   — cache TTL for /events/live only (default 1200s ≈ 20m; slate changes slowly)
+  ODDS_API_LIVE_ODDS_TTL_SEC     — cache TTL for /odds/multi when monitors pass live refresh (default 0 = fresh each poll)
+  ODDS_API_MAX_REQUESTS_PER_HOUR — soft client throttle (default 5000; lower on free tiers)
   ODDS_API_MULTI_PARALLEL_BOOKS  — default true: one /odds/multi per book (parallel) + merge, so all books appear (API truncates when many are listed in one query).
   ODDS_API_MULTI_PARALLEL_LIMIT  — max concurrent multi requests (default 12); cap if your host limits parallel connections.
   ODDS_DEBUG_MODE                — verbose inspection (see odds_ev_monitor)
@@ -182,6 +185,43 @@ def sport_slug_query_for_api(slug: str) -> str:
     return s
 
 
+# When ``ODDS_API_SPORTS`` is unset, empty, or ``all`` / ``*`` / ``everything``: use this set (Odds-API ``sport`` values).
+# ``basketball`` covers NBA and NCAA men's hoops; ``american-football`` covers NFL and NCAA football; ``football`` is soccer.
+# Keeping these year-round avoids missing CBB/CFB when seasons start; off-season leagues mostly return empty /events rows (cached).
+LIQUIDITY_DEFAULT_ODDS_API_SPORTS: Tuple[str, ...] = (
+    "baseball",
+    "basketball",
+    "ice-hockey",
+    "american-football",
+    "football",
+)
+
+
+def odds_api_sports_list() -> List[str]:
+    """
+    Sport slugs for multi-sport pregame ``/events`` fetches and ``OddsAPIClient.sports_slugs``.
+
+    - **Unset or empty** → ``LIQUIDITY_DEFAULT_ODDS_API_SPORTS`` (high-liquidity majors + soccer).
+    - **``all`` / ``*`` / ``everything``** → same liquidity set (not the full API catalog), to limit HTTP toward 5k/hr.
+      Set an explicit comma-separated list to add tennis, MMA, etc.
+    - Otherwise → comma/semicolon list, each passed through ``sport_slug_query_for_api``.
+    """
+    raw = (os.getenv("ODDS_API_SPORTS") or "").strip()
+    if not raw or raw.lower() in ("all", "*", "everything"):
+        src: Tuple[str, ...] = LIQUIDITY_DEFAULT_ODDS_API_SPORTS
+    else:
+        src = tuple(x.strip() for x in raw.replace(";", ",").split(",") if x.strip())
+    seen: set = set()
+    out: List[str] = []
+    for s in src:
+        q = sport_slug_query_for_api(s)
+        k = q.lower()
+        if k not in seen:
+            seen.add(k)
+            out.append(q)
+    return out
+
+
 def normalize_sport_slug_key(slug: str) -> str:
     """Normalize for comparing API event.sport.slug to UI selection."""
     return sport_slug_query_for_api(slug).replace("-", "")
@@ -301,6 +341,10 @@ class _TTLCache:
                 return None
             return val
 
+    async def invalidate(self, key: str) -> None:
+        async with self._lock:
+            self._data.pop(key, None)
+
 
 class OddsAPIClient:
     """Minimal async Odds-API.io v3 client with TTL caches and hourly rate limiting."""
@@ -314,12 +358,23 @@ class OddsAPIClient:
         self.api_key = api_key or os.getenv("ODDS_API_KEY", "")
         self.base_url = (base_url or os.getenv("ODDS_API_BASE", "https://api.odds-api.io/v3")).rstrip("/")
         self.bookmakers = odds_api_master_bookmakers()
-        raw_sports = _parse_csv("ODDS_API_SPORTS", "baseball,basketball")
-        self.sports_slugs = [sport_slug_query_for_api(s) for s in raw_sports if s.strip()]
-        self.max_rph = int(os.getenv("ODDS_API_MAX_REQUESTS_PER_HOUR", "100"))
+        self.sports_slugs = odds_api_sports_list()
+        self.max_rph = int(os.getenv("ODDS_API_MAX_REQUESTS_PER_HOUR", "5000"))
         self._vb_ttl = float(os.getenv("ODDS_API_VALUE_BETS_TTL_SEC", "25"))
         self._odds_ttl = float(os.getenv("ODDS_API_ODDS_TTL_SEC", "35"))
         self._ev_ttl = float(os.getenv("ODDS_API_EVENTS_TTL_SEC", "120"))
+        _live_ttl_raw = os.getenv("ODDS_API_LIVE_EVENTS_TTL_SEC")
+        if _live_ttl_raw is not None and str(_live_ttl_raw).strip() != "":
+            self._live_events_ttl = float(_live_ttl_raw)
+        else:
+            # Live *slate* (which games exist): 15–30 min is fine; decouple from line refresh poll.
+            self._live_events_ttl = max(60.0, min(2400.0, 1200.0))
+        _lod_raw = os.getenv("ODDS_API_LIVE_ODDS_TTL_SEC")
+        if _lod_raw is not None and str(_lod_raw).strip() != "":
+            self._live_odds_multi_ttl = float(_lod_raw)
+        else:
+            # 0 = do not cache /odds/multi for monitor-driven live refreshes (all books same “tick”).
+            self._live_odds_multi_ttl = 0.0
 
         self._session_owner = session is None
         self._session = session
@@ -441,21 +496,27 @@ class OddsAPIClient:
         return data if isinstance(data, dict) else {}
 
     async def _get_odds_multi_one_slice(
-        self, ids: str, books_slice: List[str]
+        self,
+        ids: str,
+        books_slice: List[str],
+        *,
+        cache_ttl: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         """Single /odds/multi HTTP for one event-id batch and one bookmaker slice (cached per slice)."""
         if not books_slice:
             return []
+        eff_ttl = self._odds_ttl if cache_ttl is None else float(cache_ttl)
         books_canon = [_canonical_odds_api_bookmaker(b) for b in books_slice]
         books_http = [_bookmaker_for_odds_request(b) for b in books_canon]
         bms = ",".join(books_http)
         key = f"multi:{ids}:{bms}"
-        cached = await self._cache_odds.get_valid(key)
-        if cached is not None:
-            docs = _as_odds_multi_list(cached)
-            if len(books_canon) == 1:
-                _rekey_bookmakers_to_configured_name(docs, books_canon[0])
-            return docs
+        if eff_ttl > 0:
+            cached = await self._cache_odds.get_valid(key)
+            if cached is not None:
+                docs = _as_odds_multi_list(cached)
+                if len(books_canon) == 1:
+                    _rekey_bookmakers_to_configured_name(docs, books_canon[0])
+                return docs
         status, data = await self._odds_multi_http(ids, bms)
         if status == 403 and isinstance(data, str):
             allowed = _books_from_odds_api_403_error(data)
@@ -477,14 +538,20 @@ class OddsAPIClient:
                 return []
             preview = data[:500] if isinstance(data, str) else str(data)[:500]
             raise RuntimeError(f"/odds/multi HTTP {status}: {preview}")
-        if self._odds_ttl > 0:
-            await self._cache_odds.set(key, data, self._odds_ttl)
+        if eff_ttl > 0:
+            await self._cache_odds.set(key, data, eff_ttl)
         docs = _as_odds_multi_list(data)
         if len(books_canon) == 1:
             _rekey_bookmakers_to_configured_name(docs, books_canon[0])
         return docs
 
-    async def get_odds_multi(self, event_ids: List[int], bookmakers: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    async def get_odds_multi(
+        self,
+        event_ids: List[int],
+        bookmakers: Optional[List[str]] = None,
+        *,
+        odds_cache_ttl: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
         """GET /odds/multi — up to 10 event ids per HTTP call.
 
         When ``ODDS_API_MULTI_PARALLEL_BOOKS`` is true (default), fetches **one bookmaker per request**
@@ -492,9 +559,13 @@ class OddsAPIClient:
         often omits most books if you pass all 10 in a single ``bookmakers=`` param; per-book calls
         return full lines for each book so the live grid and devig see all configured books together.
         Set ``ODDS_API_MULTI_PARALLEL_BOOKS=false`` to send one request with every book (legacy).
+
+        ``odds_cache_ttl``: per-request cache TTL for these slices. ``None`` uses ``ODDS_API_ODDS_TTL_SEC``.
+        Monitors pass ``_live_odds_multi_ttl`` (default 0) so consecutive polls do not reuse stale merged books.
         """
         if not event_ids:
             return []
+        eff_multi_ttl = self._odds_ttl if odds_cache_ttl is None else float(odds_cache_ttl)
         books = [_canonical_odds_api_bookmaker(b) for b in (bookmakers or self.bookmakers)]
         parallel_books = os.getenv("ODDS_API_MULTI_PARALLEL_BOOKS", "true").lower() in (
             "1",
@@ -513,14 +584,14 @@ class OddsAPIClient:
             part = [int(x) for x in event_ids[i : i + 10]]
             ids = ",".join(str(x) for x in part)
             if not parallel_books or len(books) <= 1:
-                out.extend(await self._get_odds_multi_one_slice(ids, books))
+                out.extend(await self._get_odds_multi_one_slice(ids, books, cache_ttl=eff_multi_ttl))
                 continue
             sem = asyncio.Semaphore(par_lim)
 
             async def _one_book(b: str) -> List[Dict[str, Any]]:
                 async with sem:
                     try:
-                        return await self._get_odds_multi_one_slice(ids, [b])
+                        return await self._get_odds_multi_one_slice(ids, [b], cache_ttl=eff_multi_ttl)
                     except RuntimeError:
                         return []
 
@@ -592,12 +663,23 @@ class OddsAPIClient:
         )
         return data if isinstance(data, list) else []
 
-    async def list_live_events(self, sport: Optional[str] = None) -> List[Dict[str, Any]]:
-        """GET /events/live — docs: optional ``sport`` filter (API sport slug)."""
+    async def list_live_events(
+        self,
+        sport: Optional[str] = None,
+        *,
+        force_refresh: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """GET /events/live — docs: optional ``sport`` filter (API sport slug).
+
+        ``force_refresh``: drop cache entry first (e.g. right before first pitch); default uses
+        ``ODDS_API_LIVE_EVENTS_TTL_SEC`` (long slate refresh independent of line poll).
+        """
         api_s: Optional[str] = None
         if sport and str(sport).strip().lower() not in ("", "all"):
             api_s = sport_slug_query_for_api(str(sport))
         key = f"events:live:{api_s or 'all'}"
+        if force_refresh:
+            await self._cache_events.invalidate(key)
         cached = await self._cache_events.get_valid(key)
         if cached is not None:
             return cached
@@ -609,7 +691,7 @@ class OddsAPIClient:
             params,
             cache=self._cache_events,
             cache_key=key,
-            ttl=min(self._ev_ttl, 30.0),
+            ttl=self._live_events_ttl,
         )
         return data if isinstance(data, list) else []
 

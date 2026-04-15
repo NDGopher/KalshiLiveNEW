@@ -3,6 +3,7 @@ Drop-in replacement for BookieBeatsAPIMonitor using Odds-API.io.
 
 FREE TIER SAFE -- poll interval defaults to 45s, shared client + TTL caches; optional
   ODDS_API_MLB_NBA_ONLY=true restricts alerts to NBA/MLB leagues.
+  Live **slate** (/events/live) and live **lines** (/odds/multi) use different TTLs in ``odds_api_client`` (see env README / BOOKIEBEATS roadmap).
 UPGRADE PATH: add WebSocket here (Odds-API.io WS) and push deltas instead of polling.
 
 Public interface matches BookieBeatsAPIMonitor (same __init__ signature, callbacks, loop).
@@ -12,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import math
 import json
 import os
 import re
@@ -46,6 +48,7 @@ from ev_calculator import (
 from odds_api_client import (
     get_shared_odds_client,
     odds_api_master_bookmakers,
+    odds_api_sports_list,
     reset_shared_odds_client,
     _norm_book,
 )
@@ -81,6 +84,8 @@ def print_env_debug(*, standalone: bool = False) -> None:
     print(f"  ODDS_API_BOOKMAKERS: {os.getenv('ODDS_API_BOOKMAKERS', '(unset)')}")
     print(f"  ODDS_API_SPORTS: {os.getenv('ODDS_API_SPORTS', '(unset)')}")
     print(f"  ODDS_POLL_INTERVAL_SECONDS: {os.getenv('ODDS_POLL_INTERVAL_SECONDS', '(unset)')}")
+    print(f"  ODDS_API_LIVE_EVENTS_TTL_SEC: {os.getenv('ODDS_API_LIVE_EVENTS_TTL_SEC', '(unset)')}")
+    print(f"  ODDS_API_LIVE_ODDS_TTL_SEC: {os.getenv('ODDS_API_LIVE_ODDS_TTL_SEC', '(unset)')}")
     print(f"  ODDS_API_MAX_REQUESTS_PER_HOUR: {os.getenv('ODDS_API_MAX_REQUESTS_PER_HOUR', '(unset)')}")
     print(f"  ODDS_API_MLB_NBA_ONLY: {os.getenv('ODDS_API_MLB_NBA_ONLY', '(unset)')}")
     print(f"  ODDS_API_LIVE_ONLY: {os.getenv('ODDS_API_LIVE_ONLY', '(unset)')}")
@@ -224,34 +229,27 @@ def _broad_scan_bucket(ev: Dict[str, Any]) -> Optional[str]:
 
 _BROAD_SCAN_BUCKETS = frozenset({"MLB", "NBA", "NHL", "ICEHOCKEY"})
 
-# When ODDS_API_SPORTS is unset, use this in-code list (no new env vars). /events responses are TTL-cached client-side.
-DEFAULT_ODDS_SCAN_SPORTS = (
-    "baseball",
-    "basketball",
-    "ice-hockey",
-    "american-football",
-    "football",
-    "tennis",
-    "mma",
-    "volleyball",
-    "table-tennis",
-    "handball",
-)
-
 
 def _broad_pregame_sport_slugs() -> List[str]:
-    raw = os.getenv("ODDS_API_SPORTS", "").strip()
-    from odds_api_client import sport_slug_query_for_api
+    """Same resolution as ``odds_api_client.odds_api_sports_list`` (liquidity majors when env unset)."""
+    return odds_api_sports_list()
 
-    if raw:
-        parts: List[str] = []
-        for p in raw.replace(";", ",").split(","):
-            p = p.strip()
-            if not p:
-                continue
-            parts.append(sport_slug_query_for_api(p))
-        return parts or [sport_slug_query_for_api("baseball")]
-    return [sport_slug_query_for_api(s) for s in DEFAULT_ODDS_SCAN_SPORTS]
+
+def _estimate_odds_multi_http_calls(
+    n_ids: int,
+    n_books: int,
+    *,
+    parallel_books: bool,
+    max_scan: int,
+) -> int:
+    """Upper bound on /odds/multi GETs for one merged refresh (parallel = one request per book per chunk)."""
+    n = min(max(0, int(n_ids)), max(1, int(max_scan)))
+    if n == 0:
+        return 0
+    chunks = max(1, math.ceil(n / 10))
+    if not parallel_books or n_books <= 1:
+        return chunks
+    return chunks * max(1, int(n_books))
 
 
 def _event_league_exact_display(ev: Dict[str, Any]) -> str:
@@ -313,6 +311,24 @@ def _kalshi_scan_gameline_markets(bks: Dict[str, Any]) -> List[Tuple[str, Dict[s
         if is_ml or is_sp or is_tot:
             out.append((n, m))
     return out
+
+
+def _odds_doc_has_kalshi_tradable_gameline(doc: Any) -> bool:
+    """True if merged /odds/multi doc has a Kalshi gameline row with at least one numeric price > 1."""
+    if not isinstance(doc, dict):
+        return False
+    bks = doc.get("bookmakers")
+    if not isinstance(bks, dict):
+        return False
+    for _mname, kal_mk in _kalshi_scan_gameline_markets(bks):
+        for row in kal_mk.get("odds") or []:
+            if not isinstance(row, dict):
+                continue
+            for side in ("home", "away", "over", "under"):
+                d = _float_dec(row.get(side))
+                if d is not None and d > 1.0:
+                    return True
+    return False
 
 
 def _numeric_close(a: Any, b: Any, tol: float = 1e-5) -> bool:
@@ -429,7 +445,7 @@ async def _diag_fetch_pregame_major_blocks(client: Any, cap: int) -> Tuple[List[
 
 async def _diag_fetch_pregame_by_sports(client: Any, cap_per_sport: int) -> List[Dict[str, Any]]:
     """
-    Pregame /events rows for each sport in ODDS_API_SPORTS (or DEFAULT_ODDS_SCAN_SPORTS).
+    Pregame /events rows for each sport from ``odds_api_sports_list`` (``ODDS_API_SPORTS`` or liquidity defaults).
     Sequential per sport to avoid connection bursts; responses use the client's TTL cache.
     """
     slugs = _broad_pregame_sport_slugs()
@@ -950,8 +966,10 @@ class OddsEVMonitor:
     # ODDS_API_LIVE_ONLY for the pipeline only). Set from dashboard toggle or
     # ODDS_UI_INCLUDE_PREGAME_VALUE_BETS in .env.
     include_pregame_value_bets: bool = False
-    # Diagnostic broad scan: when True, merge pregame /events (ODDS_API_SPORTS or in-code defaults) into the scan.
-    broad_scan_include_pregame: bool = True
+    # Diagnostic broad scan: when True, merge pregame /events (slower; extra HTTP per sport). Off until UI enables it.
+    broad_scan_include_pregame: bool = False
+    # Serialize broad-scan HTTP across filters (same process) to avoid duplicate /events/live + /odds/multi bursts.
+    _broad_scan_lock: Optional[asyncio.Lock] = None
 
     def __init__(
         self,
@@ -981,6 +999,7 @@ class OddsEVMonitor:
         self._target_book = "Kalshi"
         self._reference_book = "FanDuel"
         self._last_cycle_alert_count = 0
+        self.monitor_label: str = "OddsEVMonitor"
         self._debug_stats: Dict[str, int] = {}
         self._debug_aggregate = {
             "events_max": 0,
@@ -1277,7 +1296,11 @@ class OddsEVMonitor:
 
         odds_docs: List[Dict[str, Any]] = []
         try:
-            odds_docs = await client.get_odds_multi(ordered_ids, odds_api_master_bookmakers())
+            odds_docs = await client.get_odds_multi(
+                ordered_ids,
+                odds_api_master_bookmakers(),
+                odds_cache_ttl=client._live_odds_multi_ttl,
+            )
         except Exception as e:
             print(f"[DEBUG] odds/multi error: {e}")
             return stats
@@ -1647,7 +1670,7 @@ class OddsEVMonitor:
 
     async def _fetch_alerts_live_broad_scan(self, client: Any) -> List[EvAlert]:
         """
-        Merge /events/live + pregame /events (sports from ODDS_API_SPORTS or DEFAULT_ODDS_SCAN_SPORTS),
+        Merge /events/live + optional pregame /events (sports from ``odds_api_sports_list``),
         respect dashboard ``leagues`` filter for which events enter the scan, batch /odds/multi once,
         then build synthetic value-bet rows for every Kalshi gameline (moneyline, spread, total).
         """
@@ -1785,14 +1808,54 @@ class OddsEVMonitor:
 
         odds_by_id: Dict[int, Dict[str, Any]] = {}
         if event_ids:
+            parallel_books = os.getenv("ODDS_API_MULTI_PARALLEL_BOOKS", "true").lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+            est_multi = _estimate_odds_multi_http_calls(
+                len(event_ids),
+                len(multi_books),
+                parallel_books=parallel_books,
+                max_scan=max_ids,
+            )
+            if _env_bool("ODDS_HTTP_BUDGET_LOG", "false") or not getattr(self, "_http_budget_logged", False):
+                self._http_budget_logged = True
+                poll = max(float(self.poll_interval), 0.5)
+                n_mon = max(1, int(os.getenv("ODDS_HTTP_BUDGET_ASSUMED_MONITORS", "2")))
+                rough = int((3600.0 / poll) * float(est_multi) * float(n_mon))
+                print(
+                    f"[HTTP BUDGET] filter={self.monitor_label!r} ~{est_multi} GET /odds/multi per poll "
+                    f"(ids≤{max_ids} books={len(multi_books)} parallel_books={parallel_books}) | "
+                    f"live_slate_ttl={client._live_events_ttl:.0f}s multi_cache_ttl={client._live_odds_multi_ttl}s | "
+                    f"order_of_mag_upper≈{rough} multi/hour if {n_mon} filters align (tune ODDS_LIVE_SCAN_MAX_EVENTS, poll, books)"
+                )
             try:
-                multi = await client.get_odds_multi(event_ids, multi_books)
+                multi = await client.get_odds_multi(
+                    event_ids,
+                    multi_books,
+                    odds_cache_ttl=client._live_odds_multi_ttl,
+                )
                 for doc in multi:
                     eid = doc.get("id")
                     if eid is not None:
                         odds_by_id[int(eid)] = doc
             except Exception as ex:
                 print(f"[MONITOR] [WARN] live broad scan odds/multi failed: {ex}")
+
+        _n_before_k = len(odds_by_id)
+        odds_by_id = {
+            int(eid): d
+            for eid, d in odds_by_id.items()
+            if _odds_doc_has_kalshi_tradable_gameline(d)
+        }
+        _dropped_k = _n_before_k - len(odds_by_id)
+        if _dropped_k:
+            print(
+                f"[PIPELINE] Odds/multi: dropped {_dropped_k} event(s) with no tradable Kalshi gameline "
+                f"(skip EV scan on those ids; HTTP already spent in batch)."
+            )
 
         docs_list = list(odds_by_id.values())
         print(
@@ -1959,7 +2022,10 @@ class OddsEVMonitor:
 
         # Diagnostic default ON: live + pregame gameline scan + batched /odds/multi (no /value-bets).
         if _diagnostic_mode():
-            return await self._fetch_alerts_live_broad_scan(client)
+            if OddsEVMonitor._broad_scan_lock is None:
+                OddsEVMonitor._broad_scan_lock = asyncio.Lock()
+            async with OddsEVMonitor._broad_scan_lock:
+                return await self._fetch_alerts_live_broad_scan(client)
 
         try:
             raw_vb = await client.get_value_bets(self._target_book, True)
@@ -2030,7 +2096,11 @@ class OddsEVMonitor:
                 if not multi_books:
                     multi_books = ["Kalshi", self._reference_book]
                 self._pipeline_disp_book_count = len(multi_books)
-                multi = await client.get_odds_multi(event_ids, multi_books)
+                multi = await client.get_odds_multi(
+                    event_ids,
+                    multi_books,
+                    odds_cache_ttl=client._live_odds_multi_ttl,
+                )
                 for doc in multi:
                     eid = doc.get("id")
                     if eid is not None:
@@ -2547,7 +2617,13 @@ class OddsEVMonitor:
 
     async def monitor_loop(self) -> None:
         print("[MONITOR] Starting Odds-API.io monitoring loop...")
-        print(f"   Polling every {self.poll_interval}s (FREE TIER SAFE -- only MLB+NBA when ODDS_API_MLB_NBA_ONLY=true)")
+        print(
+            f"   Polling every {self.poll_interval}s — live /odds/multi uses parallel per-book merge; "
+            f"live slate TTL is separate (see ODDS_API_LIVE_EVENTS_TTL_SEC)"
+        )
+        # Desync filters so two dashboard monitors do not hit Odds-API on the same tick.
+        h = int(hashlib.md5(self.monitor_label.encode("utf-8")).hexdigest()[:8], 16)
+        await asyncio.sleep((h % 36) * 0.08)
         while self.running:
             try:
                 await self.check_for_new_alerts()
