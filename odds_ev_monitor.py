@@ -42,6 +42,7 @@ from execution_guard import is_kalshi_ticker, paper_kalshi_ticker
 from ev_calculator import (
     EVCalculator,
     LIVE_REC_POWER_MAX_AGE_SEC,
+    LIVE_TAKE_MAX_AGE_SEC,
     _fair_prob_power_relaxed_three_way,
     _fair_prob_power_relaxed_two_way,
     _passes_hold,
@@ -1276,12 +1277,80 @@ def _book_updated_epoch_seconds(value: Any) -> Optional[float]:
 
 
 def _is_live_fresh_quote(value: Any, now_ts: Optional[float] = None) -> bool:
-    """Missing ts stays eligible (fixtures). Quotes older than 45s are stale."""
+    """Missing ts stays eligible (fixtures). Quotes older than 45s are stale.
+
+    Recs only. Take books use ``_is_live_fresh_take_quote`` (fail-closed).
+    """
     epoch = _book_updated_epoch_seconds(value)
     if epoch is None:
         return True
     now = float(now_ts if now_ts is not None else time.time())
     return (now - epoch) <= float(LIVE_REC_POWER_MAX_AGE_SEC) + 1e-9
+
+
+def _is_live_fresh_take_quote(
+    value: Any,
+    now_ts: Optional[float] = None,
+    max_age: Optional[float] = None,
+) -> bool:
+    """Take books fail-closed on a missing stamp. Stale last is not a take."""
+    epoch = _book_updated_epoch_seconds(value)
+    if epoch is None:
+        return False
+    now = float(now_ts if now_ts is not None else time.time())
+    limit = float(max_age if max_age is not None else LIVE_TAKE_MAX_AGE_SEC)
+    return (now - epoch) <= limit + 1e-9
+
+
+def _kalshi_take_stamp(
+    odds_doc: Optional[Dict[str, Any]], k_row: Optional[Dict[str, Any]] = None
+) -> Any:
+    if isinstance(k_row, dict):
+        ts = k_row.get("book_updated_at") or k_row.get("updated_at")
+        if ts is not None and ts != "":
+            return ts
+    if not isinstance(odds_doc, dict):
+        return None
+    stamps = odds_doc.get("book_updated_at")
+    if isinstance(stamps, dict):
+        for key, val in stamps.items():
+            if _norm_book(str(key)).lower() == "kalshi" and val is not None and val != "":
+                return val
+    return None
+
+
+def _kalshi_take_quote_is_live(
+    odds_doc: Optional[Dict[str, Any]],
+    event: Optional[Dict[str, Any]] = None,
+    k_row: Optional[Dict[str, Any]] = None,
+    now_ts: Optional[float] = None,
+) -> bool:
+    """Soccer live Kalshi take must be ≤15s. Frozen Odds-API last is not a take.
+
+    Fixtures with no board stamps stay eligible. A live board that stamps recs
+    but not Kalshi (or stamps Kalshi 2m ago) fail-closes.
+    """
+    stamps = None
+    if isinstance(odds_doc, dict) and isinstance(odds_doc.get("book_updated_at"), dict):
+        stamps = odds_doc["book_updated_at"]
+    soccer = _event_is_soccer(event) or _event_is_soccer(odds_doc if isinstance(odds_doc, dict) else None)
+    live = bool(
+        (isinstance(odds_doc, dict) and odds_doc.get("live"))
+        or (isinstance(event, dict) and (event.get("live") or event.get("isLive")))
+    )
+    ts = _kalshi_take_stamp(odds_doc, k_row)
+    if not soccer:
+        if ts is None:
+            return True
+        return _is_live_fresh_quote(ts, now_ts)
+    max_age = LIVE_TAKE_MAX_AGE_SEC if live else LIVE_REC_POWER_MAX_AGE_SEC
+    if ts is None:
+        if stamps and any(
+            v is not None and _norm_book(str(k)).lower() != "kalshi" for k, v in stamps.items()
+        ):
+            return False
+        return True
+    return _is_live_fresh_take_quote(ts, now_ts, max_age=max_age)
 
 
 def _rec_quote_in_power(
@@ -1549,14 +1618,17 @@ def _build_display_books_payload(
 ) -> Dict[str, List[Dict[str, Any]]]:
     take_canon = _norm_book(str(take_book or "Kalshi")) or "Kalshi"
     take_key = "".join(ch.lower() for ch in take_canon if ch.isalnum())
-    rows_out: List[Dict[str, Any]] = [
-        {
-            "book": take_canon,
-            "book_key": take_key or "kalshi",
-            "odds": kalshi_am,
-            "limit": float(_row_limit_hint(k_row) or 0.0),
-        }
-    ]
+    take_blob: Dict[str, Any] = {
+        "book": take_canon,
+        "book_key": take_key or "kalshi",
+        "odds": kalshi_am,
+        "limit": float(_row_limit_hint(k_row) or 0.0),
+    }
+    if isinstance(k_row, dict):
+        take_ts = k_row.get("book_updated_at") or k_row.get("updated_at")
+        if take_ts is not None:
+            take_blob["book_updated_at"] = take_ts
+    rows_out: List[Dict[str, Any]] = [take_blob]
     if not bks or not isinstance(bks, dict):
         return {pick: rows_out}
     ref = k_row if isinstance(k_row, dict) and k_row else None
@@ -3124,6 +3196,15 @@ class OddsEVMonitor:
         elif take_canon.lower() == "plive":
             return None
         if k_dec is None or k_dec <= 1.0:
+            return None
+        if take_canon.lower() == "kalshi" and not _kalshi_take_quote_is_live(
+            odds_doc, ev_merged, k_row
+        ):
+            if _diagnostic_mode():
+                print(
+                    f"[PIPELINE] Dropped: stale or unstamped Kalshi take | {teams} | {mname} | "
+                    f"side={bet_side}"
+                )
             return None
         ref_for_gate = canon_vb or (k_row if k_row else None)
         if _soccer_ml_home_away_suppressed(ev_merged, mname, bet_side, bks, ref_for_gate):

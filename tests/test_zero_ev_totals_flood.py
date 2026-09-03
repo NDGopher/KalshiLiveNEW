@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ev_calculator import LIVE_REC_POWER_MAX_AGE_SEC, american_to_decimal, is_plus_print_ev
+from ev_calculator import LIVE_REC_POWER_MAX_AGE_SEC, LIVE_TAKE_MAX_AGE_SEC, american_to_decimal, is_plus_print_ev
 from odds_ev_monitor import (
     OddsEVMonitor,
     _scan_strike_key,
@@ -383,6 +383,7 @@ def test_mlb_stale_rec_out_of_power_no_certified_break():
     }
     assert _rec_quote_in_power(stale, nba_live, now) is False
     assert 30.0 <= float(LIVE_REC_POWER_MAX_AGE_SEC) <= 60.0
+    assert float(LIVE_TAKE_MAX_AGE_SEC) == 15.0
 
 
 def test_scan_strike_key_keeps_alts_independent():

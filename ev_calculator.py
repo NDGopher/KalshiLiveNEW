@@ -61,6 +61,9 @@ AUTOBET_TIGHT_PACK_CENTS = 0.15
 AUTOBET_MAX_EV_PCT = 12.0
 # Live recs older than this are out of POWER (tile timers stay). 3h NV is junk.
 LIVE_REC_POWER_MAX_AGE_SEC = 45.0
+# Soccer live Kalshi take. Recs at 0–3s vs a 2m Odds-API last must not print +EV.
+# Tighter than the rec window. PLive baseball keeps its own coeff stale path.
+LIVE_TAKE_MAX_AGE_SEC = 15.0
 
 
 def is_plus_print_ev(ev_percent: Any, min_ev: float = 0.0) -> bool:
