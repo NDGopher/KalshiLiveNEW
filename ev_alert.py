@@ -40,6 +40,8 @@ class EvAlert:
         self.kalshi_last_trade_ts = data.get("kalshi_last_trade_ts")
         # Kalshi or PLive — both are take venues. PLive is never a sharp.
         self.take_book = str(data.get("take_book") or "Kalshi")
+        # Royals-shape allowlist for later auto-bet. Default deny. Switch stays OFF.
+        self.autobet_allow = bool(data.get("autobet_allow", False))
 
     def extract_ticker_from_url(self):
         """Extract Kalshi ticker from market URL."""
@@ -70,4 +72,5 @@ class EvAlert:
             "book_updated_at": self.book_updated_at or {},
             "kalshi_last_trade_ts": self.kalshi_last_trade_ts,
             "take_book": self.take_book,
+            "autobet_allow": self.autobet_allow,
         }

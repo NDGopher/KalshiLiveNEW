@@ -2293,6 +2293,7 @@ async def handle_plive_take_display_alert(alert: EvAlert) -> None:
         "last_seen": time.time(),
         "match_failed": False,
         "strict_pass": getattr(alert, "strict_pass", True),
+        "autobet_allow": False,
         "ev_source": getattr(alert, "ev_source", "plive_take"),
         "take_book": "PLive",
         "book_updated_at": getattr(alert, "book_updated_at", None) or {},
@@ -2860,6 +2861,7 @@ async def handle_new_alert(alert: EvAlert):
             'expiry': (datetime.now() + timedelta(seconds=30)).timestamp(),  # TTL: 30 seconds
             'last_seen': time.time(),  # Track when alert was last seen for stale detection
             'strict_pass': getattr(alert, 'strict_pass', True),
+            'autobet_allow': bool(getattr(alert, 'autobet_allow', False)),
             'ev_source': getattr(alert, 'ev_source', 'odds_api_value_bets'),
             'take_book': getattr(alert, 'take_book', 'Kalshi') or 'Kalshi',
             'book_updated_at': getattr(alert, 'book_updated_at', None) or {},
@@ -4212,6 +4214,7 @@ def run_monitor_loop():
                 alert_data['devig_books'] = getattr(alert, 'devig_books', [])
                 if hasattr(alert, 'strict_pass'):
                     alert_data['strict_pass'] = alert.strict_pass
+                alert_data['autobet_allow'] = bool(getattr(alert, 'autobet_allow', False))
                 # Update last_seen timestamp for stale alert detection
                 alert_data['last_seen'] = time.time()
                 # CRITICAL: Preserve filter_name - use existing if new alert doesn't have it, otherwise update
@@ -4714,6 +4717,14 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
     elif isinstance(alert_data, dict):
         strict_ok = alert_data.get('strict_pass', True)
     if strict_ok is False:
+        return
+    autobet_ok = False
+    if alert is not None:
+        autobet_ok = bool(getattr(alert, "autobet_allow", False))
+    elif isinstance(alert_data, dict):
+        autobet_ok = bool(alert_data.get("autobet_allow", False))
+    if not autobet_ok:
+        # Product lock: only Royals-like Kalshi-best / ≥5 same-sign / two-way few-percent.
         return
     
     # CRITICAL: Check EV threshold FIRST before any processing/logging to avoid wasting time on low-EV alerts

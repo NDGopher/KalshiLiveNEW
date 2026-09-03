@@ -219,6 +219,7 @@ def test_keep_royals_plus163_two_way():
     assert "Poly" not in out["fair_names"]
     assert "PLive" not in out["fair_names"]
     assert out["plus_alert"] is True
+    assert out["autobet_allow"] is True
     # Live printed ~+9.59% is two-way POWER on the rec pack (fair ~+140), not Poly.
     # Do not invent sisters to reprint 9.59. Plus-only on these pluses would be teens.
     assert 4.0 <= out["ev_percent"] <= 14.0

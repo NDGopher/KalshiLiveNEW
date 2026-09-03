@@ -156,6 +156,9 @@ def test_royals_poly_minus455_skip_paint_not_gray():
     assert r["Kalshi"] == {"skip": False, "take": True, "better": False}
     assert r["Polymarket"] == {"skip": True, "take": False, "better": False}
     assert r["PLive"] == {"skip": False, "take": False, "better": False}
+    cell = JS[JS.index("booksTableHtml += ") : JS.index("booksTableHtml += '</div></div>'")]
+    assert "grayed-out" not in cell
+    assert "junk-tile" not in cell
     assert r["Betfair Exchange"] == {"skip": False, "take": False, "better": False}
     assert r["FanDuel"] == {"skip": False, "take": False, "better": False}
     assert r["Caesars"] == {"skip": False, "take": False, "better": False}

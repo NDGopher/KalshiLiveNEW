@@ -43,6 +43,7 @@ from ev_calculator import (
     _fair_prob_power_relaxed_two_way,
     _passes_hold,
     apply_ev_hard_gates,
+    autobet_product_shape,
     decimal_to_american,
     ev_percent_three_methods_multi_sharp,
     ev_percent_three_methods_three_way,
@@ -52,6 +53,7 @@ from ev_calculator import (
     ev_percent_vs_take_american,
     format_ev_percent_display,
     is_junk_vs_kalshi,
+    is_plive_book,
     is_polymarket_book,
     power_average_fair_prob,
     spread_keep_on_labeled_side,
@@ -1378,8 +1380,10 @@ class OddsEVMonitor:
                 "book_updated_at": bet.get("book_updated_at") or {},
                 "kalshi_last_trade_ts": bet.get("kalshi_last_trade_ts"),
                 "take_book": str(bet.get("take_book") or "Kalshi"),
+                "autobet_allow": bool(bet.get("autobet_allow", False)),
             }
             alert = EvAlert(alert_data)
+            alert.autobet_allow = bool(bet.get("autobet_allow", False))
             alert.book_updated_at = alert_data["book_updated_at"]
             alert.kalshi_last_trade_ts = alert_data["kalshi_last_trade_ts"]
             alert.take_book = str(bet.get("take_book") or "Kalshi")
@@ -2942,6 +2946,39 @@ class OddsEVMonitor:
             if _diagnostic_mode():
                 print("[PIPELINE] Dropped: suspect EV (<-100%).")
             return None
+        plus_ok = ev_percent > 0
+        if surviving_books or used_fallback_fair:
+            plus_ok = bool(gated.get("plus_alert"))
+        shape_books = list(panel_books or [])
+        if bks and isinstance(bks, dict):
+            pl_mk = _find_market_block(_markets_list_for_book(bks, "PLive"), mname)
+            pl_row = (
+                _sharp_row_for_market(pl_mk or {}, mname, ref_for_sharps)
+                if ref_for_sharps
+                else (_first_odds_row(pl_mk or {}) or {})
+            )
+            twp = _two_way_pick_opp_decimals(pl_row, bet_side) if pl_row else None
+            if twp:
+                d_pl, d_pl_opp = twp
+                if not any(is_plive_book(b.get("name")) for b in shape_books):
+                    shape_books.append(
+                        {
+                            "name": "PLive",
+                            "american": decimal_to_american(d_pl),
+                            "decimal_pick": d_pl,
+                            "decimal_opp": d_pl_opp,
+                        }
+                    )
+        actual_h = side_signed_line(row_for_pick, bet_side) if _market_is_spread(mname) else None
+        shape = autobet_product_shape(
+            shape_books,
+            kalshi_am,
+            take_book=take_canon,
+            ev_percent=ev_percent,
+            plus_alert=plus_ok,
+            painted_side_hdp=actual_h,
+            actual_side_hdp=actual_h,
+        )
         fd_am = decimal_to_american(fd_dec_for_side) if fd_dec_for_side else kalshi_am
 
         relaxed_fp = copy.deepcopy(self.filter_payload)
@@ -3059,6 +3096,7 @@ class OddsEVMonitor:
                 else str(vb.get("_ev_source") or "odds_api_value_bets")
             ),
             "take_book": take_canon,
+            "autobet_allow": bool(shape["allow"]),
         }
 
     async def check_for_new_alerts(self) -> None:

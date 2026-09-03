@@ -53,6 +53,12 @@ MEDIAN_GATE_TOL = 0.005
 # Identity band. KEEP boards with ~8c of juice (57c vs 65c) must not match this.
 TIGHT_CLUSTER_BAND = 0.04
 TIGHT_CLUSTER_EV_ABS = 2.0
+# Auto-bet product lock (switch stays OFF). Royals-like: Kalshi strictly best
+# vs ≥5 tight same-sign recs, PLive on-pack confirm, two-way POWER few-percent.
+# Brewers-like +14% plus-only / away-sign-wrong must not fire.
+AUTOBET_MIN_SAME_SIGN_RECS = 5
+AUTOBET_TIGHT_PACK_CENTS = 0.15
+AUTOBET_MAX_EV_PCT = 12.0
 
 
 def decimal_to_american(d: float) -> int:
@@ -182,6 +188,108 @@ def two_way_power_fair(pick_american: int, opp_american: int) -> Optional[float]
     if len(fair) < 2:
         return None
     return float(fair[0])
+
+
+def _tight_same_sign_vs_take(book_american: int, take_american: int) -> bool:
+    """Same-sign (or pick'em) and within the auto-bet pack window. Not a real flip."""
+    if is_real_sign_flip(int(book_american), int(take_american)):
+        return False
+    bp = implied_prob_from_american(int(book_american))
+    kp = implied_prob_from_american(int(take_american))
+    if bp is None or kp is None:
+        return False
+    return abs(bp - kp) <= AUTOBET_TIGHT_PACK_CENTS + 1e-12
+
+
+def autobet_product_shape(
+    books: List[Dict[str, Any]],
+    take_american: int,
+    *,
+    take_book: str = "Kalshi",
+    ev_percent: Optional[float] = None,
+    plus_alert: Optional[bool] = None,
+    painted_side_hdp: Optional[float] = None,
+    actual_side_hdp: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Allowlist for later auto-bet. Does not flip the live switch.
+
+    Royals ML +163 vs a tight same-sign pack of ≥5 recs, PLive +118 confirming
+    (not in POWER), honest two-way few-percent EV. Poly −455 is junk.
+    Brewers-like teens from plus-only implieds, or a wrong away hdp, fail.
+    """
+    reasons: List[str] = []
+    if _book_name_key(take_book or "Kalshi") != "kalshi":
+        reasons.append("take_not_kalshi")
+    recs: List[Dict[str, Any]] = []
+    plive_row: Optional[Dict[str, Any]] = None
+    for raw in books or []:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            am = int(raw.get("american") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not am:
+            continue
+        if is_plive_book(raw.get("name")):
+            plive_row = raw
+            continue
+        if is_kalshi_book(raw.get("name")):
+            continue
+        if _tight_same_sign_vs_take(am, int(take_american)):
+            recs.append(raw)
+    if len(recs) < AUTOBET_MIN_SAME_SIGN_RECS:
+        reasons.append("same_sign_recs")
+    sisters = sum(1 for b in recs if float(b.get("decimal_opp") or 0) > 1.0)
+    have_sister_field = any(b.get("decimal_opp") is not None for b in recs)
+    if have_sister_field and sisters < AUTOBET_MIN_SAME_SIGN_RECS:
+        reasons.append("sister_required")
+    pack_for_best = list(recs)
+    if plive_row is not None:
+        try:
+            _pam = int(plive_row.get("american") or 0)
+        except (TypeError, ValueError):
+            _pam = 0
+        if _pam and not is_junk_vs_kalshi(_pam, int(take_american)):
+            pack_for_best.append(plive_row)
+    if count_better_than_kalshi(pack_for_best, int(take_american)) > 0:
+        reasons.append("take_not_best")
+    if plive_row is not None:
+        try:
+            pam = int(plive_row.get("american") or 0)
+        except (TypeError, ValueError):
+            pam = 0
+        if not pam or is_junk_vs_kalshi(pam, int(take_american)):
+            reasons.append("plive_off_pack")
+    if plus_alert is False:
+        reasons.append("no_plus")
+    if ev_percent is not None:
+        ev = float(ev_percent)
+        if ev <= 0:
+            reasons.append("no_plus")
+        elif ev > AUTOBET_MAX_EV_PCT:
+            reasons.append("ev_teens")
+    hdp = spread_keep_on_labeled_side(
+        painted_hdp=painted_side_hdp,
+        actual_hdp=actual_side_hdp,
+        kalshi_hdp=actual_side_hdp,
+        rec_hdp=actual_side_hdp,
+    )
+    if not hdp["allow_keep"]:
+        reasons.extend(hdp["reasons"])
+    # Unique reasons, stable order.
+    seen: Set[str] = set()
+    uniq: List[str] = []
+    for r in reasons:
+        if r not in seen:
+            seen.add(r)
+            uniq.append(r)
+    return {
+        "allow": not uniq,
+        "reasons": uniq,
+        "same_sign_recs": len(recs),
+        "sisters": sisters,
+    }
 
 
 def two_way_power_ev(
@@ -841,6 +949,15 @@ def evaluate_sharp_panel_ev(
         plus_alert = False
         ev_out = min(ev_out, 0.0)
         reasons.extend(hdp_gate["reasons"])
+    shape = autobet_product_shape(
+        books,
+        int(kalshi_american),
+        take_book=take_book,
+        ev_percent=ev_out,
+        plus_alert=plus_alert,
+        painted_side_hdp=painted_side_hdp,
+        actual_side_hdp=kalshi_side_hdp,
+    )
     out = {
         "surviving": surviving,
         "surviving_names": [str(b.get("name") or "") for b in surviving],
@@ -854,6 +971,8 @@ def evaluate_sharp_panel_ev(
         "kalshi_implied": gated["kalshi_implied"],
         "survivor_median_implied": gated.get("survivor_median_implied"),
         "used_fallback": used_fallback,
+        "autobet_allow": bool(shape["allow"]),
+        "autobet_reasons": list(shape["reasons"]),
     }
     return out
 

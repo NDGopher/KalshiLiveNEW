@@ -847,6 +847,7 @@ function createAlertCard(alert) {
                 }
                 const paint = tilePaintState(bookName, bookOdds, alert, takeAm);
                 // Junk vs take: omit the tile (not gray). Poly −455 vs +163 is both 10c and sign-flip.
+                // PLive excluded from fair is NOT gray — +118 vs +163 paints like the recs.
                 if (paint.skip) {
                     return;
                 }
