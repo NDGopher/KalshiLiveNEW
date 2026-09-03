@@ -1728,6 +1728,14 @@ class OddsEVMonitor:
                         return kr
                 except (TypeError, ValueError):
                     continue
+        # Totals/spreads: never reuse row[0] (a nearby 3.5/4.5) when the strike missed.
+        if (
+            ref_tot is not None
+            or fmax is not None
+            or fhdp is not None
+            or (isinstance(f_row, dict) and (f_row.get("over") is not None or f_row.get("under") is not None))
+        ):
+            return {}
         return ks_rows[0] if ks_rows else {}
 
     def _fmt_event_banner(self, doc: Dict[str, Any]) -> str:
