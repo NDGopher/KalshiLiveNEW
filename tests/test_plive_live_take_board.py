@@ -204,24 +204,25 @@ def _hearts_draw_vb(kalshi_am: int = 335) -> dict:
             "league": "Scotland Premiership",
             "sport": {"slug": "football"},
         },
-        "market": {"name": "ML", "home": 1.85, "draw": kalshi, "away": 4.2},
+        "market": {"name": "ML", "home": 1.85, "draw": kalshi, "away": 4.0},
         "betSide": "draw",
         "bookmakerOdds": {
             "draw": kalshi,
             "home": 1.85,
-            "away": 4.2,
+            "away": 4.0,
             "href": "https://kalshi.com/markets/KXTEST-HEARTS-DRAW",
         },
         "_live_broad_scan": True,
         "_ev_source": "live_event_scan",
-        "_canonical_kalshi_row": {"home": 1.85, "draw": kalshi, "away": 4.2},
+        "_canonical_kalshi_row": {"home": 1.85, "draw": kalshi, "away": 4.0},
     }
 
 
 def _hearts_books(*, kalshi_am: int = 335, plive_draw=None, live: bool = False) -> dict:
+    """Hearts 32' 0-1 board. Rec pack ~+265 makes Kalshi +335 ≈ +9.5% and live PLive +270 −EV."""
     kalshi = american_to_decimal(kalshi_am)
-    pack = american_to_decimal(240)
-    plive_row = {"home": 1.85, "away": 4.2, "draw": kalshi}
+    pack = american_to_decimal(265)
+    plive_row = {"home": 1.85, "away": 4.0, "draw": kalshi}
     if plive_draw is not None:
         plive_row["draw"] = (
             plive_draw if isinstance(plive_draw, float) else american_to_decimal(int(plive_draw))
@@ -242,61 +243,115 @@ def _hearts_books(*, kalshi_am: int = 335, plive_draw=None, live: bool = False) 
         "league": {"name": "Scotland Premiership"},
         "live": True,
         "bookmakers": {
-            "Kalshi": [{"name": "ML", "odds": [{"home": 1.85, "draw": kalshi, "away": 4.2}]}],
+            "Kalshi": [{"name": "ML", "odds": [{"home": 1.85, "draw": kalshi, "away": 4.0}]}],
             "PLive": [{"name": "ML", "odds": [plive_row]}],
-            "Betfair Exchange": [{"name": "ML", "odds": [{"home": 1.80, "draw": pack, "away": 4.4}]}],
-            "Bet365": [{"name": "ML", "odds": [{"home": 1.82, "draw": pack, "away": 4.3}]}],
-            "FanDuel": [{"name": "ML", "odds": [{"home": 1.84, "draw": pack, "away": 4.2}]}],
+            "Betfair Exchange": [{"name": "ML", "odds": [{"home": 1.85, "draw": pack, "away": 4.0}]}],
+            "Bet365": [{"name": "ML", "odds": [{"home": 1.84, "draw": pack, "away": 4.05}]}],
+            "FanDuel": [{"name": "ML", "odds": [{"home": 1.86, "draw": american_to_decimal(260), "away": 3.95}]}],
         },
     }
 
 
-def test_hearts_draw_32_kalshi_335_is_take_not_copied_plive():
-    """Primary: Hearts 32' 0-1. Two filters painted PLive-take +335. Real PLive +270.
+def test_hearts_draw_32_primary_kalshi_335_not_cloned_plive_take():
+    """PRIMARY: Hearts Draw 32' 0-1, EV +9.53% Draw ML.
 
-    Kalshi +335 is the take if +EV. PLive is a comparison book at +270, not the take.
-    Soccer Live must not invent a PLive-take from Kalshi.
+    Live laptop: Soccer Live and All Sports both printed PLive-take +335.
+    Kalshi was also +335. No Kalshi-take card. Real PLive Draw was +270.
+
+    Required:
+    - One Kalshi-take at +335 (both filters, not two cards).
+    - No PLive-take from the Kalshi copy, and none at +270 (not the +EV take).
+    - Missing/stale PLive omits the tile; Kalshi remains the take.
+    - Soccer Live must not invent a PLive-take from Kalshi.
     """
-    mon = _gameline_mon()
-    vb = _hearts_draw_vb(335)
-    copied = _hearts_books(kalshi_am=335, plive_draw=335, live=False)
-    assert mon._value_bet_to_normalized_bet(vb, copied, take_book="PLive") is None
-    kalshi_copied = mon._value_bet_to_normalized_bet(vb, copied, take_book="Kalshi")
-    if kalshi_copied is not None:
-        assert kalshi_copied["take_book"] == "Kalshi"
-        assert int(kalshi_copied["odds"]) == 335
-        tiles = [t["book"] for t in kalshi_copied["displayBooks"][kalshi_copied["selection"]]]
-        assert "PLive" not in tiles
+    from dashboard import (
+        DEFAULT_FILTER_NAME,
+        SOCCER_FILTER_NAME,
+        create_alert_id,
+        dedupe_listed_alert_rows,
+    )
 
-    live_270 = _hearts_books(kalshi_am=335, plive_draw=270, live=True)
-    plive = mon._value_bet_to_normalized_bet(vb, live_270, take_book="PLive")
-    kalshi_card = mon._value_bet_to_normalized_bet(vb, live_270, take_book="Kalshi")
-    if plive is not None:
-        assert int(plive["odds"]) == 270
-        assert int(plive["odds"]) != 335
-        assert plive["take_book"] == "PLive"
-    if kalshi_card is not None:
+    soccer = _gameline_mon(min_sharp=2)
+    allsports = _gameline_mon(min_sharp=3)
+    vb = _hearts_draw_vb(335)
+
+    copied = _hearts_books(kalshi_am=335, plive_draw=335, live=False)
+    for mon in (soccer, allsports):
+        assert mon._value_bet_to_normalized_bet(vb, copied, take_book="PLive") is None
+        kalshi_card = mon._value_bet_to_normalized_bet(vb, copied, take_book="Kalshi")
+        assert kalshi_card is not None
         assert kalshi_card["take_book"] == "Kalshi"
         assert int(kalshi_card["odds"]) == 335
+        assert float(kalshi_card["ev"]) > 0
+        tiles = [t["book"] for t in kalshi_card["displayBooks"][kalshi_card["selection"]]]
+        assert "PLive" not in tiles
+
+    missing = {
+        **copied,
+        "bookmakers": {k: v for k, v in copied["bookmakers"].items() if k != "PLive"},
+    }
+    assert "PLive" not in missing["bookmakers"]
+    soccer_missing = soccer._value_bet_to_normalized_bet(vb, missing, take_book="Kalshi")
+    assert soccer_missing is not None
+    assert soccer_missing["take_book"] == "Kalshi"
+    assert int(soccer_missing["odds"]) == 335
+    assert soccer._value_bet_to_normalized_bet(vb, missing, take_book="PLive") is None
+
+    live_270 = _hearts_books(kalshi_am=335, plive_draw=270, live=True)
+    for mon in (soccer, allsports):
+        assert mon._value_bet_to_normalized_bet(vb, live_270, take_book="PLive") is None
+        kalshi_card = mon._value_bet_to_normalized_bet(vb, live_270, take_book="Kalshi")
+        assert kalshi_card is not None
+        assert kalshi_card["take_book"] == "Kalshi"
+        assert int(kalshi_card["odds"]) == 335
+        assert float(kalshi_card["ev"]) > 8.0
         plive_tile = [
             t for t in kalshi_card["displayBooks"][kalshi_card["selection"]] if t["book"] == "PLive"
         ]
         assert plive_tile and int(plive_tile[0]["odds"]) == 270
         assert int(plive_tile[0]["odds"]) != 335
 
-    painted = _build_display_books_payload(
-        "Draw",
-        live_270["bookmakers"],
-        "ML",
-        "draw",
-        ["Kalshi", "PLive", "FanDuel"],
-        335,
-        {"draw": american_to_decimal(335)},
-        take_book="Kalshi",
+    soccer_built = soccer._value_bet_to_normalized_bet(vb, live_270, take_book="Kalshi")
+    all_built = allsports._value_bet_to_normalized_bet(vb, live_270, take_book="Kalshi")
+    soccer_alert = soccer.parse_bet_to_alert(soccer_built, vb["event"])
+    all_alert = allsports.parse_bet_to_alert(all_built, vb["event"])
+    soccer_alert.filter_name = SOCCER_FILTER_NAME
+    all_alert.filter_name = DEFAULT_FILTER_NAME
+    assert create_alert_id(soccer_alert) == create_alert_id(all_alert)
+    listed = dedupe_listed_alert_rows(
+        [
+            {
+                "id": create_alert_id(soccer_alert),
+                "teams": soccer_alert.teams,
+                "market_type": soccer_alert.market_type,
+                "pick": soccer_alert.pick,
+                "qualifier": soccer_alert.qualifier,
+                "line": soccer_alert.line,
+                "take_book": soccer_alert.take_book,
+                "ev_percent": soccer_alert.ev_percent,
+                "filter_name": SOCCER_FILTER_NAME,
+                "odds": soccer_alert.odds,
+                "match_failed": False,
+            },
+            {
+                "id": create_alert_id(all_alert),
+                "teams": all_alert.teams,
+                "market_type": all_alert.market_type,
+                "pick": all_alert.pick,
+                "qualifier": all_alert.qualifier,
+                "line": all_alert.line,
+                "take_book": all_alert.take_book,
+                "ev_percent": all_alert.ev_percent,
+                "filter_name": DEFAULT_FILTER_NAME,
+                "odds": all_alert.odds,
+                "match_failed": False,
+            },
+        ]
     )
-    plive_tile = [r for r in painted["Draw"] if r["book"] == "PLive"]
-    assert plive_tile and int(plive_tile[0]["odds"]) == 270
-    assert int(plive_tile[0]["odds"]) != 335
+    assert len(listed) == 1
+    assert listed[0]["take_book"] == "Kalshi"
+    assert int(listed[0]["odds"]) == 335
+    assert listed[0]["filter_name"] == DEFAULT_FILTER_NAME
 
 
 def test_celta_draw_plive_249_vs_kalshi_317():
