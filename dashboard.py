@@ -628,8 +628,15 @@ def _plive_status_payload() -> Dict[str, Any]:
             "connected": False,
             "receiving_events": False,
             "receiving_prices": False,
+            "receiving_mlb_prices": False,
+            "receiving_soccer_prices": False,
+            "receiving_coeffs": False,
             "mlb_events": 0,
             "mlb_with_prices": 0,
+            "mlb_with_coeffs": 0,
+            "soccer_events": 0,
+            "soccer_with_prices": 0,
+            "soccer_with_coeffs": 0,
             "samples": [],
             "partner_id": 113,
             "flavor": "live",
@@ -638,18 +645,91 @@ def _plive_status_payload() -> Dict[str, Any]:
         }
     snap = feed.status_snapshot()
     snap["wanted"] = True
-    if snap.get("receiving_prices"):
+    mlb_priced = snap.get("mlb_with_prices") or 0
+    soccer_priced = snap.get("soccer_with_prices") or 0
+    soccer_coeffs = snap.get("soccer_with_coeffs") or 0
+    age = snap.get("coeff_age_sec")
+    age_s = f"{age:.0f}s" if isinstance(age, (int, float)) else "none"
+    if snap.get("price_feed_ok") and (snap.get("receiving_prices") or snap.get("receiving_coeffs")):
         snap["message"] = (
             f"PLive connected and receiving events with prices "
-            f"({snap.get('mlb_with_prices') or 0} MLB)"
+            f"(mlb_priced={mlb_priced} soccer_priced={soccer_priced} "
+            f"soccer_coeffs={soccer_coeffs}, last_coeff={snap.get('last_coeff_at')})"
+        )
+    elif snap.get("connected") and not snap.get("price_feed_ok"):
+        snap["message"] = (
+            f"PLive connected but prices stale or missing — fail closed "
+            f"(mlb_events={snap.get('mlb_events') or 0} mlb_priced={mlb_priced} "
+            f"soccer_events={snap.get('soccer_events') or 0} soccer_priced={soccer_priced} "
+            f"soccer_coeffs={soccer_coeffs} coeff_age={age_s} "
+            f"last_coeff={snap.get('last_coeff_at') or 'none'})"
         )
     elif snap.get("connected"):
         snap["message"] = (
-            f"PLive connected · {snap.get('mlb_events') or 0} MLB events · waiting for prices"
+            f"PLive connected · {snap.get('mlb_events') or 0} MLB / "
+            f"{snap.get('soccer_events') or 0} soccer · waiting for prices"
         )
     else:
         snap["message"] = f"PLive disconnected ({snap.get('last_error') or 'not connected'})"
     return snap
+
+
+def _plive_board_rows_for_summary(
+    feed: Any,
+    summary: Dict[str, Any],
+    *,
+    league: str,
+    sport_slug: str,
+) -> List[Dict[str, Any]]:
+    eid = summary.get("id")
+    home = str(summary.get("home") or "")
+    away = str(summary.get("away") or "")
+    teams = f"{away} @ {home}".strip(" @")
+    mkts: List[Dict[str, Any]] = []
+    try:
+        mkts = list(feed.store.markets_for_event(eid) or [])
+    except Exception:
+        mkts = []
+    if not mkts:
+        if summary.get("home_am") is not None or summary.get("away_am") is not None:
+            mkts.append(
+                {
+                    "name": "ML",
+                    "odds": [{"home": summary.get("home_dec"), "away": summary.get("away_dec")}],
+                }
+            )
+        if summary.get("tot_line") is not None:
+            mkts.append(
+                {
+                    "name": "Totals",
+                    "odds": [
+                        {
+                            "hdp": summary.get("tot_line"),
+                            "max": summary.get("tot_line"),
+                            "line": summary.get("tot_line"),
+                            "over": summary.get("tot_over"),
+                            "under": summary.get("tot_under"),
+                        }
+                    ],
+                }
+            )
+    return live_odds_board_rows_from_bookmakers(
+        event_id=eid,
+        home=home,
+        away=away,
+        teams=teams,
+        league=league,
+        sport_slug=sport_slug,
+        live=True,
+        status="live",
+        start_display="",
+        clock="",
+        clock_running=None,
+        status_detail="",
+        bks={"PLive": mkts},
+        books=["PLive"],
+        plive_only=True,
+    )
 
 
 def _plive_board_rows() -> List[Dict[str, Any]]:
@@ -659,56 +739,11 @@ def _plive_board_rows() -> List[Dict[str, Any]]:
         return []
     rows: List[Dict[str, Any]] = []
     for s in feed.priced_mlb_summaries():
-        eid = s.get("id")
-        home = str(s.get("home") or "")
-        away = str(s.get("away") or "")
-        teams = f"{away} @ {home}".strip(" @")
-        mkts: List[Dict[str, Any]] = []
-        try:
-            mkts = list(feed.store.markets_for_event(eid) or [])
-        except Exception:
-            mkts = []
-        if not mkts:
-            if s.get("home_am") is not None or s.get("away_am") is not None:
-                mkts.append(
-                    {
-                        "name": "ML",
-                        "odds": [{"home": s.get("home_dec"), "away": s.get("away_dec")}],
-                    }
-                )
-            if s.get("tot_line") is not None:
-                mkts.append(
-                    {
-                        "name": "Totals",
-                        "odds": [
-                            {
-                                "hdp": s.get("tot_line"),
-                                "max": s.get("tot_line"),
-                                "line": s.get("tot_line"),
-                                "over": s.get("tot_over"),
-                                "under": s.get("tot_under"),
-                            }
-                        ],
-                    }
-                )
-        extra = live_odds_board_rows_from_bookmakers(
-            event_id=eid,
-            home=home,
-            away=away,
-            teams=teams,
-            league="MLB",
-            sport_slug="baseball",
-            live=True,
-            status="live",
-            start_display="",
-            clock="",
-            clock_running=None,
-            status_detail="",
-            bks={"PLive": mkts},
-            books=["PLive"],
-            plive_only=True,
-        )
-        rows.extend(extra)
+        rows.extend(_plive_board_rows_for_summary(feed, s, league="MLB", sport_slug="baseball"))
+    for s in feed.priced_soccer_summaries():
+        ev = feed.store.events.get(str(s.get("id") or "")) or {}
+        league = str(ev.get("league_name") or "Soccer")
+        rows.extend(_plive_board_rows_for_summary(feed, s, league=league, sport_slug="football"))
     return rows
 
 

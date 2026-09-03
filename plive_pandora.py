@@ -10,8 +10,14 @@ Handshake matches the public live UI at https://plive.becoms.co/live/ :
     2) subscribeSystemEvents {partnerId: 113}
     3) subscribe + getCache once for live.sports (catalog names) and
        live.main.<LINE_SET>.eventData (directory). live.events is dead.
-    4) For each wanted live eventId subscribe eventCoefficients.{eventId}
+    4) For each wanted live eventId: subscribe AND getCache
+       ``live.main.<LINE_SET>.eventCoefficients.{eventId}``
        (MLB sport 1 / league 8, plus soccer sport 5 and Top Soccer 220).
+       getCache often delivers a JSON-patch *list* (or ``{isDiff, payload}``)
+       on the room name — that list is a coeff snapshot, not a catalog.
+       subscribe keeps the room open for live diffs. Re-getCache rooms
+       that stay unpriced; re-subscribe+getCache if prices go stale.
+       On reconnect, drop room bindings and subscribe/getCache again.
        Unsubscribe that room when the event is finished.
 
 Do not scrape ``https://plive.becoms.co/live/?#!/event/{id}`` — the hash
@@ -310,6 +316,72 @@ def _is_event_list_topic(event_name: Optional[str]) -> bool:
     if t.endswith(".events") or t == "live.events":
         return False
     return t.endswith(".eventData")
+
+
+def _is_coeff_topic(event_name: Optional[str]) -> bool:
+    return "eventCoefficients" in str(event_name or "")
+
+
+def _looks_like_json_patch_list(data: Any) -> bool:
+    """getCache on eventCoefficients often emits a bare JSON-patch list."""
+    if not isinstance(data, list) or not data:
+        return False
+    sample = next((x for x in data if x is not None), None)
+    return isinstance(sample, dict) and "op" in sample and "path" in sample
+
+
+def _iso_utc(ts: Optional[float]) -> Optional[str]:
+    try:
+        stamp = float(ts or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if stamp <= 0:
+        return None
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(stamp))
+
+
+def _eid_from_coeff_payload(data: Any) -> Optional[str]:
+    """Event id from a cache wrapper when the Socket.IO event is not the room."""
+    if not isinstance(data, dict):
+        return None
+    for key in ("room", "channel", "topic", "event", "name"):
+        eid = event_id_from_channel(str(data.get(key) or ""))
+        if eid:
+            return eid
+    return None
+
+
+def _unwrap_coeff_body(data: Any) -> Any:
+    """Pull ``c.m`` / patch lists out of getCache wrappers."""
+    if not isinstance(data, dict):
+        return data
+    for key in ("payload", "data", "value", "d", "cache"):
+        inner = data.get(key)
+        if isinstance(inner, (dict, list)):
+            return inner
+    return data
+
+
+def _coerce_socket_payload(data: Any) -> Any:
+    """Bytes (gzip JSON) or a JSON string. Bare non-JSON strings are dropped."""
+    if isinstance(data, (bytes, bytearray)):
+        try:
+            decompressed = gzip.decompress(bytes(data))
+            return json.loads(decompressed.decode("utf-8"))
+        except Exception:
+            try:
+                return json.loads(bytes(data).decode("utf-8"))
+            except Exception:
+                return None
+    if isinstance(data, str):
+        s = data.strip()
+        if s[:1] in "{[":
+            try:
+                return json.loads(s)
+            except json.JSONDecodeError:
+                return None
+        return None
+    return data
 
 
 def parse_coeff_path(path: str) -> Optional[Dict[str, Any]]:
@@ -1422,7 +1494,28 @@ class PliveStore:
         if _is_event_list_topic(event_name):
             self.apply_event_catalog(data)
             return self.generation != before
-        eid = event_id_from_channel(event_name)
+        eid = event_id_from_channel(event_name) or _eid_from_coeff_payload(data)
+        if _is_coeff_topic(event_name) or (
+            eid and isinstance(data, (dict, list)) and not _is_event_list_topic(event_name)
+        ):
+            if isinstance(data, dict) and data.get("id") is not None and eid is None:
+                eid = str(data.get("id"))
+            if eid and isinstance(data, dict):
+                self.apply_meta(eid, data)
+            body = _unwrap_coeff_body(data)
+            if eid and isinstance(data, dict) and data.get("isDiff") and isinstance(data.get("payload"), list):
+                self.apply_json_patch(eid, data["payload"])
+            elif eid and isinstance(body, dict) and body.get("isDiff") and isinstance(body.get("payload"), list):
+                self.apply_json_patch(eid, body["payload"])
+            elif eid and isinstance(body, list):
+                self.apply_json_patch(eid, body)
+            elif eid and isinstance(body, dict) and ("c" in body or "m" in body):
+                self.apply_coeff_tree(eid, body)
+            elif eid and isinstance(data, dict):
+                tree = data.get("payload") if isinstance(data.get("payload"), dict) else data
+                if isinstance(tree, dict) and ("c" in tree or "m" in tree):
+                    self.apply_coeff_tree(eid, tree)
+            return self.generation != before
         if isinstance(data, dict):
             if data.get("id") is not None and eid is None:
                 eid = str(data.get("id"))
@@ -1755,10 +1848,30 @@ class PlivePandoraFeed:
         self._bound_rooms: Set[str] = set()
         self.events_received = 0
         self._logged_prices = False
+        self._last_event_data_at: float = 0.0
+        self._last_coeff_at: float = 0.0
+        self._last_subscribe_at: float = 0.0
+        self._last_getcache_refresh_at: float = 0.0
 
     @property
     def healthy(self) -> bool:
-        return bool(self._running and self.connected)
+        return bool(self._running and self.connected and self.price_feed_ok())
+
+    def price_feed_ok(self, *, now: Optional[float] = None) -> bool:
+        """Fail closed when live events are subscribed but coefficients are missing or stale."""
+        now = time.time() if now is None else float(now)
+        wanted = [ev for ev in self.store.events.values() if self.store.wants_coeff(ev)]
+        if not wanted:
+            return True
+        newest = float(self._last_coeff_at or 0.0)
+        for ev in wanted:
+            try:
+                newest = max(newest, float(ev.get("coeff_updated_at") or 0.0))
+            except (TypeError, ValueError):
+                continue
+        if newest <= 0:
+            return False
+        return (now - newest) <= float(plive_stale_sec())
 
     def _mark_dirty(self) -> None:
         self.generation = self.store.generation
@@ -1777,14 +1890,20 @@ class PlivePandoraFeed:
 
     def handle_payload(self, data: Any, event_name: Optional[str] = None) -> None:
         self.events_received += 1
+        if _is_event_list_topic(event_name):
+            self._last_event_data_at = time.time()
         if self.store.apply_message(data, event_name):
+            if _is_coeff_topic(event_name) or _eid_from_coeff_payload(data):
+                self._last_coeff_at = time.time()
             self._mark_dirty()
             snap = self.status_snapshot()
-            if snap.get("receiving_prices") and not self._logged_prices:
+            if (snap.get("receiving_prices") or snap.get("receiving_coeffs")) and not self._logged_prices:
                 self._logged_prices = True
                 print(
-                    f"[PLIVE] receiving events with prices: {snap['mlb_with_prices']} MLB | "
-                    f"{'; '.join(snap.get('samples') or []) or 'priced'}"
+                    f"[PLIVE] receiving events with prices: "
+                    f"mlb_priced={snap['mlb_with_prices']} soccer_priced={snap.get('soccer_with_prices') or 0} "
+                    f"mlb_coeffs={snap.get('mlb_with_coeffs') or 0} soccer_coeffs={snap.get('soccer_with_coeffs') or 0} | "
+                    f"{'; '.join(snap.get('samples') or []) or 'coeffs'}"
                 )
 
     def _dec_to_am(self, d: Optional[float]) -> Optional[int]:
@@ -1794,9 +1913,9 @@ class PlivePandoraFeed:
             return int(round((d - 1.0) * 100))
         return int(round(-100 / (d - 1.0)))
 
-    def priced_mlb_summaries(self) -> List[Dict[str, Any]]:
+    def _priced_summaries(self, events: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
-        for eid, ev in self.store.mlb_events().items():
+        for eid, ev in events.items():
             mk = self.store.markets_for_event(eid)
             if not mk:
                 continue
@@ -1830,9 +1949,25 @@ class PlivePandoraFeed:
             )
         return out
 
+    def priced_mlb_summaries(self) -> List[Dict[str, Any]]:
+        """MLB display rows only. Do not use this as the sole price-health signal."""
+        return self._priced_summaries(self.store.mlb_events())
+
+    def priced_soccer_summaries(self) -> List[Dict[str, Any]]:
+        return self._priced_summaries(self.store.soccer_events())
+
+    @staticmethod
+    def _events_with_coeffs(events: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        return {k: v for k, v in events.items() if v.get("coeffs")}
+
     def status_snapshot(self) -> Dict[str, Any]:
-        priced = self.priced_mlb_summaries()
         mlb = self.store.mlb_events()
+        soccer = self.store.soccer_events()
+        priced_mlb = self._priced_summaries(mlb)
+        priced_soccer = self._priced_summaries(soccer)
+        mlb_coeffs = self._events_with_coeffs(mlb)
+        soccer_coeffs = self._events_with_coeffs(soccer)
+        priced = priced_mlb + priced_soccer
         samples = []
         for s in priced[:5]:
             bits = [f"{s.get('away')}@{s.get('home')}"]
@@ -1843,6 +1978,10 @@ class PlivePandoraFeed:
                     f"Tot {s.get('tot_line')} {s.get('tot_over_am')}/{s.get('tot_under_am')}"
                 )
             samples.append(" ".join(bits))
+        now = time.time()
+        last_event_unix = self._last_event_data_at or None
+        last_coeff_unix = self._last_coeff_at or None
+        last_sub_unix = self._last_subscribe_at or None
         return {
             "connected": bool(self.connected),
             "healthy": self.healthy,
@@ -1850,9 +1989,26 @@ class PlivePandoraFeed:
             "flavor": PLIVE_FLAVOR,
             "sport_id": self.store.sport_id,
             "mlb_events": len(mlb),
-            "mlb_with_prices": len(priced),
-            "receiving_events": bool(mlb) or self.store.generation > 0 or self.events_received > 0,
+            "mlb_with_prices": len(priced_mlb),
+            "mlb_with_coeffs": len(mlb_coeffs),
+            "soccer_events": len(soccer),
+            "soccer_with_prices": len(priced_soccer),
+            "soccer_with_coeffs": len(soccer_coeffs),
+            "receiving_events": bool(mlb or soccer) or self.store.generation > 0 or self.events_received > 0,
+            # Mapped display markets across MLB + soccer. Empty MLB is not a miss.
+            "receiving_mlb_prices": len(priced_mlb) > 0,
+            "receiving_soccer_prices": len(priced_soccer) > 0,
             "receiving_prices": len(priced) > 0,
+            # Raw eventCoefficients landed in the store (even if a market did not map).
+            "receiving_coeffs": bool(mlb_coeffs or soccer_coeffs),
+            "price_feed_ok": self.price_feed_ok(now=now),
+            "last_event_data_at": _iso_utc(self._last_event_data_at),
+            "last_coeff_at": _iso_utc(self._last_coeff_at),
+            "last_subscribe_at": _iso_utc(self._last_subscribe_at),
+            "last_event_data_unix": last_event_unix,
+            "last_coeff_unix": last_coeff_unix,
+            "last_subscribe_unix": last_sub_unix,
+            "coeff_age_sec": (now - self._last_coeff_at) if self._last_coeff_at else None,
             "acks": sorted(self._ack_names),
             "samples": samples,
             "last_error": self.last_error,
@@ -1862,34 +2018,41 @@ class PlivePandoraFeed:
 
     def log_status(self, *, prefix: str = "[PLIVE] status") -> Dict[str, Any]:
         snap = self.status_snapshot()
+        age = snap.get("coeff_age_sec")
+        age_s = f"{age:.0f}s" if isinstance(age, (int, float)) else "none"
         print(
             f"{prefix} connected={snap['connected']} receiving_events={snap['receiving_events']} "
-            f"receiving_prices={snap['receiving_prices']} mlb={snap['mlb_events']} "
-            f"priced={snap['mlb_with_prices']} sample={'; '.join(snap['samples'][:3]) or 'none'}"
+            f"receiving_prices={snap['receiving_prices']} receiving_soccer_prices={snap['receiving_soccer_prices']} "
+            f"price_ok={snap['price_feed_ok']} "
+            f"mlb_events={snap['mlb_events']} mlb_priced={snap['mlb_with_prices']} mlb_coeffs={snap['mlb_with_coeffs']} "
+            f"soccer_events={snap['soccer_events']} soccer_priced={snap['soccer_with_prices']} "
+            f"soccer_coeffs={snap['soccer_with_coeffs']} "
+            f"coeff_age={age_s} sample={'; '.join(snap['samples'][:3]) or 'none'}"
         )
         return snap
 
     def decode_binary(self, binary_data: bytes) -> Optional[Any]:
-        try:
-            decompressed = gzip.decompress(binary_data)
-            return json.loads(decompressed.decode("utf-8"))
-        except Exception:
-            return None
+        return _coerce_socket_payload(binary_data)
 
     def ingest_raw(self, data: Any, event_name: Optional[str] = None) -> None:
-        if isinstance(data, bytes):
-            decoded = self.decode_binary(data)
-            if decoded is not None:
-                self.handle_payload(decoded, event_name)
+        data = _coerce_socket_payload(data)
+        if data is None:
             return
-        if isinstance(data, str):
+        # A coeff getCache snapshot is often a JSON-patch *list*. Do not
+        # walk it as separate catalog records — that drops every price.
+        if isinstance(data, list) and (
+            _is_coeff_topic(event_name)
+            or _looks_like_json_patch_list(data)
+            or _eid_from_coeff_payload(data)
+        ):
+            self.handle_payload(data, event_name)
             return
-        if isinstance(data, (dict, list)):
-            if isinstance(data, list):
-                for item in data:
-                    self.handle_payload(item, event_name)
-            else:
-                self.handle_payload(data, event_name)
+        if isinstance(data, list):
+            for item in data:
+                self.handle_payload(item, event_name)
+            return
+        if isinstance(data, dict):
+            self.handle_payload(data, event_name)
 
     def markets_for_odds_event(self, doc: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Join PLive take prices onto an Odds-API event.
@@ -1919,6 +2082,8 @@ class PlivePandoraFeed:
         if not eid:
             return []
         ev = self.store.events.get(str(eid)) or {}
+        if plive_price_is_stale(ev):
+            return []
         return align_plive_markets_to_odds_fixture(
             self.store.markets_for_event(eid),
             plive_home=str(ev.get("home") or ""),
@@ -1949,14 +2114,21 @@ class PlivePandoraFeed:
             print(f"[PLIVE] ack subscribed {preview[:220]}")
 
     def _bind_room(self, sio: Any, room: str) -> None:
-        """Binary snapshots arrive on the room name, not on the catch-all ``*``."""
+        """Binary snapshots arrive on the room name, not on the catch-all ``*``.
+
+        The handler must accept ``*args``. A two-arg emit (meta, payload)
+        used to overwrite the captured room name and drop the snapshot.
+        """
         if not room or room in self._bound_rooms:
             return
         self._bound_rooms.add(room)
 
         @sio.on(room)
-        def _on_room(data: Any, _room: str = room) -> None:
-            self.ingest_raw(data, _room)
+        def _on_room(*args: Any, _room: str = room) -> None:
+            if not args:
+                return
+            for arg in args:
+                self.ingest_raw(arg, _room)
             if _is_event_list_topic(_room) and sio is not None:
                 try:
                     loop = asyncio.get_running_loop()
@@ -2000,8 +2172,55 @@ class PlivePandoraFeed:
                 self._bound_rooms.discard(room)
             print(f"[PLIVE] unsubscribed eventCoefficients for {len(batch)} finished events")
 
+    def reset_socket_bindings(self) -> None:
+        """Reconnect: keep eventData, drop room bindings so subscribe/getCache rerun."""
+        self._coeff_subscribed = set()
+        self._bound_rooms = set()
+        self._ack_names = set()
+        self._logged_prices = False
+
+    def _rooms_needing_coeff_cache(self) -> List[str]:
+        """Subscribed rooms that never produced a coefficient snapshot."""
+        rooms: List[str] = []
+        for eid, ev in self.store.events.items():
+            if not self.store.wants_coeff(ev):
+                continue
+            room = coeff_room_for_event(str(eid))
+            if room not in self._coeff_subscribed:
+                continue
+            stamp = ev.get("coeff_updated_at") or 0
+            try:
+                ts = float(stamp)
+            except (TypeError, ValueError):
+                ts = 0.0
+            if ts <= 0 or not (ev.get("coeffs") or {}):
+                rooms.append(room)
+        return rooms
+
+    def _rooms_needing_stale_resubscribe(self, *, now: Optional[float] = None) -> List[str]:
+        """Subscribed rooms whose last coeff is older than PLIVE_STALE_SEC."""
+        now = time.time() if now is None else float(now)
+        stale_after = float(plive_stale_sec())
+        rooms: List[str] = []
+        for eid, ev in self.store.events.items():
+            if not self.store.wants_coeff(ev):
+                continue
+            room = coeff_room_for_event(str(eid))
+            if room not in self._coeff_subscribed:
+                continue
+            if not (ev.get("coeffs") or {}):
+                continue
+            stamp = ev.get("coeff_updated_at") or 0
+            try:
+                ts = float(stamp)
+            except (TypeError, ValueError):
+                ts = 0.0
+            if ts <= 0 or (now - ts) > stale_after:
+                rooms.append(room)
+        return rooms
+
     async def _subscribe_mlb_coefficients(self, sio: Any) -> None:
-        """Per-event click-in coeff rooms (full book: run lines, team totals, margins)."""
+        """Per-event click-in coeff rooms. subscribe + getCache; retry cache if empty."""
         await self._unsubscribe_finished_coefficients(sio)
         want = list(self.store.sport_ids or [self.store.sport_id])
         new_rooms: List[str] = []
@@ -2014,16 +2233,39 @@ class PlivePandoraFeed:
             self._coeff_subscribed.add(room)
             self._bind_room(sio, room)
             new_rooms.append(room)
-        if not new_rooms:
+        refresh = self._rooms_needing_coeff_cache() if not new_rooms else []
+        stale = self._rooms_needing_stale_resubscribe() if not new_rooms else []
+        if not new_rooms and not refresh and not stale:
             return
-        for i in range(0, len(new_rooms), 80):
-            batch = new_rooms[i : i + 80]
-            try:
-                await sio.emit("subscribe", batch)
-                await sio.emit("getCache", batch)
-                print(f"[PLIVE] subscribed eventCoefficients for {len(batch)} events (sports {want})")
-            except Exception as ex:
-                print(f"[PLIVE] [WARN] coeff subscribe failed: {ex}")
+        try:
+            if new_rooms:
+                for i in range(0, len(new_rooms), 80):
+                    batch = new_rooms[i : i + 80]
+                    await sio.emit("subscribe", batch)
+                    await sio.emit("getCache", batch)
+                    self._last_subscribe_at = time.time()
+                    print(f"[PLIVE] subscribed eventCoefficients for {len(batch)} events (sports {want})")
+            else:
+                now = time.time()
+                if now - self._last_getcache_refresh_at < 2.0:
+                    return
+                self._last_getcache_refresh_at = now
+                if stale:
+                    for i in range(0, len(stale), 80):
+                        batch = stale[i : i + 80]
+                        await sio.emit("subscribe", batch)
+                        await sio.emit("getCache", batch)
+                        self._last_subscribe_at = time.time()
+                    print(
+                        f"[PLIVE] resubscribe stale eventCoefficients for {len(stale)} events (sports {want})"
+                    )
+                elif refresh:
+                    for i in range(0, len(refresh), 80):
+                        batch = refresh[i : i + 80]
+                        await sio.emit("getCache", batch)
+                    print(f"[PLIVE] getCache refresh eventCoefficients for {len(refresh)} events still unpriced")
+        except Exception as ex:
+            print(f"[PLIVE] [WARN] coeff subscribe failed: {ex}")
 
     async def start(self) -> None:
         if self._running:
@@ -2088,9 +2330,7 @@ class PlivePandoraFeed:
 
         sio = socketio.AsyncClient(reconnection=False, logger=False, engineio_logger=False)
         self._sio = sio
-        self._coeff_subscribed = set()
-        self._ack_names = set()
-        self._bound_rooms = set()
+        self.reset_socket_bindings()
 
         @sio.on("connect")
         async def _on_connect() -> None:
@@ -2208,14 +2448,19 @@ def merge_plive_into_docs(docs: List[Dict[str, Any]]) -> int:
         return 0
     n = 0
     book = _canonical_odds_api_bookmaker(PLIVE_BOOK_NAME)
+    feed_ok = feed.price_feed_ok()
     for doc in docs:
         if not isinstance(doc, dict):
             continue
-        markets = feed.markets_for_odds_event(doc)
         bks = doc.setdefault("bookmakers", {})
         if not isinstance(bks, dict):
             doc["bookmakers"] = {}
             bks = doc["bookmakers"]
+        if not feed_ok:
+            # Subscribed but silent/stale — do not keep a stale PLive take.
+            bks.pop(book, None)
+            continue
+        markets = feed.markets_for_odds_event(doc)
         existing = bks.get(book) if isinstance(bks.get(book), list) else []
         if not markets:
             # No live coeff match — do not invent. Existing Odds-API PLive stays.

@@ -2053,7 +2053,7 @@ if (stoppagesOnlyCb) {
         const pliveMeta = pl.message
             ? ` · ${pl.message}`
             : (pl.connected
-                ? ` · PLive connected · ${pl.mlb_with_prices || 0} MLB priced`
+                ? ` · PLive connected · ${pl.mlb_with_prices || 0} MLB / ${pl.soccer_with_prices || 0} soccer priced`
                 : '');
         meta.textContent =
             `Updated ${t.toLocaleString()} · ${evs.length} game(s) (${pairRows} lines) · ${data.timing || ''} · sport=${data.sport || ''} · api=${data.sport_api || '-'} · league=${data.league_focus || 'all'} · league_api=${data.league_api || '-'} · date=${data.date_filter || ''}${bmeta}${pliveMeta}`;
