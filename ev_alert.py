@@ -31,7 +31,7 @@ class EvAlert:
         self.timestamp = datetime.now()
         self.raw_html = data.get("raw_html", "")
         self.price_cents = None
-        self.line = None
+        self.line = data.get("line")
         # False = diagnostic display candidate (failed strict minRoi/minEv but passed relaxed gates)
         self.strict_pass = bool(data.get("strict_pass", True))
         # How the opportunity was discovered: e.g. odds_api_value_bets vs local_odds_scan (future).
@@ -42,6 +42,11 @@ class EvAlert:
         self.take_book = str(data.get("take_book") or "Kalshi")
         # Royals-shape allowlist for later auto-bet. Default deny. Switch stays OFF.
         self.autobet_allow = bool(data.get("autobet_allow", False))
+        self.live = data.get("live")
+        self.clock = data.get("clock")
+        self.clock_running = data.get("clock_running")
+        self.status_detail = data.get("status_detail") or data.get("statusDetail") or ""
+        self.score = data.get("score") or ""
 
     def extract_ticker_from_url(self):
         """Extract Kalshi ticker from market URL."""
@@ -73,4 +78,9 @@ class EvAlert:
             "kalshi_last_trade_ts": self.kalshi_last_trade_ts,
             "take_book": self.take_book,
             "autobet_allow": self.autobet_allow,
+            "live": self.live,
+            "clock_running": self.clock_running,
+            "status_detail": self.status_detail,
+            "score": self.score,
+            "line": self.line,
         }

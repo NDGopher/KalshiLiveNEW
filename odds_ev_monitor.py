@@ -36,6 +36,7 @@ _LOADED_ENV_CWD = load_dotenv(_DOTENV_CWD, override=True, encoding="utf-8-sig")
 
 import aiohttp
 
+from auto_bet_sheet import live_context_from_event
 from ev_alert import EvAlert
 from ev_calculator import (
     EVCalculator,
@@ -1528,6 +1529,16 @@ class OddsEVMonitor:
                 "take_book": str(bet.get("take_book") or "Kalshi"),
                 "autobet_allow": bool(bet.get("autobet_allow", False)),
             }
+            ctx = live_context_from_event(event if isinstance(event, dict) else {})
+            alert_data.update(
+                {
+                    "live": ctx.get("live"),
+                    "clock": ctx.get("clock"),
+                    "clock_running": ctx.get("clock_running"),
+                    "status_detail": ctx.get("status_detail") or "",
+                    "score": ctx.get("score") or "",
+                }
+            )
             alert = EvAlert(alert_data)
             alert.autobet_allow = bool(bet.get("autobet_allow", False))
             alert.book_updated_at = alert_data["book_updated_at"]
@@ -1541,6 +1552,11 @@ class OddsEVMonitor:
                 alert.ticker = self.extract_ticker_from_link(link) or bet.get("ticker")
             alert.price_cents = price_cents
             alert.line = line
+            alert.live = ctx.get("live")
+            alert.clock = ctx.get("clock")
+            alert.clock_running = ctx.get("clock_running")
+            alert.status_detail = ctx.get("status_detail") or ""
+            alert.score = ctx.get("score") or ""
             return alert
         except Exception as e:
             print(f"[WARN] Error parsing bet: {e}")

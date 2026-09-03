@@ -78,6 +78,13 @@ from plive_pandora import (
     peek_shared_plive_feed,
     plive_wanted,
 )
+from auto_bet_sheet import (
+    AUTO_BET_CSV_FIELDNAMES,
+    AUTO_BET_SHEET_HEADERS,
+    auto_bet_sheet_row,
+    build_auto_bet_sheet_record,
+    ensure_sheet_extra_headers,
+)
 from ev_calculator import decimal_to_american, is_plus_print_ev
 from stoppage_gate import clock_fields_for_live_odds
 
@@ -293,6 +300,31 @@ def store_failed_auto_bet(alert_id, alert, alert_data, error, reason=None, ticke
             failed_auto_bets = failed_auto_bets[-MAX_FAILED_BETS:]
         
         print(f"[FAILED-BETS] ✅ Stored failure: {alert.teams if alert else 'N/A'} - {alert.pick if alert else 'N/A'} | Error: {error} | Total stored: {len(failed_auto_bets)}")
+        skip_reason = str(reason or error or "").strip()
+        try:
+            write_auto_bet_to_sheets(
+                build_auto_bet_sheet_record(
+                    alert=alert,
+                    alert_data=alert_data if isinstance(alert_data, dict) else {},
+                    skipped=True,
+                    skip_reason=skip_reason,
+                    fill={
+                        "ticker": failure_entry.get("ticker") or "",
+                        "side": failure_entry.get("side") or "",
+                        "teams": failure_entry.get("teams") or "",
+                        "market_type": failure_entry.get("market_type") or "",
+                        "pick": failure_entry.get("pick") or "",
+                        "qualifier": failure_entry.get("qualifier") or "",
+                        "ev_percent": failure_entry.get("ev_percent"),
+                        "expected_price_cents": failure_entry.get("expected_price") or "",
+                        "american_odds": failure_entry.get("odds") or "",
+                        "filter_name": failure_entry.get("filter_name") or "",
+                        "status": "SKIPPED",
+                    },
+                )
+            )
+        except Exception as sheet_exc:
+            print(f"[FAILED-BETS] Sheet SKIPPED row failed: {sheet_exc}")
     except Exception as e:
         print(f"[FAILED-BETS] ❌ ERROR storing failed bet: {e}")
         print(f"[FAILED-BETS] Traceback: {traceback.format_exc()}")
@@ -1630,14 +1662,9 @@ def init_google_sheets():
         try:
             worksheet = spreadsheet.worksheet(GOOGLE_SHEETS_WORKSHEET_NAME)
         except gspread.exceptions.WorksheetNotFound:
-            worksheet = spreadsheet.add_worksheet(title=GOOGLE_SHEETS_WORKSHEET_NAME, rows=1000, cols=20)
-            # Write header
-            headers = [
-                'Timestamp', 'Order ID', 'Ticker', 'Side', 'Teams', 'Market Type', 'Pick', 'Qualifier',
-                'EV %', 'Expected Price (¢)', 'Executed Price (¢)', 'American Odds',
-                'Contracts', 'Cost ($)', 'Payout ($)', 'Win Amount ($)', 'Sport', 'Status', 'Result', 'PNL ($)', 'Settled', 'Filter Name', 'Devig Books'
-            ]
-            worksheet.append_row(headers)
+            worksheet = spreadsheet.add_worksheet(title=GOOGLE_SHEETS_WORKSHEET_NAME, rows=1000, cols=32)
+            # First 23 columns stay in grade_bets order. Extra fields are appended.
+            worksheet.append_row(list(AUTO_BET_SHEET_HEADERS))
         
         print(f"[GOOGLE SHEETS] OK: Connected to spreadsheet: {spreadsheet.title}")
         return worksheet
@@ -1661,35 +1688,15 @@ def write_auto_bet_to_sheets(bet_data: Dict):
             import gspread
             spreadsheet = google_sheets_client.open_by_key(GOOGLE_SHEETS_SPREADSHEET_ID)
             worksheet = spreadsheet.worksheet(GOOGLE_SHEETS_WORKSHEET_NAME)
-            
-            # Convert bet_data dict to row (matching header order)
-            # Removed 'Kalshi Odds' (duplicate of 'American Odds'), moved 'Devig Books' to end
-            row = [
-                bet_data.get('timestamp', ''),
-                bet_data.get('order_id', ''),
-                bet_data.get('ticker', ''),
-                bet_data.get('side', ''),
-                bet_data.get('teams', ''),
-                bet_data.get('market_type', ''),
-                bet_data.get('pick', ''),
-                bet_data.get('qualifier', ''),
-                bet_data.get('ev_percent', ''),
-                bet_data.get('expected_price_cents', ''),
-                bet_data.get('executed_price_cents', ''),
-                bet_data.get('american_odds', ''),
-                bet_data.get('contracts', ''),
-                bet_data.get('cost', ''),
-                bet_data.get('payout', ''),
-                bet_data.get('win_amount', ''),
-                bet_data.get('sport', ''),
-                bet_data.get('status', ''),
-                bet_data.get('result', ''),
-                bet_data.get('pnl', ''),
-                bet_data.get('settled', ''),
-                bet_data.get('filter_name', ''),  # Filter name
-                bet_data.get('devig_books', '')  # Devig books with odds (moved to end)
-            ]
-            
+            try:
+                current_header = worksheet.row_values(1)
+                wanted = ensure_sheet_extra_headers(current_header)
+                if wanted != list(current_header or []):
+                    worksheet.update("A1", [wanted])
+            except Exception:
+                pass
+            # First 23 columns stay locked. New fields are appended only.
+            row = auto_bet_sheet_row(bet_data)
             worksheet.append_row(row)
             print(f"[GOOGLE SHEETS] OK: Wrote bet to sheet: {bet_data.get('ticker')} - {bet_data.get('pick')}")
             return
@@ -1705,22 +1712,16 @@ def write_auto_bet_to_csv(bet_data: Dict):
     """Write auto-bet record to CSV file (appends if file exists)"""
     file_exists = os.path.exists(AUTO_BET_CSV_FILE)
     
-    # CSV columns (matching Google Sheets structure: removed 'kalshi_odds', moved 'devig_books' to end)
-    fieldnames = [
-        'timestamp', 'order_id', 'ticker', 'side', 'teams', 'market_type', 'pick', 'qualifier',
-        'ev_percent', 'expected_price_cents', 'executed_price_cents', 'american_odds',
-        'contracts', 'cost', 'payout', 'win_amount', 'sport', 'status', 'result', 'pnl', 'settled', 'filter_name', 'devig_books'
-    ]
-    
+    fieldnames = list(AUTO_BET_CSV_FIELDNAMES)
+
     try:
         with open(AUTO_BET_CSV_FILE, 'a', newline='', encoding='utf-8') as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction="ignore")
+
             # Write header if file is new
             if not file_exists:
                 writer.writeheader()
-            
-            # Write bet record
+
             writer.writerow(bet_data)
             print(f"[AUTO-BET CSV] OK: Wrote bet to {AUTO_BET_CSV_FILE}: {bet_data.get('ticker')} - {bet_data.get('pick')}")
     except Exception as e:
@@ -1818,6 +1819,9 @@ def get_auto_bet_stats():
             for row in rows:
                 if len(row) < 22:  # Skip incomplete rows (was 21, now 22 after removing Kalshi Odds and moving Devig Books)
                     continue
+                status = str(row[17] or "").strip().upper()
+                if status == "SKIPPED":
+                    continue
                 
                 try:
                     cost = float(row[13] or 0)  # Cost column (was 14, now 13 after removing Kalshi Odds)
@@ -1847,6 +1851,8 @@ def get_auto_bet_stats():
                 reader = csv.DictReader(csvfile)
                 for row in reader:
                     try:
+                        if str(row.get("status") or "").strip().upper() == "SKIPPED":
+                            continue
                         cost = float(row.get('cost', 0) or 0)
                         pnl_str = row.get('pnl', '0.00') or '0.00'
                         pnl = float(pnl_str.replace('$', '').replace(',', '') or 0)
@@ -2296,6 +2302,12 @@ async def handle_plive_take_display_alert(alert: EvAlert) -> None:
         "autobet_allow": False,
         "ev_source": getattr(alert, "ev_source", "plive_take"),
         "take_book": "PLive",
+        "line": getattr(alert, "line", None),
+        "live": getattr(alert, "live", None),
+        "clock": getattr(alert, "clock", None),
+        "clock_running": getattr(alert, "clock_running", None),
+        "status_detail": getattr(alert, "status_detail", None) or "",
+        "score": getattr(alert, "score", None) or "",
         "book_updated_at": getattr(alert, "book_updated_at", None) or {},
         "kalshi_last_trade_ts": getattr(alert, "kalshi_last_trade_ts", None),
     }
@@ -2864,6 +2876,12 @@ async def handle_new_alert(alert: EvAlert):
             'autobet_allow': bool(getattr(alert, 'autobet_allow', False)),
             'ev_source': getattr(alert, 'ev_source', 'odds_api_value_bets'),
             'take_book': getattr(alert, 'take_book', 'Kalshi') or 'Kalshi',
+            'line': getattr(alert, 'line', None),
+            'live': getattr(alert, 'live', None),
+            'clock': getattr(alert, 'clock', None),
+            'clock_running': getattr(alert, 'clock_running', None),
+            'status_detail': getattr(alert, 'status_detail', None) or getattr(alert, 'statusDetail', None) or '',
+            'score': getattr(alert, 'score', None) or '',
             'book_updated_at': getattr(alert, 'book_updated_at', None) or {},
             'kalshi_last_trade_ts': getattr(alert, 'kalshi_last_trade_ts', None) or (
                 (match_result.get('market') or {}).get('last_trade_ts')
@@ -2913,6 +2931,16 @@ async def handle_new_alert(alert: EvAlert):
             if getattr(alert, "ev_source", None) and alert.ev_source != existing_alert.get("ev_source"):
                 existing_alert["ev_source"] = alert.ev_source
                 updated = True
+            if getattr(alert, "take_book", None):
+                existing_alert["take_book"] = alert.take_book
+                updated = True
+            if getattr(alert, "line", None) is not None:
+                existing_alert["line"] = alert.line
+                updated = True
+            for _lk in ("live", "clock", "clock_running", "status_detail", "score"):
+                if getattr(alert, _lk, None) is not None:
+                    existing_alert[_lk] = getattr(alert, _lk)
+                    updated = True
             
             # CRITICAL: Preserve filter_name - use existing if new alert doesn't have it, otherwise update
             if hasattr(alert, 'filter_name') and alert.filter_name:
@@ -7011,58 +7039,46 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
                 taker_fees_cents = result.get('taker_fees_cents', 0)
                 total_fees_cents = result.get('total_fees_cents', 0)
                 
-                # Get devig books and their odds from alert
+                # POWER pack names + tile odds. Named Devig Books list is built in build_auto_bet_sheet_record.
                 devig_books = getattr(alert, 'devig_books', []) or alert_data.get('devig_books', [])
                 display_books = getattr(alert, 'display_books', {}) or alert_data.get('display_books', {})
-                
-                # Build devig books string with odds (e.g., "Pinnacle:-206, SportTrade:-207, ProphetX:-212, BookMaker:-212")
-                devig_books_str = ''
-                if devig_books and display_books:
-                    our_selection = alert.pick
-                    our_books = display_books.get(our_selection, [])
-                    
-                    # Create a map of book name to odds for quick lookup
-                    book_odds_map = {book.get('book', ''): book.get('odds', 0) for book in our_books}
-                    
-                    # Build list of devig books with their odds
-                    devig_books_list = []
-                    for book_name in devig_books:
-                        if book_name in book_odds_map:
-                            odds = book_odds_map[book_name]
-                            devig_books_list.append(f"{book_name}:{odds}")
-                    
-                    devig_books_str = ', '.join(devig_books_list)
-                
-                bet_record = {
-                    'timestamp': datetime.now().isoformat(),
-                    'order_id': order_id,
-                    'ticker': ticker,
-                    'side': side,
-                    'teams': alert.teams,
-                    'market_type': alert.market_type or alert_data.get('market_type', ''),
-                    'pick': alert.pick,
-                    'qualifier': qualifier,
-                    'ev_percent': f"{ev_percent:.2f}",
-                    'expected_price_cents': str(expected_price_cents),
-                    'executed_price_cents': str(executed_price_cents),
-                    'american_odds': effective_american_odds,
-                    'contracts': str(fill_count),
-                    'cost': f"{cost:.2f}",
-                    'payout': f"{payout:.2f}",
-                    'win_amount': f"{win_amount:.2f}",
-                    'fee_type': fee_type,  # 'maker' or 'taker'
-                    'taker_fees_cents': str(taker_fees_cents),  # Taker fees in cents (for Telegram alert)
-                    'taker_fees': f"{taker_fees_cents/100:.2f}",  # Taker fees in dollars
-                    'total_fees': f"{total_fees_cents/100:.2f}",  # Total fees in dollars
-                    'sport': sport,
-                    'status': 'executed',
-                    'result': 'OPEN',  # Will be updated when market settles
-                    'pnl': '0.00',
-                    'settled': 'FALSE',
-                    'devig_books': devig_books_str,  # Books used for devigging with their odds
-                    'kalshi_odds': effective_american_odds,  # Kalshi odds we bet at (net of fees)
-                    'filter_name': getattr(alert, 'filter_name', '') or alert_data.get('filter_name', '')  # Filter name that triggered this bet (with fallback to alert_data)
-                }
+
+                bet_record = build_auto_bet_sheet_record(
+                    alert=alert,
+                    alert_data=alert_data if isinstance(alert_data, dict) else {},
+                    fill={
+                        "timestamp": datetime.now().isoformat(),
+                        "order_id": order_id,
+                        "ticker": ticker,
+                        "side": side,
+                        "teams": alert.teams,
+                        "market_type": alert.market_type or alert_data.get("market_type", ""),
+                        "pick": alert.pick,
+                        "qualifier": qualifier,
+                        "ev_percent": f"{ev_percent:.2f}",
+                        "expected_price_cents": str(expected_price_cents),
+                        "executed_price_cents": str(executed_price_cents),
+                        "american_odds": effective_american_odds,
+                        "contracts": str(fill_count),
+                        "cost": f"{cost:.2f}",
+                        "payout": f"{payout:.2f}",
+                        "win_amount": f"{win_amount:.2f}",
+                        "fee_type": fee_type,
+                        "taker_fees_cents": str(taker_fees_cents),
+                        "taker_fees": f"{taker_fees_cents/100:.2f}",
+                        "total_fees": f"{total_fees_cents/100:.2f}",
+                        "sport": sport,
+                        "status": "executed",
+                        "result": "OPEN",
+                        "pnl": "0.00",
+                        "settled": "FALSE",
+                        "kalshi_odds": effective_american_odds,
+                        "filter_name": getattr(alert, "filter_name", "") or alert_data.get("filter_name", ""),
+                        "devig_books_names": devig_books,
+                        "display_books": display_books,
+                        "skip_reason": "",
+                    },
+                )
                 
                 # Update decision path with bet execution info
                 decision_path_so_far['final_decision'] = 'BET_PLACED'
