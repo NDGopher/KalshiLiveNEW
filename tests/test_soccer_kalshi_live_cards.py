@@ -4,7 +4,14 @@ Primary: Lille OSC @ Toulouse ML Draw, Odds-API Kalshi +178, no href/ticker.
 """
 from __future__ import annotations
 
-from ev_calculator import american_to_decimal, decimal_to_american, is_plus_print_ev
+import time
+
+from ev_calculator import (
+    LIVE_TAKE_MAX_AGE_SEC,
+    american_to_decimal,
+    decimal_to_american,
+    is_plus_print_ev,
+)
 from execution_guard import (
     is_kalshi_ticker,
     is_paper_kalshi_ticker,
@@ -12,6 +19,7 @@ from execution_guard import (
     prepare_executable_order,
 )
 from kalshi_public_feed import (
+    apply_public_yes_asks,
     attach_public_kalshi_markets,
     book_from_event,
     kalshi_already_priced,
@@ -24,6 +32,8 @@ from kalshi_public_feed import (
 from odds_ev_monitor import (
     OddsEVMonitor,
     _build_display_books_payload,
+    _is_live_fresh_take_quote,
+    _kalshi_take_quote_is_live,
     _numeric_close,
     _pick_matching_odds_row,
     _pick_qualifier_line_for_side,
@@ -1132,6 +1142,326 @@ def test_paper_kalshi_ticker_is_not_kxscan_and_not_executable():
         require_credentials=False,
     )
     assert check.ok is False
+
+
+CELTA_EID = 220179003
+CELTA_HOME = "Real Sociedad San Sebastian"
+CELTA_AWAY = "RC Celta de Vigo"
+# Frozen Odds-API last Stephen saw: -122 then -179. Live Kalshi.com was 71¢ ≈ -245.
+CELTA_FROZEN_122 = american_to_decimal(-122)
+CELTA_FROZEN_179 = american_to_decimal(-179)
+CELTA_LIVE_71C = 1.0 / 0.71
+CELTA_PUBLIC_59C = 1.0 / 0.59
+CELTA_REC_160 = american_to_decimal(-160)
+CELTA_REC_170 = american_to_decimal(-170)
+CELTA_REC_250 = american_to_decimal(-250)
+CELTA_REC_257 = american_to_decimal(-257)
+DRAW_TICKER = "KXLALIGAGAME-26SEP03CELSOC-TIE"
+HOME_TICKER_CELTA = "KXLALIGAGAME-26SEP03CELSOC-SOC"
+AWAY_TICKER_CELTA = "KXLALIGAGAME-26SEP03CELSOC-CEL"
+
+
+def _celta_mon(*, min_sharp: int = 2) -> OddsEVMonitor:
+    mon = OddsEVMonitor(auth_token=None)
+    mon.set_filter(
+        {
+            "betTypes": ["GAMELINES"],
+            "minRoi": 0,
+            "devigFilter": {
+                "sharps": ["Pinnacle", "Betfair Exchange", "Bet365", "Polymarket"],
+                "method": "POWER",
+                "type": "AVERAGE",
+                "minEv": 0,
+                "minSharpBooks": min_sharp,
+                "hold": [{"book": "Any", "max": 20}],
+            },
+            "oddsRanges": [{"book": "Any", "min": -500, "max": 500}],
+            "displayBooks": [
+                "Kalshi",
+                "Pinnacle",
+                "Betfair Exchange",
+                "Bet365",
+                "Polymarket",
+            ],
+        }
+    )
+    return mon
+
+
+def _celta_doc(
+    *,
+    kalshi_draw,
+    rec_draw,
+    kalshi_age_sec=None,
+    rec_age_sec=2.0,
+    now=None,
+    kalshi_href="",
+    live=True,
+):
+    now = float(now if now is not None else time.time())
+    kalshi_row = {
+        "home": 3.20,
+        "draw": kalshi_draw,
+        "away": 3.20,
+    }
+    if kalshi_href:
+        kalshi_row["href"] = kalshi_href
+        kalshi_row["draw_href"] = kalshi_href
+        kalshi_row["draw_ticker"] = DRAW_TICKER
+    rec = {
+        "home": 3.40,
+        "draw": rec_draw,
+        "away": 3.50,
+    }
+    stamps = {
+        "Pinnacle": now - float(rec_age_sec),
+        "Betfair Exchange": now - 0.5,
+        "Bet365": now - float(rec_age_sec),
+        "Polymarket": now - 1.0,
+    }
+    if kalshi_age_sec is not None:
+        stamps["Kalshi"] = now - float(kalshi_age_sec)
+        kalshi_row["book_updated_at"] = now - float(kalshi_age_sec)
+    return {
+        "id": CELTA_EID,
+        "home": CELTA_HOME,
+        "away": CELTA_AWAY,
+        "sport": {"slug": "football"},
+        "league": {"name": "Spain La Liga"},
+        "live": live,
+        "book_updated_at": stamps,
+        "bookmakers": {
+            "Kalshi": [{"name": "ML", "odds": [kalshi_row]}],
+            "Pinnacle": [{"name": "ML", "odds": [dict(rec)]}],
+            "Betfair Exchange": [{"name": "ML", "odds": [dict(rec)]}],
+            "Bet365": [{"name": "ML", "odds": [dict(rec, draw=american_to_decimal(-163))]}],
+            "Polymarket": [{"name": "ML", "odds": [dict(rec)]}],
+        },
+    }
+
+
+def _celta_public_markets(*, ask_prob: float):
+    ask = f"{ask_prob:.4f}"
+    no_ask = f"{max(0.01, 1.0 - ask_prob - 0.02):.4f}"
+    return [
+        {
+            "ticker": HOME_TICKER_CELTA,
+            "event_ticker": "KXLALIGAGAME-26SEP03CELSOC",
+            "series_ticker": "KXLALIGAGAME",
+            "status": "open",
+            "yes_sub_title": "Real Sociedad",
+            "yes_ask_dollars": "0.3200",
+            "no_ask_dollars": "0.7000",
+        },
+        {
+            "ticker": AWAY_TICKER_CELTA,
+            "event_ticker": "KXLALIGAGAME-26SEP03CELSOC",
+            "series_ticker": "KXLALIGAGAME",
+            "status": "open",
+            "yes_sub_title": "Celta Vigo",
+            "yes_ask_dollars": "0.2800",
+            "no_ask_dollars": "0.7400",
+        },
+        {
+            "ticker": DRAW_TICKER,
+            "event_ticker": "KXLALIGAGAME-26SEP03CELSOC",
+            "series_ticker": "KXLALIGAGAME",
+            "status": "open",
+            "yes_sub_title": "Tie",
+            "yes_ask_dollars": ask,
+            "no_ask_dollars": no_ask,
+        },
+    ]
+
+
+def _celta_draw_card(doc, mon=None):
+    mon = mon or _celta_mon()
+    rows = mon.live_scan_value_bets_from_docs({CELTA_EID: doc})
+    draw = [
+        r
+        for r in rows
+        if r.get("betSide") == "draw" and r.get("_scan_mname") == "ML" and r.get("_take_only") != "PLive"
+    ]
+    if not draw:
+        return None, mon
+    return mon._value_bet_to_normalized_bet(draw[0], doc, take_book="Kalshi"), mon
+
+
+def test_soccer_live_take_window_is_15s():
+    assert float(LIVE_TAKE_MAX_AGE_SEC) == 15.0
+    now = time.time()
+    assert _is_live_fresh_take_quote(None, now) is False
+    assert _is_live_fresh_take_quote(now - 2.0, now) is True
+    assert _is_live_fresh_take_quote(now - 16.0, now) is False
+    ev = {"sport": {"slug": "football"}, "live": True}
+    stale = {
+        "live": True,
+        "sport": {"slug": "football"},
+        "book_updated_at": {"Kalshi": now - 120.0, "Pinnacle": now - 2.0},
+    }
+    assert _kalshi_take_quote_is_live(stale, ev, now_ts=now) is False
+    missing_take = {
+        "live": True,
+        "sport": {"slug": "football"},
+        "book_updated_at": {"Pinnacle": now - 2.0},
+    }
+    assert _kalshi_take_quote_is_live(missing_take, ev, now_ts=now) is False
+    fixture = {"sport": {"slug": "football"}, "live": True}
+    assert _kalshi_take_quote_is_live(fixture, ev, now_ts=now) is True
+
+
+def test_celta_frozen_122_for_4min_vs_live_recs_drops_kalshi_take():
+    """PRIMARY: Odds-API Kalshi stuck -122 for 4 minutes vs recs ~-160 → no card."""
+    now = time.time()
+    doc = _celta_doc(
+        kalshi_draw=CELTA_FROZEN_122,
+        rec_draw=CELTA_REC_160,
+        kalshi_age_sec=240.0,
+        rec_age_sec=2.0,
+        now=now,
+    )
+    assert kalshi_already_priced(doc, now=now) is False
+    built, _mon = _celta_draw_card(doc)
+    assert built is None
+    alerts = _celta_mon().alerts_from_live_scan_docs({CELTA_EID: doc})
+    kalshi = [a for a in alerts if str(getattr(a, "take_book", "")).lower() == "kalshi"]
+    assert kalshi == []
+
+
+def test_celta_frozen_179_for_2min_vs_71c_board_is_failed_take():
+    """PRIMARY LIVE PROOF: green Kalshi -179 badge 2m vs live 71¢ / recs -250. Hide it."""
+    now = time.time()
+    doc = _celta_doc(
+        kalshi_draw=CELTA_FROZEN_179,
+        rec_draw=CELTA_REC_250,
+        kalshi_age_sec=120.0,
+        rec_age_sec=3.0,
+        now=now,
+    )
+    doc["bookmakers"]["Pinnacle"][0]["odds"][0]["draw"] = CELTA_REC_257
+    built, mon = _celta_draw_card(doc)
+    assert built is None
+    alerts = mon.alerts_from_live_scan_docs({CELTA_EID: doc})
+    plus = [a for a in alerts if is_plus_print_ev(getattr(a, "ev_percent", None))]
+    kalshi = [a for a in plus if str(getattr(a, "take_book", "")).lower() == "kalshi"]
+    assert kalshi == []
+    assert all(int(str(getattr(a, "odds", 0)).replace("+", "") or 0) != -179 for a in alerts)
+
+
+def test_celta_stale_odds_api_does_not_block_public_overwrite():
+    now = time.time()
+    doc = _celta_doc(
+        kalshi_draw=CELTA_FROZEN_122,
+        rec_draw=CELTA_REC_170,
+        kalshi_age_sec=240.0,
+        rec_age_sec=1.0,
+        now=now,
+    )
+    assert kalshi_already_priced(doc, now=now) is False
+    public = _celta_public_markets(ask_prob=0.59)
+    n = attach_public_kalshi_markets({CELTA_EID: doc}, public, now=now)
+    assert n == 1
+    row = doc["bookmakers"]["Kalshi"][0]["odds"][0]
+    assert abs(float(row["draw"]) - CELTA_PUBLIC_59C) < 1e-3
+    assert abs(float(row["draw"]) - CELTA_FROZEN_122) > 0.05
+    assert row.get("draw_ticker") == DRAW_TICKER
+    assert abs(float(doc["book_updated_at"]["Kalshi"]) - now) < 1e-6
+    assert abs(float(row["book_updated_at"]) - now) < 1e-6
+
+
+def test_celta_public_71c_fresh_is_not_fake_plus_ten():
+    """Live Kalshi.com Tie YES 71¢ ≈ -245 vs recs -250. Not +10% on frozen -179."""
+    now = time.time()
+    doc = _celta_doc(
+        kalshi_draw=CELTA_FROZEN_179,
+        rec_draw=CELTA_REC_250,
+        kalshi_age_sec=120.0,
+        rec_age_sec=2.0,
+        now=now,
+        kalshi_href=f"https://kalshi.com/markets/{DRAW_TICKER}",
+    )
+    public = _celta_public_markets(ask_prob=0.71)
+    assert attach_public_kalshi_markets({CELTA_EID: doc}, public, now=now) == 1
+    row = doc["bookmakers"]["Kalshi"][0]["odds"][0]
+    assert abs(float(row["draw"]) - CELTA_LIVE_71C) < 1e-3
+    built, mon = _celta_draw_card(doc)
+    if built is not None:
+        assert int(built["odds"]) != -179
+        assert int(built["odds"]) != -122
+        assert abs(int(built["odds"]) + 245) <= 2
+        assert float(built["ev"]) < 9.0
+        assert built["autobet_allow"] is False
+        left = (built["displayBooks"][built["selection"]] or [])[0]
+        assert left["book"] == "Kalshi"
+        assert abs(float(left["book_updated_at"]) - now) < 1e-6
+    alerts = mon.alerts_from_live_scan_docs({CELTA_EID: doc})
+    plus = [
+        a
+        for a in alerts
+        if str(getattr(a, "take_book", "")).lower() == "kalshi"
+        and is_plus_print_ev(getattr(a, "ev_percent", None))
+    ]
+    assert all(float(a.ev_percent) < 9.0 for a in plus)
+    assert all(int(str(a.odds).replace("+", "")) != -179 for a in plus)
+
+
+def test_celta_public_59c_fresh_not_plus_nine_vs_live_recs():
+    now = time.time()
+    doc = _celta_doc(
+        kalshi_draw=CELTA_FROZEN_122,
+        rec_draw=CELTA_REC_160,
+        kalshi_age_sec=240.0,
+        rec_age_sec=1.0,
+        now=now,
+    )
+    public = _celta_public_markets(ask_prob=0.59)
+    assert attach_public_kalshi_markets({CELTA_EID: doc}, public, now=now) == 1
+    built, _mon = _celta_draw_card(doc)
+    if built is not None:
+        assert int(built["odds"]) != -122
+        assert abs(int(built["odds"]) + 144) <= 3
+        assert float(built["ev"]) < 9.0
+        assert built["autobet_allow"] is False
+
+
+def test_celta_fresh_odds_api_under_15s_still_already_priced():
+    now = time.time()
+    doc = _celta_doc(
+        kalshi_draw=CELTA_FROZEN_179,
+        rec_draw=CELTA_REC_250,
+        kalshi_age_sec=8.0,
+        rec_age_sec=2.0,
+        now=now,
+        kalshi_href=f"https://kalshi.com/markets/{DRAW_TICKER}",
+    )
+    assert kalshi_already_priced(doc, now=now) is True
+    public = _celta_public_markets(ask_prob=0.71)
+    assert attach_public_kalshi_markets({CELTA_EID: doc}, public, now=now) == 0
+    n_ask = apply_public_yes_asks({CELTA_EID: doc}, public, now=now)
+    assert n_ask == 1
+    row = doc["bookmakers"]["Kalshi"][0]["odds"][0]
+    assert abs(float(row["draw"]) - CELTA_LIVE_71C) < 1e-3
+    assert abs(float(doc["book_updated_at"]["Kalshi"]) - now) < 1e-6
+
+
+def test_celta_green_left_tile_age_matches_quote_used():
+    now = time.time()
+    doc = _celta_doc(
+        kalshi_draw=CELTA_PUBLIC_59C,
+        rec_draw=american_to_decimal(160),
+        kalshi_age_sec=2.0,
+        rec_age_sec=2.0,
+        now=now,
+        kalshi_href=f"https://kalshi.com/markets/{DRAW_TICKER}",
+    )
+    # Rec pack at +160 vs Kalshi 59¢ / -144 can plus. Age on the take tile is Kalshi's.
+    built, _mon = _celta_draw_card(doc)
+    if built is None:
+        return
+    left = (built["displayBooks"][built["selection"]] or [])[0]
+    assert left["book"] == "Kalshi"
+    assert abs(float(left["book_updated_at"]) - (now - 2.0)) < 1e-6
+    assert abs(float((built["book_updated_at"] or {}).get("Kalshi")) - (now - 2.0)) < 1e-6
 
 
 def test_auto_bet_stays_off_and_paper_handler_exists():

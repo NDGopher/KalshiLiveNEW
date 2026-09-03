@@ -1,13 +1,13 @@
 """Public Kalshi market listing → Odds-API take-book attach.
 
-Odds-API supplies the rec pack. When that feed has no priced Kalshi
-gameline, this module lists open GAME/SPREAD/TOTAL markets with an
-unsigned GET and maps them onto Odds-API events.
+Odds-API supplies the rec pack. Soccer Kalshi on that feed is often a
+frozen last. This module lists open GAME/SPREAD/TOTAL markets with an
+unsigned GET and maps the executable YES ask onto Odds-API events.
 
 Private-key credentials are not used here. Orders still require a key.
 Fail-closed: zero or two-plus event matches, swapped/ambiguous teams,
-or a missing ask → no attach. Existing priced Odds-API Kalshi is kept.
-PLive-only docs may receive a Kalshi book; PLive itself is untouched.
+or a missing ask → no attach. Fresh Odds-API Kalshi is kept. Stale or
+missing Odds-API Kalshi is overwritten and stamped now. PLive is untouched.
 """
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ import time
 from collections import defaultdict
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
+from ev_calculator import LIVE_REC_POWER_MAX_AGE_SEC, LIVE_TAKE_MAX_AGE_SEC
 from execution_guard import event_ticker_from_any
 from plive_pandora import _norm_team, _team_identity_tokens, odds_event_start_unix
 
@@ -26,7 +27,8 @@ KALSHI_MARKETS_PATH = "/trade-api/v2/markets"
 KALSHI_SERIES_PATH = "/trade-api/v2/series"
 KALSHI_HREF = "https://kalshi.com/markets/{ticker}"
 
-CACHE_TTL_SEC = float(os.getenv("KALSHI_PUBLIC_FEED_TTL_SEC", "45") or "45")
+# Open take cards need the executable YES ask every poll. 45s froze Celta -179.
+CACHE_TTL_SEC = float(os.getenv("KALSHI_PUBLIC_FEED_TTL_SEC", "2") or "2")
 SOCCER_SERIES_TTL_SEC = float(os.getenv("KALSHI_SOCCER_SERIES_TTL_SEC", "300") or "300")
 START_TOLERANCE_SEC = int(os.getenv("KALSHI_PUBLIC_START_TOLERANCE_SEC", "64800") or "64800")
 MAX_PAGES = 8
@@ -500,16 +502,36 @@ def assign_kalshi_title_side(title: str, odds_home: str, odds_away: str) -> Opti
     return None
 
 
-def kalshi_already_priced(doc: Dict[str, Any]) -> bool:
+def _stamp_epoch_seconds(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        v = float(value)
+        if v != v or v <= 0:
+            return None
+        return v / 1000.0 if v > 1e12 else v
+    try:
+        from datetime import datetime
+
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return float(parsed.timestamp())
+
+
+def _kalshi_book_list(doc: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
     bks = doc.get("bookmakers")
     if not isinstance(bks, dict):
-        return False
-    raw = None
+        return None
     for key, val in bks.items():
         if str(key).strip().lower() == "kalshi":
-            raw = val
-            break
-    if not isinstance(raw, list):
+            return val if isinstance(val, list) else None
+    return None
+
+
+def kalshi_has_priced_decimal(doc: Dict[str, Any]) -> bool:
+    raw = _kalshi_book_list(doc)
+    if not raw:
         return False
     for mk in raw:
         if not isinstance(mk, dict):
@@ -524,6 +546,64 @@ def kalshi_already_priced(doc: Dict[str, Any]) -> bool:
                 except (TypeError, ValueError):
                     continue
     return False
+
+
+def kalshi_book_stamp(doc: Dict[str, Any]) -> Any:
+    stamps = doc.get("book_updated_at")
+    if isinstance(stamps, dict):
+        for key, val in stamps.items():
+            if str(key).strip().lower() == "kalshi" and val is not None and val != "":
+                return val
+    raw = _kalshi_book_list(doc) or []
+    for mk in raw:
+        if not isinstance(mk, dict):
+            continue
+        for row in mk.get("odds") or []:
+            if not isinstance(row, dict):
+                continue
+            ts = row.get("book_updated_at") or row.get("updated_at")
+            if ts is not None and ts != "":
+                return ts
+    return None
+
+
+def kalshi_already_priced(doc: Dict[str, Any], now: Optional[float] = None) -> bool:
+    """True only for a priced Odds-API Kalshi quote that is still fresh.
+
+    Missing price → False (public may attach). A stamp older than the take
+    window on soccer live, or the 45s rec window otherwise, is stale and
+    does not block the public YES ask. Unstamped fixtures stay priced.
+    """
+    if not kalshi_has_priced_decimal(doc):
+        return False
+    ts = kalshi_book_stamp(doc)
+    if ts is None:
+        return True
+    epoch = _stamp_epoch_seconds(ts)
+    if epoch is None:
+        return False
+    clock = float(now if now is not None else time.time())
+    soccer_live = sport_key_for_doc(doc) == "soccer" and bool(doc.get("live"))
+    max_age = LIVE_TAKE_MAX_AGE_SEC if soccer_live else LIVE_REC_POWER_MAX_AGE_SEC
+    return (clock - epoch) <= float(max_age) + 1e-9
+
+
+def stamp_kalshi_book(doc: Dict[str, Any], when: Optional[float] = None) -> float:
+    """Mark the Kalshi take as the quote just written. Tile age follows this."""
+    now = float(when if when is not None else time.time())
+    stamps = doc.get("book_updated_at")
+    if not isinstance(stamps, dict):
+        stamps = {}
+        doc["book_updated_at"] = stamps
+    stamps["Kalshi"] = now
+    raw = _kalshi_book_list(doc) or []
+    for mk in raw:
+        if not isinstance(mk, dict):
+            continue
+        for row in mk.get("odds") or []:
+            if isinstance(row, dict):
+                row["book_updated_at"] = now
+    return now
 
 
 def _volume(market: Dict[str, Any]) -> float:
@@ -768,15 +848,126 @@ def book_from_event(
     return out
 
 
+def _ticker_from_href(href: Any) -> str:
+    raw = str(href or "").strip()
+    if not raw:
+        return ""
+    parts = raw.rstrip("/").split("/")
+    cand = parts[-1].upper() if parts else ""
+    return cand if cand.startswith("KX") else ""
+
+
+def kalshi_tickers_from_doc(doc: Dict[str, Any]) -> List[str]:
+    found: List[str] = []
+    seen: Set[str] = set()
+    raw = _kalshi_book_list(doc) or []
+    keys = (
+        "ticker",
+        "home_ticker",
+        "away_ticker",
+        "draw_ticker",
+        "over_ticker",
+        "under_ticker",
+    )
+    href_keys = ("href", "home_href", "away_href", "draw_href", "over_href", "under_href")
+    for mk in raw:
+        if not isinstance(mk, dict):
+            continue
+        for row in mk.get("odds") or []:
+            if not isinstance(row, dict):
+                continue
+            for key in keys:
+                tok = str(row.get(key) or "").strip().upper()
+                if tok.startswith("KX") and tok not in seen:
+                    seen.add(tok)
+                    found.append(tok)
+            for key in href_keys:
+                tok = _ticker_from_href(row.get(key))
+                if tok and tok not in seen:
+                    seen.add(tok)
+                    found.append(tok)
+    return found
+
+
+def apply_public_yes_asks(
+    docs: Union[Dict[Any, Dict[str, Any]], Sequence[Dict[str, Any]]],
+    markets: Sequence[Dict[str, Any]],
+    now: Optional[float] = None,
+) -> int:
+    """Overwrite Kalshi decimals with the public YES ask when tickers match.
+
+    Odds-API last is not the take. Executable ask is. Stamps ``book_updated_at``.
+    Does not copy PLive. No ticker → no overlay (attach may still replace).
+    """
+    by_ticker: Dict[str, Dict[str, Any]] = {}
+    for m in markets or []:
+        if not isinstance(m, dict):
+            continue
+        tok = str(m.get("ticker") or "").strip().upper()
+        if tok:
+            by_ticker[tok] = m
+    if not by_ticker:
+        return 0
+    clock = float(now if now is not None else time.time())
+    updated = 0
+    side_ticker = {
+        "home": ("ticker", "home_ticker", "home_href", "href"),
+        "away": ("away_ticker", "away_href"),
+        "draw": ("draw_ticker", "draw_href"),
+        "over": ("over_ticker", "ticker", "over_href", "href"),
+        "under": ("under_ticker", "under_href"),
+    }
+    for doc in _as_docs(docs):
+        raw = _kalshi_book_list(doc)
+        if not raw:
+            continue
+        changed = False
+        for mk in raw:
+            if not isinstance(mk, dict):
+                continue
+            for row in mk.get("odds") or []:
+                if not isinstance(row, dict):
+                    continue
+                for side, keys in side_ticker.items():
+                    ticker = ""
+                    for key in keys:
+                        if key.endswith("href"):
+                            ticker = _ticker_from_href(row.get(key))
+                        else:
+                            ticker = str(row.get(key) or "").strip().upper()
+                        if ticker.startswith("KX"):
+                            break
+                        ticker = ""
+                    if not ticker or ticker not in by_ticker:
+                        continue
+                    ask_side = "no" if side == "under" else "yes"
+                    dec = decimal_from_ask(_ask_prob(by_ticker[ticker], ask_side))
+                    if dec is None or dec <= 1.0:
+                        continue
+                    row[side] = dec
+                    row["book_updated_at"] = clock
+                    changed = True
+        if changed:
+            stamp_kalshi_book(doc, clock)
+            updated += 1
+    return updated
+
+
 def attach_public_kalshi_markets(
     docs: Union[Dict[Any, Dict[str, Any]], Sequence[Dict[str, Any]]],
     markets: Sequence[Dict[str, Any]],
+    now: Optional[float] = None,
 ) -> int:
-    """Inject Odds-API-shaped ``bookmakers['Kalshi']`` from public markets. Mutates docs."""
+    """Inject Odds-API-shaped ``bookmakers['Kalshi']`` from public markets. Mutates docs.
+
+    Fresh priced Odds-API Kalshi is kept. Stale or missing is replaced with the
+    public YES ask and stamped now. WS-up does not skip this path.
+    """
     grouped = _group_events(markets)
+    clock = float(now if now is not None else time.time())
     attached = 0
     for doc in _as_docs(docs):
-        if kalshi_already_priced(doc):
+        if kalshi_already_priced(doc, now=clock):
             continue
         ev = match_public_event(doc, grouped)
         if not ev:
@@ -793,6 +984,7 @@ def attach_public_kalshi_markets(
             bks = {}
             doc["bookmakers"] = bks
         bks["Kalshi"] = book
+        stamp_kalshi_book(doc, clock)
         attached += 1
     return attached
 
@@ -947,6 +1139,10 @@ async def attach_public_kalshi_to_docs(
             print(f"[KALSHI PUBLIC] fetch failed: {ex}")
             return 0
     n = attach_public_kalshi_markets(docs, markets)
-    if n:
-        print(f"[PIPELINE] Public Kalshi: attached take lines to {n} event(s) (no private key)")
-    return n
+    n_ask = apply_public_yes_asks(docs, markets)
+    if n or n_ask:
+        print(
+            f"[PIPELINE] Public Kalshi: attached take lines to {n} event(s) "
+            f"yes_ask_refresh={n_ask} (no private key; WS-up does not skip)"
+        )
+    return n + n_ask

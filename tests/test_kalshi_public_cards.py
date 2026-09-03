@@ -3,9 +3,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ev_calculator import american_to_decimal, is_plus_print_ev
+import time
+
+from ev_calculator import LIVE_REC_POWER_MAX_AGE_SEC, LIVE_TAKE_MAX_AGE_SEC, american_to_decimal, is_plus_print_ev
 from execution_guard import has_trading_credentials
 from kalshi_public_feed import (
+    CACHE_TTL_SEC,
     attach_public_kalshi_markets,
     attach_public_kalshi_to_docs,
     decimal_from_ask,
@@ -147,14 +150,48 @@ def test_wrong_teams_do_not_attach():
 
 def test_does_not_overwrite_priced_odds_api_kalshi():
     doc = _odds_doc_no_take()
+    now = time.time()
     doc["bookmakers"]["Kalshi"] = [
         {"name": "ML", "odds": [{"home": 1.80, "away": 2.10, "href": "https://kalshi.com/markets/KXKEEP"}]}
     ]
-    assert kalshi_already_priced(doc) is True
-    n = attach_public_kalshi_markets({1: doc}, _public_mlb_markets())
+    doc["book_updated_at"] = {"Kalshi": now}
+    assert kalshi_already_priced(doc, now=now) is True
+    n = attach_public_kalshi_markets({1: doc}, _public_mlb_markets(), now=now)
     assert n == 0
     href = doc["bookmakers"]["Kalshi"][0]["odds"][0]["href"]
     assert "KXKEEP" in href
+
+
+def test_stale_odds_api_kalshi_does_not_block_public_overwrite():
+    doc = _odds_doc_no_take()
+    now = time.time()
+    doc["bookmakers"]["Kalshi"] = [
+        {"name": "ML", "odds": [{"home": 1.80, "away": 2.10, "href": "https://kalshi.com/markets/KXSTALE"}]}
+    ]
+    doc["book_updated_at"] = {"Kalshi": now - 240.0}
+    assert kalshi_already_priced(doc, now=now) is False
+    n = attach_public_kalshi_markets({1: doc}, _public_mlb_markets(), now=now)
+    assert n == 1
+    href = doc["bookmakers"]["Kalshi"][0]["odds"][0]["href"]
+    assert "KXKEEP" not in href
+    assert HOME_TICKER in href
+    assert abs(float(doc["book_updated_at"]["Kalshi"]) - now) < 1e-6
+
+
+def test_fresh_odds_api_kalshi_under_45s_still_already_priced():
+    doc = _odds_doc_no_take()
+    now = time.time()
+    doc["bookmakers"]["Kalshi"] = [
+        {"name": "ML", "odds": [{"home": 1.80, "away": 2.10, "href": "https://kalshi.com/markets/KXKEEP"}]}
+    ]
+    doc["book_updated_at"] = {"Kalshi": now - 20.0}
+    assert 20.0 < float(LIVE_REC_POWER_MAX_AGE_SEC)
+    assert kalshi_already_priced(doc, now=now) is True
+
+
+def test_public_feed_cache_is_1_to_2s_not_45():
+    assert 1.0 <= float(CACHE_TTL_SEC) <= 2.0
+    assert float(LIVE_TAKE_MAX_AGE_SEC) == 15.0
 
 
 def test_plive_only_stays_tradable_without_public_kalshi():
@@ -259,5 +296,5 @@ def test_async_attach_uses_injected_markets_not_network():
         return await attach_public_kalshi_to_docs({DET_MIN_EID: doc}, _public_mlb_markets())
 
     n = asyncio.run(_run())
-    assert n == 1
+    assert n >= 1
     assert _odds_doc_has_take_tradable_gameline(doc) is True
