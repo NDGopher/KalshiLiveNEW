@@ -155,12 +155,25 @@ def test_7_tigers_away_sign_and_plive_not_best():
         369,
         min_sharp_books=3,
         take_book="PLive",
-        painted_side_hdp=1.5,
+        painted_side_hdp=-1.5,
         kalshi_side_hdp=-1.5,
         rec_side_hdp=-1.5,
     )
     assert out["plus_alert"] is False
-    assert "plive_not_best" in out["reasons"] or out["plus_alert"] is False
+    assert out["ev_percent"] <= 0
+    assert "plive_not_best" in out["reasons"]
+    assert "nv_better" not in out["reasons"]
+    assert "two_exchange" not in out["reasons"]
+    assert count_better_exchanges(
+        [
+            _book("Bet365", 475, -650),
+            _book("NoVig", 525, -750),
+            _book("Caesars", 333, -430),
+            _book("DraftKings", 307, -390),
+            _book("Kalshi", 317, -410),
+        ],
+        369,
+    ) == 1
 
 
 def test_8_missing_sister_no_ev():

@@ -59,6 +59,21 @@ TIGHT_CLUSTER_EV_ABS = 2.0
 AUTOBET_MIN_SAME_SIGN_RECS = 5
 AUTOBET_TIGHT_PACK_CENTS = 0.15
 AUTOBET_MAX_EV_PCT = 12.0
+# Live recs older than this are out of POWER (tile timers stay). 3h NV is junk.
+LIVE_REC_POWER_MAX_AGE_SEC = 45.0
+
+
+def is_plus_print_ev(ev_percent: Any, min_ev: float = 0.0) -> bool:
+    """Zero is not a KEEP. Failed/missing two-way must be no card, not EV=0."""
+    try:
+        ev = float(ev_percent)
+    except (TypeError, ValueError):
+        return False
+    if ev != ev:
+        return False
+    if ev <= 1e-9:
+        return False
+    return ev + 1e-9 >= float(min_ev or 0.0)
 
 
 def decimal_to_american(d: float) -> int:
@@ -858,8 +873,18 @@ def apply_ev_hard_gates(
         reasons.append("two_exchange")
 
     take_key = _book_name_key(take_book or "Kalshi")
-    # PLive take: KEEP only if PLive is strictly best vs the rec pack.
-    if take_key == "plive" and better > 0:
+    # PLive take: KEEP only if PLive is strictly best on the raw board
+    # (not just POWER survivors / configured sharps). Bet365 +475 vs PLive
+    # +369 is take-not-best even when Bet365 is display-only.
+    board_better = count_better_than_kalshi(
+        [
+            b
+            for b in (exch_src or [])
+            if _book_name_key(b.get("name")) != take_key
+        ],
+        kalshi_american,
+    )
+    if take_key == "plive" and (better > 0 or board_better > 0):
         ev = min(ev, 0.0)
         allow_plus = False
         reasons.append("plive_not_best")
@@ -970,6 +995,7 @@ def evaluate_sharp_panel_ev(
         "reasons": reasons,
         "kalshi_implied": gated["kalshi_implied"],
         "survivor_median_implied": gated.get("survivor_median_implied"),
+        "exchange_better": gated.get("exchange_better", 0),
         "used_fallback": used_fallback,
         "autobet_allow": bool(shape["allow"]),
         "autobet_reasons": list(shape["reasons"]),

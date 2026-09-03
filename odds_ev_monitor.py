@@ -39,6 +39,7 @@ import aiohttp
 from ev_alert import EvAlert
 from ev_calculator import (
     EVCalculator,
+    LIVE_REC_POWER_MAX_AGE_SEC,
     _fair_prob_power_relaxed_three_way,
     _fair_prob_power_relaxed_two_way,
     _passes_hold,
@@ -53,6 +54,7 @@ from ev_calculator import (
     ev_percent_vs_take_american,
     format_ev_percent_display,
     is_junk_vs_kalshi,
+    is_plus_print_ev,
     is_plive_book,
     is_polymarket_book,
     power_average_fair_prob,
@@ -1063,6 +1065,122 @@ def _two_way_pick_opp_decimals(row: Dict[str, Any], bet_side: str) -> Optional[T
     return None
 
 
+def _board_books_for_side(
+    bks: Optional[Dict[str, Any]],
+    mname: str,
+    bet_side: str,
+    ref_row: Optional[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Every bookmaker two-way on this side — display + sharps. Used for take-best."""
+    out: List[Dict[str, Any]] = []
+    if not isinstance(bks, dict):
+        return out
+    for sn in bks.keys():
+        mk = _find_market_block(_markets_list_for_book(bks, str(sn)), mname)
+        if not mk:
+            continue
+        row = (
+            _sharp_row_for_market(mk, mname, ref_row)
+            if ref_row
+            else (_first_odds_row(mk) or {})
+        )
+        tw = _two_way_pick_opp_decimals(row, bet_side)
+        if not tw:
+            continue
+        d_pick, d_opp = tw
+        blob: Dict[str, Any] = {
+            "name": str(sn),
+            "american": decimal_to_american(d_pick),
+            "decimal_pick": d_pick,
+            "decimal_opp": d_opp,
+        }
+        ts = row.get("updated_at") or row.get("book_updated_at")
+        if ts is not None:
+            blob["book_updated_at"] = ts
+        out.append(blob)
+    return out
+
+
+def _book_updated_epoch_seconds(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        v = float(value)
+        if not math.isfinite(v):
+            return None
+        return v / 1000.0 if v > 1e12 else v
+    parsed = None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        parsed = None
+    if parsed is None:
+        return None
+    return float(parsed.timestamp())
+
+
+def _is_live_fresh_quote(value: Any, now_ts: Optional[float] = None) -> bool:
+    """Missing ts stays eligible (fixtures). Quotes older than 45s are out of POWER."""
+    epoch = _book_updated_epoch_seconds(value)
+    if epoch is None:
+        return True
+    now = float(now_ts if now_ts is not None else time.time())
+    return (now - epoch) <= float(LIVE_REC_POWER_MAX_AGE_SEC) + 1e-9
+
+
+def _fresh_board_books(books: List[Dict[str, Any]], now_ts: Optional[float] = None) -> List[Dict[str, Any]]:
+    return [b for b in (books or []) if _is_live_fresh_quote(b.get("book_updated_at"), now_ts)]
+
+
+def _consensus_primary_totals_line(bks: Optional[Dict[str, Any]], *, skip_book: str = "") -> Optional[float]:
+    """Modal first Totals line among rec books. Used to drop a stale take line (10.5 vs 7)."""
+    from collections import Counter
+
+    if not isinstance(bks, dict):
+        return None
+    skip = _norm_book(str(skip_book or "")).lower()
+    firsts: List[float] = []
+    for sn, markets in bks.items():
+        if skip and _norm_book(str(sn)).lower() == skip:
+            continue
+        mk = _find_market_block(markets if isinstance(markets, list) else [], "Totals")
+        if not mk:
+            continue
+        lv = total_line_value(_first_odds_row(mk) or {})
+        if lv is not None:
+            firsts.append(float(lv))
+    if len(firsts) < 2:
+        return None
+    mode, n = Counter(firsts).most_common(1)[0]
+    if n < 2:
+        return None
+    return float(mode)
+
+
+def drop_both_plus_total_alerts(alerts: List[Any]) -> List[Any]:
+    """Both Over and Under of the same total cannot both be plus. Drop the pair."""
+    from collections import defaultdict
+
+    groups: Dict[Tuple[str, str, str], List[Any]] = defaultdict(list)
+    for alert in alerts or []:
+        pick = str(getattr(alert, "pick", "") or "").strip().lower()
+        if pick not in ("over", "under"):
+            continue
+        key = (
+            str(getattr(alert, "teams", "") or ""),
+            str(getattr(alert, "qualifier", "") or ""),
+            str(getattr(alert, "market_type", "") or "").lower(),
+        )
+        groups[key].append(alert)
+    drop_ids: Set[int] = set()
+    for rows in groups.values():
+        plus = [a for a in rows if is_plus_print_ev(getattr(a, "ev_percent", None))]
+        picks = {str(getattr(a, "pick", "") or "").strip().lower() for a in plus}
+        if "over" in picks and "under" in picks:
+            drop_ids.update(id(a) for a in plus)
+    return [a for a in (alerts or []) if id(a) not in drop_ids]
+
+
 def _three_way_draw_decimals(row: Dict[str, Any]) -> Optional[Tuple[float, float, float]]:
     dh = _float_dec(row.get("home"))
     dd = _float_dec(row.get("draw"))
@@ -1349,6 +1467,8 @@ class OddsEVMonitor:
                 odds_str = f"+{oi}" if oi > 0 else str(oi)
             price_cents = bet.get("price")
             ev_percent = float(bet.get("ev", 0.0))
+            if not is_plus_print_ev(ev_percent):
+                return None
             limit = float(bet.get("limit", 0.0))
             fair_odds = bet.get("fairOdds")
             fair_odds_str = None
@@ -2197,7 +2317,7 @@ class OddsEVMonitor:
                 f"[PIPELINE] Summary: live_pregame_scan rows={len(scan_rows)} alerts_built={len(alerts)} "
                 f"dropped_or_skipped={miss} minSharpBooks={ms}"
             )
-        return alerts
+        return drop_both_plus_total_alerts(alerts)
 
     async def _fetch_alerts_live_broad_scan(self, client: Any) -> List[EvAlert]:
         """
@@ -2697,6 +2817,18 @@ class OddsEVMonitor:
             return None
         if k_dec is None or k_dec <= 1.0:
             return None
+        # Totals: missing sister = no card. Stale take line vs live consensus (10.5 vs 7) = hide.
+        if _market_is_total(mname):
+            if not _two_way_pick_opp_decimals(k_row or {}, bet_side):
+                return None
+            take_line = total_line_value(k_row)
+            consensus = _consensus_primary_totals_line(bks, skip_book=take_canon)
+            if (
+                take_line is not None
+                and consensus is not None
+                and abs(float(take_line) - float(consensus)) >= 1.0 - 1e-9
+            ):
+                return None
         price_cents = int(max(1, min(99, round(100.0 / k_dec))))
 
         row_for_pick = k_row if k_row else f_row if f_row else market
@@ -2795,6 +2927,11 @@ class OddsEVMonitor:
                     if not _passes_hold([d_pick, d_opp], hold_rules):
                         continue
                     if not _row_passes_sharp_limit(row, sn, min_sharp_rules):
+                        continue
+                    rec_ts = row.get("updated_at") or row.get("book_updated_at")
+                    if rec_ts is None and isinstance(odds_doc, dict):
+                        rec_ts = (odds_doc.get("book_updated_at") or {}).get(sn)
+                    if not _is_live_fresh_quote(rec_ts):
                         continue
                     panels.append((d_pick, d_opp, sn))
                 panel_books: List[Dict[str, Any]] = [
@@ -2915,29 +3052,42 @@ class OddsEVMonitor:
         kalshi_am = decimal_to_american(k_dec)
         ev_opt = ev_percent_vs_take_american(fair_prob, kalshi_am)
         ev_percent = float(ev_opt) if ev_opt is not None else -999.0
-        if surviving_books or used_fallback_fair:
+        board_books = _board_books_for_side(
+            bks if isinstance(bks, dict) else None,
+            mname,
+            bet_side,
+            ref_for_sharps,
+        )
+        if isinstance(odds_doc, dict) and isinstance(odds_doc.get("book_updated_at"), dict):
+            for blob in board_books:
+                if blob.get("book_updated_at") is not None:
+                    continue
+                ts = (odds_doc.get("book_updated_at") or {}).get(blob.get("name"))
+                if ts is not None:
+                    blob["book_updated_at"] = ts
+        board_books = _fresh_board_books(board_books)
+        if used_fallback_fair:
+            return None
+        if surviving_books or board_books:
             gated = apply_ev_hard_gates(
                 ev_percent,
                 kalshi_am,
                 fair_books_excluding_take(surviving_books, take_canon),
-                used_fallback=used_fallback_fair,
+                used_fallback=False,
                 min_sharp_books=min_sharp,
                 take_book=take_canon,
-                exchange_source=panel_books or surviving_books,
+                exchange_source=board_books or panel_books or surviving_books,
             )
             ev_percent = float(gated["ev_percent"])
-            plive_total_take = (
-                take_canon.lower() == "plive"
-                and _market_is_total(mname)
-                and not used_fallback_fair
-            )
-            if used_fallback_fair or (not gated["plus_alert"] and not plive_total_take):
+            if not gated["plus_alert"] or not is_plus_print_ev(ev_percent):
                 if _diagnostic_mode():
                     print(
                         f"[PIPELINE] Dropped: EV gates {gated.get('reasons') or ['no_plus']} "
                         f"| {teams} | {mname} | ev={ev_percent:.2f}%"
                     )
                 return None
+        elif not is_plus_print_ev(ev_percent):
+            return None
         if ev_percent > 20.0:
             if _diagnostic_mode():
                 print("[PIPELINE] Dropped: suspect EV (>20%).")
@@ -2946,9 +3096,7 @@ class OddsEVMonitor:
             if _diagnostic_mode():
                 print("[PIPELINE] Dropped: suspect EV (<-100%).")
             return None
-        plus_ok = ev_percent > 0
-        if surviving_books or used_fallback_fair:
-            plus_ok = bool(gated.get("plus_alert"))
+        plus_ok = is_plus_print_ev(ev_percent)
         shape_books = list(panel_books or [])
         if bks and isinstance(bks, dict):
             pl_mk = _find_market_block(_markets_list_for_book(bks, "PLive"), mname)

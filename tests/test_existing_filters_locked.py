@@ -79,8 +79,8 @@ def test_payload_leftovers_use_canonical_book_names():
     assert '"Betfair Exchange"' in src
     assert '"NoVig"' in src
     assert "auto_bet_enabled = False" in src
-    assert "show_matched = alert.ev_percent >= dashboard_min_ev" in src
-    assert "show_update = alert.ev_percent >= dashboard_min_ev" in src
+    assert "show_matched = is_plus_print_ev(alert.ev_percent, dashboard_min_ev)" in src
+    assert "show_update = is_plus_print_ev(alert.ev_percent, dashboard_min_ev)" in src
     assert "or not getattr(alert, 'strict_pass', True)" not in src
     assert "sharps_list.append(_extra_bk)" not in src
     assert 'if _dnorm(b) not in ("kalshi", "plive")' in src

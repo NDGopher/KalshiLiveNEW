@@ -78,7 +78,7 @@ from plive_pandora import (
     peek_shared_plive_feed,
     plive_wanted,
 )
-from ev_calculator import decimal_to_american
+from ev_calculator import decimal_to_american, is_plus_print_ev
 from stoppage_gate import clock_fields_for_live_odds
 
 
@@ -2245,9 +2245,9 @@ async def handle_plive_take_display_alert(alert: EvAlert) -> None:
     if filter_name and filter_name not in selected_dashboard_filters:
         print(f"[ALERT] SKIP: PLive take from filter '{filter_name}' not in selected dashboard filters")
         return
-    if float(alert.ev_percent or 0) < float(dashboard_min_ev or 0):
+    if not is_plus_print_ev(alert.ev_percent, dashboard_min_ev):
         print(
-            f"❌ Filtered PLive take (EV {alert.ev_percent:.2f}% < min {dashboard_min_ev:.2f}%): "
+            f"❌ Filtered PLive take (EV {alert.ev_percent:.2f}% not plus / min {dashboard_min_ev:.2f}%): "
             f"{alert.teams} - {alert.pick}"
         )
         return
@@ -3015,7 +3015,7 @@ async def handle_new_alert(alert: EvAlert):
             return
         
         print(f"[ALERT] Processing alert: {alert.teams} - {alert.pick} ({alert.ev_percent:.2f}% EV, dashboard_min_ev={dashboard_min_ev:.2f}%)")
-        show_matched = alert.ev_percent >= dashboard_min_ev
+        show_matched = is_plus_print_ev(alert.ev_percent, dashboard_min_ev)
         if show_matched:
             # Emit to all connected clients IMMEDIATELY (don't wait for orderbook)
             print(
@@ -4231,7 +4231,7 @@ def run_monitor_loop():
                 
                 # Filter by dashboard min EV before emitting update
                 global dashboard_min_ev
-                show_update = alert.ev_percent >= dashboard_min_ev
+                show_update = is_plus_print_ev(alert.ev_percent, dashboard_min_ev)
                 if show_update:
                     # Check if values actually changed (avoid logging every refresh)
                     old_ev = alert_data.get('ev_percent', 0)
@@ -4633,16 +4633,8 @@ def listed_active_alerts(source=None):
         rows = list(src or [])
     out = [r for r in rows if not is_unlisted_match_failed(r)]
     floor = float(dashboard_min_ev or 0.0)
-
-    def _keeps(row: Dict) -> bool:
-        if float(row.get("ev_percent") or 0.0) >= floor:
-            return True
-        # PLive-take Over/Under still list when Kalshi ticker/EV floor would hide them.
-        if str(row.get("take_book") or "").strip().lower() != "plive":
-            return False
-        return str(row.get("pick") or "").strip().lower() in ("over", "under")
-
-    return [r for r in out if _keeps(r)]
+    # Zero is not a KEEP. PLive O/U still list only with honest EV>0.
+    return [r for r in out if is_plus_print_ev(r.get("ev_percent"), floor)]
 
 
 def unmatched_alert_should_emit_new_alert(_alert_data=None) -> bool:
