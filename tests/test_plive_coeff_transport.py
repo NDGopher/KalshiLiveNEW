@@ -148,7 +148,12 @@ def test_coeff_patch_list_is_not_split_as_catalog():
     assert mk["ML"]["odds"][0]["home"] == 1.85
     snap = feed.status_snapshot()
     assert snap["receiving_prices"] is True
+    assert snap["receiving_soccer_prices"] is True
+    assert snap["receiving_mlb_prices"] is False
+    assert snap["mlb_with_prices"] == 0
     assert snap["soccer_with_prices"] >= 1
+    assert snap["soccer_with_coeffs"] >= 1
+    assert snap["receiving_coeffs"] is True
     assert snap["price_feed_ok"] is True
 
 
@@ -246,6 +251,101 @@ def test_merge_strips_plive_when_prices_stale(monkeypatch):
         n = merge_plive_into_docs([doc])
         assert n == 0
         assert "PLive" not in doc["bookmakers"]
+        await reset_shared_plive_feed()
+
+    asyncio.run(_run())
+    assert peek_shared_plive_feed() is None
+
+
+def test_empty_mlb_slate_soccer_coeffs_is_receiving_prices():
+    """MLB-only health (mlb_priced=0) is not proof that soccer prices are missing."""
+    feed = _feed()
+    feed.connected = True
+    feed._running = True
+    _meta(feed.store, EID_SOC, sportId=5, home="Al-Fayha FC", away="Al-Kholood")
+    _meta(feed.store, EID_TOP, sportId=220, home="Barcelona", away="Real Madrid")
+    feed.ingest_raw(
+        [
+            {"op": "replace", "path": "/c/m/5/o/over_2.5/0", "value": 1.52},
+            {"op": "replace", "path": "/c/m/5/o/under_2.5/0", "value": 2.86},
+        ],
+        ROOM_SOC,
+    )
+    feed.ingest_raw(
+        [
+            {"op": "replace", "path": "/c/m/5/o/over_2.5/0", "value": 1.61},
+            {"op": "replace", "path": "/c/m/5/o/under_2.5/0", "value": 2.40},
+        ],
+        coeff_room_for_event(EID_TOP),
+    )
+    assert feed.store.mlb_events() == {}
+    ev = feed.store.events[EID_SOC]
+    assert ev.get("coeffs")
+    assert (5, "over_2.5") in ev["coeffs"] or any(k[0] == 5 for k in ev["coeffs"])
+    tot = next(m for m in feed.store.markets_for_event(EID_SOC) if m["name"] == "Totals")
+    row = next(r for r in tot["odds"] if abs(float(r["hdp"]) - 2.5) < 1e-9)
+    assert abs(float(row["under"]) - 2.86) < 1e-9
+    snap = feed.status_snapshot()
+    assert snap["mlb_events"] == 0
+    assert snap["mlb_with_prices"] == 0
+    assert snap["receiving_mlb_prices"] is False
+    assert snap["soccer_events"] == 2
+    assert snap["soccer_with_coeffs"] == 2
+    assert snap["soccer_with_prices"] == 2
+    assert snap["receiving_soccer_prices"] is True
+    assert snap["receiving_prices"] is True
+    assert snap["receiving_coeffs"] is True
+    assert snap["price_feed_ok"] is True
+    assert feed.healthy is True
+    assert any("2.5" in s for s in snap["samples"])
+
+
+def test_soccer_eventcoefficients_land_in_store_without_mlb():
+    """Store-level proof: sport 5 coeffs apply even when the MLB slate is empty."""
+    store = PliveStore()
+    store.apply_meta(EID_SOC, {"sportId": 5, "ip": True, "home": "Al-Fayha FC", "away": "Al-Kholood"})
+    changed = store.apply_message(
+        {
+            "isDiff": True,
+            "payload": [
+                {"op": "replace", "path": "/c/m/5/o/over_3.5/0", "value": 2.10},
+                {"op": "replace", "path": "/c/m/5/o/under_3.5/0", "value": 1.75},
+            ],
+        },
+        event_name=coeff_room_for_event(EID_SOC),
+    )
+    assert changed is True
+    slots = store.events[EID_SOC]["coeffs"]
+    assert (5, "over_3.5") in slots
+    assert (5, "under_3.5") in slots
+    mk = {m["name"]: m for m in store.markets_for_event(EID_SOC)}
+    assert "Totals" in mk
+    row = next(r for r in mk["Totals"]["odds"] if abs(float(r["hdp"]) - 3.5) < 1e-9)
+    assert abs(float(row["over"]) - 2.10) < 1e-9
+    assert abs(float(row["under"]) - 1.75) < 1e-9
+
+
+def test_plive_board_includes_soccer_when_mlb_empty():
+    async def _run():
+        await reset_shared_plive_feed()
+        feed = _feed()
+        _meta(feed.store, EID_SOC, sportId=5, home="Al-Fayha FC", away="Al-Kholood")
+        feed.ingest_raw(
+            [
+                {"op": "replace", "path": "/c/m/5/o/over_2.5/0", "value": 1.52},
+                {"op": "replace", "path": "/c/m/5/o/under_2.5/0", "value": 2.86},
+            ],
+            ROOM_SOC,
+        )
+        import plive_pandora as pp
+        from dashboard import _plive_board_rows
+
+        pp._shared_plive = feed
+        rows = _plive_board_rows()
+        assert rows
+        blob = " ".join(str(r.get("teams") or "") for r in rows)
+        assert "Fayha" in blob or "Kholood" in blob
+        assert any(str(r.get("sport_slug") or "") == "football" for r in rows)
         await reset_shared_plive_feed()
 
     asyncio.run(_run())

@@ -1897,12 +1897,13 @@ class PlivePandoraFeed:
                 self._last_coeff_at = time.time()
             self._mark_dirty()
             snap = self.status_snapshot()
-            if snap.get("receiving_prices") and not self._logged_prices:
+            if (snap.get("receiving_prices") or snap.get("receiving_coeffs")) and not self._logged_prices:
                 self._logged_prices = True
                 print(
-                    f"[PLIVE] receiving events with prices: {snap['mlb_with_prices']} MLB | "
-                    f"{snap.get('soccer_with_prices') or 0} soccer | "
-                    f"{'; '.join(snap.get('samples') or []) or 'priced'}"
+                    f"[PLIVE] receiving events with prices: "
+                    f"mlb_priced={snap['mlb_with_prices']} soccer_priced={snap.get('soccer_with_prices') or 0} "
+                    f"mlb_coeffs={snap.get('mlb_with_coeffs') or 0} soccer_coeffs={snap.get('soccer_with_coeffs') or 0} | "
+                    f"{'; '.join(snap.get('samples') or []) or 'coeffs'}"
                 )
 
     def _dec_to_am(self, d: Optional[float]) -> Optional[int]:
@@ -1949,13 +1950,23 @@ class PlivePandoraFeed:
         return out
 
     def priced_mlb_summaries(self) -> List[Dict[str, Any]]:
+        """MLB display rows only. Do not use this as the sole price-health signal."""
         return self._priced_summaries(self.store.mlb_events())
+
+    def priced_soccer_summaries(self) -> List[Dict[str, Any]]:
+        return self._priced_summaries(self.store.soccer_events())
+
+    @staticmethod
+    def _events_with_coeffs(events: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        return {k: v for k, v in events.items() if v.get("coeffs")}
 
     def status_snapshot(self) -> Dict[str, Any]:
         mlb = self.store.mlb_events()
         soccer = self.store.soccer_events()
         priced_mlb = self._priced_summaries(mlb)
         priced_soccer = self._priced_summaries(soccer)
+        mlb_coeffs = self._events_with_coeffs(mlb)
+        soccer_coeffs = self._events_with_coeffs(soccer)
         priced = priced_mlb + priced_soccer
         samples = []
         for s in priced[:5]:
@@ -1979,10 +1990,17 @@ class PlivePandoraFeed:
             "sport_id": self.store.sport_id,
             "mlb_events": len(mlb),
             "mlb_with_prices": len(priced_mlb),
+            "mlb_with_coeffs": len(mlb_coeffs),
             "soccer_events": len(soccer),
             "soccer_with_prices": len(priced_soccer),
+            "soccer_with_coeffs": len(soccer_coeffs),
             "receiving_events": bool(mlb or soccer) or self.store.generation > 0 or self.events_received > 0,
+            # Mapped display markets across MLB + soccer. Empty MLB is not a miss.
+            "receiving_mlb_prices": len(priced_mlb) > 0,
+            "receiving_soccer_prices": len(priced_soccer) > 0,
             "receiving_prices": len(priced) > 0,
+            # Raw eventCoefficients landed in the store (even if a market did not map).
+            "receiving_coeffs": bool(mlb_coeffs or soccer_coeffs),
             "price_feed_ok": self.price_feed_ok(now=now),
             "last_event_data_at": _iso_utc(self._last_event_data_at),
             "last_coeff_at": _iso_utc(self._last_coeff_at),
@@ -2004,9 +2022,11 @@ class PlivePandoraFeed:
         age_s = f"{age:.0f}s" if isinstance(age, (int, float)) else "none"
         print(
             f"{prefix} connected={snap['connected']} receiving_events={snap['receiving_events']} "
-            f"receiving_prices={snap['receiving_prices']} price_ok={snap['price_feed_ok']} "
-            f"mlb={snap['mlb_events']} soccer={snap['soccer_events']} "
-            f"priced={snap['mlb_with_prices'] + snap['soccer_with_prices']} "
+            f"receiving_prices={snap['receiving_prices']} receiving_soccer_prices={snap['receiving_soccer_prices']} "
+            f"price_ok={snap['price_feed_ok']} "
+            f"mlb_events={snap['mlb_events']} mlb_priced={snap['mlb_with_prices']} mlb_coeffs={snap['mlb_with_coeffs']} "
+            f"soccer_events={snap['soccer_events']} soccer_priced={snap['soccer_with_prices']} "
+            f"soccer_coeffs={snap['soccer_with_coeffs']} "
             f"coeff_age={age_s} sample={'; '.join(snap['samples'][:3]) or 'none'}"
         )
         return snap
