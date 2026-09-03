@@ -38,6 +38,8 @@ class EvAlert:
         self.ev_source = str(data.get("ev_source") or "odds_api_value_bets")
         self.book_updated_at = data.get("book_updated_at") or {}
         self.kalshi_last_trade_ts = data.get("kalshi_last_trade_ts")
+        # Kalshi or PLive — both are take venues. PLive is never a sharp.
+        self.take_book = str(data.get("take_book") or "Kalshi")
 
     def extract_ticker_from_url(self):
         """Extract Kalshi ticker from market URL."""
@@ -67,4 +69,5 @@ class EvAlert:
             "ev_source": self.ev_source,
             "book_updated_at": self.book_updated_at or {},
             "kalshi_last_trade_ts": self.kalshi_last_trade_ts,
+            "take_book": self.take_book,
         }

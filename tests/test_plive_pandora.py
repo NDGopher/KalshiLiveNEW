@@ -8,12 +8,14 @@ from plive_pandora import (
     PLIVE_LINE_SET,
     PLIVE_PARTNER_ID,
     PLIVE_SPORT_CATALOG_FALLBACK,
+    PlivePandoraFeed,
     PliveStore,
     coeff_room_for_event,
     event_id_from_channel,
     extra_local_bookmakers,
     handshake_emits,
     match_plive_event_to_odds_doc,
+    plive_sport_id,
     note_handshake_ack,
     parse_coeff_path,
     parse_sport_hash,
@@ -117,6 +119,14 @@ def test_sport_1_filter_drops_other_sports():
     store.apply_meta("nba", {"sportId": 2, "home": "C", "away": "D"})
     assert "mlb" in store.mlb_events()
     assert "nba" not in store.mlb_events()
+
+
+def test_mlb_is_catalog_sport_1(monkeypatch):
+    monkeypatch.delenv("PLIVE_PAGE", raising=False)
+    monkeypatch.delenv("PLIVE_HASH", raising=False)
+    monkeypatch.delenv("PLIVE_SPORT_ID", raising=False)
+    assert PLIVE_SPORT_CATALOG_FALLBACK[1] == "Baseball"
+    assert plive_sport_id() == 1
 
 
 def test_handshake_matches_public_ui():
@@ -274,3 +284,21 @@ def test_game_period_markets_ml_spread_totals():
     assert by_name["Spread"]["odds"][0]["hdp"] == -2.0
     assert by_name["Spread"]["odds"][0]["home"] == 1.93
     assert by_name["Spread"]["odds"][0]["away"] == 1.81
+
+
+def test_status_snapshot_reports_priced_mlb():
+    feed = PlivePandoraFeed(connect_fn=lambda _f: None)
+    feed.connected = True
+    feed._running = True
+    feed.store.apply_meta("99", {"home": "New York Yankees", "away": "Boston Red Sox", "sportId": 1})
+    feed.store.set_coeff("99", 3, "1", 1, 1.8)
+    feed.store.set_coeff("99", 3, "2", 1, 2.1)
+    snap = feed.status_snapshot()
+    assert snap["connected"] is True
+    assert snap["partner_id"] == 113
+    assert snap["flavor"] == "live"
+    assert snap["sport_id"] == 1
+    assert snap["mlb_events"] == 1
+    assert snap["mlb_with_prices"] == 1
+    assert snap["receiving_prices"] is True
+    assert snap["samples"]

@@ -758,8 +758,13 @@ function createAlertCard(alert) {
         const ourSelection = alert.pick;
         const ourBooks = alert.display_books[ourSelection] || [];
         
-        // Find Kalshi book first to get actual Kalshi odds for comparison
-        const kalshiBook = ourBooks.find(book => (book.book || 'Unknown') === 'Kalshi');
+        // Take venue (Kalshi or PLive) is the betting book on the left.
+        const takeName = String(alert.take_book || 'Kalshi');
+        const takeKey = normalizeBookKey(takeName);
+        const kalshiBook = ourBooks.find((book) => {
+            const n = normalizeBookKey(book.book || '');
+            return n === takeKey || n === 'kalshi' && takeKey === 'kalshi';
+        }) || ourBooks.find(book => (book.book || 'Unknown') === 'Kalshi');
         if (kalshiBook && kalshiBook.odds) {
             kalshiOddsNum = kalshiBook.odds;
         } else {
@@ -788,32 +793,38 @@ function createAlertCard(alert) {
                 }
                 const bookLimit = book.limit || 0;
                 const bookLimitDisplay = bookLimit ? formatLiquidityUsd(bookLimit) : '';
-                const isKalshi = bookName === 'Kalshi' || normalizeBookKey(bookName) === 'kalshi';
+                const isTakeBook =
+                    normalizeBookKey(bookName) === normalizeBookKey(alert.take_book || 'Kalshi') ||
+                    ((bookName === 'Kalshi' || normalizeBookKey(bookName) === 'kalshi') &&
+                        normalizeBookKey(alert.take_book || 'Kalshi') === 'kalshi');
                 const usedForLine =
-                    isKalshi || bookMatchesDevigOrSharp(bookName, alert.devig_books, alert.sharp_books);
-                const junkVsKalshi = !isKalshi && kalshiOddsNum !== null && isJunkVsKalshi(bookOdds, kalshiOddsNum);
+                    isTakeBook || bookMatchesDevigOrSharp(bookName, alert.devig_books, alert.sharp_books);
+                const junkVsKalshi = !isTakeBook && kalshiOddsNum !== null && isJunkVsKalshi(bookOdds, kalshiOddsNum);
                 // Junk is display-gray only. Min EV never grays a tile.
                 let isGrayedOut = !usedForLine || junkVsKalshi;
                 
-                // Red only when strictly better than Kalshi AND inside the 10c band.
+                // Red only when strictly better than the take venue AND inside the 10c band.
                 let hasBetterOdds = false;
-                if (!isKalshi && !junkVsKalshi && kalshiOddsNum !== null && bookOdds !== 0) {
+                if (!isTakeBook && !junkVsKalshi && kalshiOddsNum !== null && bookOdds !== 0) {
                     hasBetterOdds = bookAmericanIsBetter(bookOdds, kalshiOddsNum);
                 }
                 
                 const logoHtml = bookLogoHtml(bookName);
                 const bookKey = book.book_key || normalizeBookKey(bookName);
+                const isKalshiTile = normalizeBookKey(bookName) === 'kalshi';
                 const kTrade = alert.kalshi_last_trade_ts;
-                const bookTs = book.book_updated_at || (isKalshi ? kTrade : null)
+                const bookTs = book.book_updated_at || (isKalshiTile ? kTrade : null)
                     || ((alert.book_updated_at || {})[bookName]);
                 const bookAge = formatFreshnessAge(bookTs);
                 const kAge = formatFreshnessAge(kTrade);
                 const titleBits = [bookName];
                 if (bookAge) titleBits.push('updated ' + bookAge + ' ago');
-                if (!isKalshi && kAge) titleBits.push('Kalshi last trade ' + kAge + ' ago');
+                if (!isKalshiTile && takeKey === 'kalshi' && kAge) {
+                    titleBits.push('Kalshi last trade ' + kAge + ' ago');
+                }
                 
                 booksTableHtml += `
-                    <div class="book-cell ${isKalshi ? 'kalshi-book' : ''} ${isGrayedOut ? 'grayed-out' : ''} ${junkVsKalshi ? 'junk-tile' : ''} ${hasBetterOdds ? 'better-than-kalshi' : ''}" data-book-name="${escapeHtml(bookName)}" data-book-key="${escapeHtml(bookKey)}" title="${escapeHtml(titleBits.join(' · '))}">
+                    <div class="book-cell ${isTakeBook ? 'kalshi-book take-book' : ''} ${isGrayedOut ? 'grayed-out' : ''} ${junkVsKalshi ? 'junk-tile' : ''} ${hasBetterOdds ? 'better-than-kalshi' : ''}" data-book-name="${escapeHtml(bookName)}" data-book-key="${escapeHtml(bookKey)}" title="${escapeHtml(titleBits.join(' · '))}">
                         <div class="book-logo">${logoHtml}</div>
                         <div class="book-odds" data-book-odds="${bookOdds}">${bookOdds > 0 ? '+' : ''}${bookOdds}</div>
                         ${bookLimitDisplay ? `<div class="book-limit" data-book-limit="${bookLimit}">${bookLimitDisplay}</div>` : ''}
@@ -1828,8 +1839,14 @@ if (broadScanPregameCb) {
             bwl.length > 0
                 ? ` · API books with any line this refresh: ${bwl.length}/${breq} (${bwl.join(', ')})`
                 : '';
+        const pl = data.plive || {};
+        const pliveMeta = pl.message
+            ? ` · ${pl.message}`
+            : (pl.connected
+                ? ` · PLive connected · ${pl.mlb_with_prices || 0} MLB priced`
+                : '');
         meta.textContent =
-            `Updated ${t.toLocaleString()} · ${evs.length} game(s) (${pairRows} lines) · ${data.timing || ''} · sport=${data.sport || ''} · api=${data.sport_api || '-'} · league=${data.league_focus || 'all'} · league_api=${data.league_api || '-'} · date=${data.date_filter || ''}${bmeta}`;
+            `Updated ${t.toLocaleString()} · ${evs.length} game(s) (${pairRows} lines) · ${data.timing || ''} · sport=${data.sport || ''} · api=${data.sport_api || '-'} · league=${data.league_focus || 'all'} · league_api=${data.league_api || '-'} · date=${data.date_filter || ''}${bmeta}${pliveMeta}`;
 
         const hdr = document.createElement('tr');
         let h = '<th class="pto-col-match">Game</th><th class="pto-col-side">Team</th>';

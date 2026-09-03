@@ -1,6 +1,6 @@
 # Kalshi Live — Aggressive Betting Bot
 
-Real-time **+EV** opportunities on Kalshi, driven by **[Odds-API.io](https://odds-api.io/)** WebSocket odds (REST for slate/resync only) plus optional **PLive** (Pandora) as a local sharp/display book. The **dashboard** (`dashboard.py` / `main.py`) is the main entry point.
+Real-time **+EV** opportunities on **Kalshi and PLive** (betting / take venues), driven by **[Odds-API.io](https://odds-api.io/)** WebSocket odds (REST for slate/resync only) plus the Origin-only **PLive** Pandora feed. Fair is the other configured pack — PLive is never a sharp. The **dashboard** (`dashboard.py` / `main.py`) is the main entry point.
 
 ## MLB tonight (ship slice)
 
@@ -48,9 +48,11 @@ Docs: [WebSockets](https://docs.odds-api.io/guides/websockets) · [API](https://
 
 `ODDS_API_WS` defaults **true when `ODDS_API_KEY` is set**. Set `ODDS_API_WS=false` to force REST.
 
-## PLive (Pandora) — extra sharp/display book
+## PLive (Pandora) — second betting / take venue
 
 Origin-only Socket.IO. **No login. No cookies. No BetBCK. No BookieBeats DOM.**
+
+PLive is **not** a sharp / minSharp / `devig_books` book. Betting books are **Kalshi and PLive**. Fair is the configured pack (DK / FD / NV / Bet365 / Betfair / MGM / Caesars / Circa / Poly) minus PLive and the take venue. If PLive is +EV vs that pack, the dashboard emits a PLive take card (PLive on the left; same min-EV whole-card hide). Auto-bet stays OFF and never fires on PLive cards.
 
 Public handshake (bare connect is silent):
 
@@ -61,7 +63,7 @@ Public handshake (bare connect is silent):
 
 - MLB is catalog **sport 1** (`#!/sport/1`). `https://plive.becoms.co/live/?#!/sport/220` is **Top Soccer**, not MLB.
 - Trust the `live.sports` catalog (1 Baseball, 2 Basketball, 3 Football, …). Do not use the old Selenium map that had nfl=2 / nba=3.
-- Lines merge into the same EvAlert / filter pipeline as book **`PLive`**. Kalshi stays the take venue (`bettingBooks=[Kalshi]`). Same filters and dollar sizes apply; PLive is not a new filter.
+- Filter JSON still has `bettingBooks=[Kalshi]`; PLive take is a second venue in code. Same filters and dollar sizes. PLive is not a new filter.
 - **No BetBCK scrape.**
 
 Disable with `PLIVE_ENABLED=false`.

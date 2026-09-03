@@ -16,9 +16,8 @@ Bare connect is silent. Do not scrape BetBCK. Do not send cookies.
 MLB is catalog sport 1 (hash ``#!/sport/1``). ``#!/sport/220`` is Top Soccer.
 Trust the live.sports catalog over any old Selenium sport map.
 
-Lines become ``bookmakers["PLive"]`` so EvAlerts still use the existing
-filter / dollar-size pipeline in ``ev_calculator.py`` (Kalshi remains the
-take venue).
+Lines become ``bookmakers["PLive"]``. PLive is a betting / take venue
+(same role as Kalshi), not a sharp. Fair is the other pack.
 """
 from __future__ import annotations
 
@@ -851,6 +850,8 @@ class PlivePandoraFeed:
         self._coeff_subscribed: Set[str] = set()
         self._ack_names: Set[str] = set()
         self._bound_rooms: Set[str] = set()
+        self.events_received = 0
+        self._logged_prices = False
 
     @property
     def healthy(self) -> bool:
@@ -872,8 +873,82 @@ class PlivePandoraFeed:
         return True
 
     def handle_payload(self, data: Any, event_name: Optional[str] = None) -> None:
+        self.events_received += 1
         if self.store.apply_message(data, event_name):
             self._mark_dirty()
+            snap = self.status_snapshot()
+            if snap.get("receiving_prices") and not self._logged_prices:
+                self._logged_prices = True
+                print(
+                    f"[PLIVE] receiving events with prices: {snap['mlb_with_prices']} MLB | "
+                    f"{'; '.join(snap.get('samples') or []) or 'priced'}"
+                )
+
+    def _dec_to_am(self, d: Optional[float]) -> Optional[int]:
+        if d is None or d <= 1.0:
+            return None
+        if d >= 2.0:
+            return int(round((d - 1.0) * 100))
+        return int(round(-100 / (d - 1.0)))
+
+    def priced_mlb_summaries(self) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for eid, ev in self.store.mlb_events().items():
+            mk = self.store.markets_for_event(eid)
+            if not mk:
+                continue
+            ml = next((m for m in mk if m.get("name") == "ML"), None)
+            row = ((ml or {}).get("odds") or [{}])[0] if ml else {}
+            home_dec = _as_float((row or {}).get("home"))
+            away_dec = _as_float((row or {}).get("away"))
+            if home_dec is None or away_dec is None:
+                continue
+            out.append(
+                {
+                    "id": eid,
+                    "home": ev.get("home"),
+                    "away": ev.get("away"),
+                    "markets": [m.get("name") for m in mk],
+                    "home_dec": home_dec,
+                    "away_dec": away_dec,
+                    "home_am": self._dec_to_am(home_dec),
+                    "away_am": self._dec_to_am(away_dec),
+                }
+            )
+        return out
+
+    def status_snapshot(self) -> Dict[str, Any]:
+        priced = self.priced_mlb_summaries()
+        mlb = self.store.mlb_events()
+        samples = [
+            f"{s.get('away')}@{s.get('home')} ML {s.get('away_am')}/{s.get('home_am')}"
+            for s in priced[:5]
+        ]
+        return {
+            "connected": bool(self.connected),
+            "healthy": self.healthy,
+            "partner_id": PLIVE_PARTNER_ID,
+            "flavor": PLIVE_FLAVOR,
+            "sport_id": self.store.sport_id,
+            "mlb_events": len(mlb),
+            "mlb_with_prices": len(priced),
+            "receiving_events": bool(mlb) or self.store.generation > 0 or self.events_received > 0,
+            "receiving_prices": len(priced) > 0,
+            "acks": sorted(self._ack_names),
+            "samples": samples,
+            "last_error": self.last_error,
+            "generation": self.store.generation,
+            "events_received": self.events_received,
+        }
+
+    def log_status(self, *, prefix: str = "[PLIVE] status") -> Dict[str, Any]:
+        snap = self.status_snapshot()
+        print(
+            f"{prefix} connected={snap['connected']} receiving_events={snap['receiving_events']} "
+            f"receiving_prices={snap['receiving_prices']} mlb={snap['mlb_events']} "
+            f"priced={snap['mlb_with_prices']} sample={'; '.join(snap['samples'][:3]) or 'none'}"
+        )
+        return snap
 
     def decode_binary(self, binary_data: bytes) -> Optional[Any]:
         try:
@@ -1104,6 +1179,7 @@ class PlivePandoraFeed:
         ping_every = 4 * 60
         last_ping = asyncio.get_event_loop().time()
         last_coeff = 0.0
+        last_status = 0.0
         try:
             while self._running and sio.connected:
                 now = asyncio.get_event_loop().time()
@@ -1116,6 +1192,9 @@ class PlivePandoraFeed:
                 if now - last_coeff >= 2.0:
                     await self._subscribe_mlb_coefficients(sio)
                     last_coeff = now
+                if now - last_status >= 10.0:
+                    self.log_status()
+                    last_status = now
                 await asyncio.sleep(0.5)
         finally:
             if sio.connected:

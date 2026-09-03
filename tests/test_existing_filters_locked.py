@@ -82,3 +82,5 @@ def test_payload_leftovers_use_canonical_book_names():
     assert "show_matched = alert.ev_percent >= dashboard_min_ev" in src
     assert "show_update = alert.ev_percent >= dashboard_min_ev" in src
     assert "or not getattr(alert, 'strict_pass', True)" not in src
+    assert "sharps_list.append(_extra_bk)" not in src
+    assert 'if _dnorm(b) not in ("kalshi", "plive")' in src

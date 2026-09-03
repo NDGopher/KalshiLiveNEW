@@ -5,6 +5,7 @@ FREE TIER SAFE -- poll interval defaults to 45s, shared client + TTL caches; opt
   ODDS_API_MLB_NBA_ONLY=true restricts alerts to NBA/MLB leagues.
   Live **slate** (/events/live) and live **lines** (/odds/multi) use different TTLs in ``odds_api_client`` (see env README / BOOKIEBEATS roadmap).
 Primary live lines: Odds-API.io WebSocket (MLB / usa-mlb, prematch+live) plus optional PLive.
+PLive is a betting / take venue (same role as Kalshi), not a sharp. Fair is the other pack.
 REST is for slate (``/events``, ``/events/live``) and resync only. Auto-bet stays OFF at startup.
 
 Public interface matches BookieBeatsAPIMonitor (same __init__ signature, callbacks, loop).
@@ -346,10 +347,36 @@ def _kalshi_market_is_prop(u: str) -> bool:
     return "PLAYER" in u or "PROP" in u
 
 
-def _kalshi_scan_gameline_markets(bks: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
-    """Kalshi gamelines present in /odds/multi: moneylines, spreads, totals (excludes player props)."""
+BETTING_TAKE_BOOKS = ("Kalshi", "PLive")
+
+
+def is_betting_take_book(name: str) -> bool:
+    n = _norm_book(str(name or "")).lower()
+    return n in ("kalshi", "plive")
+
+
+def fair_sharp_names(sharps: List[str], take_book: str = "Kalshi") -> List[str]:
+    """Configured fair pack minus PLive and the take venue. Never a betting book."""
+    take = _norm_book(str(take_book or "")).lower()
+    out: List[str] = []
+    seen: Set[str] = set()
+    for raw in sharps or []:
+        n = _norm_book(str(raw)).lower()
+        if not n or n in seen:
+            continue
+        if n in ("kalshi", "plive") or n == take:
+            continue
+        seen.add(n)
+        out.append(str(raw))
+    return out
+
+
+def _kalshi_scan_gameline_markets(
+    bks: Dict[str, Any], book: str = "Kalshi"
+) -> List[Tuple[str, Dict[str, Any]]]:
+    """Gamelines present in /odds/multi: moneylines, spreads, totals (excludes player props)."""
     out: List[Tuple[str, Dict[str, Any]]] = []
-    for m in _markets_list_for_book(bks, "Kalshi"):
+    for m in _markets_list_for_book(bks, book):
         n = str(m.get("name") or "").strip()
         if not n:
             continue
@@ -965,11 +992,14 @@ def _build_display_books_payload(
     display_names: List[str],
     kalshi_am: int,
     k_row: Dict[str, Any],
+    take_book: str = "Kalshi",
 ) -> Dict[str, List[Dict[str, Any]]]:
+    take_canon = _norm_book(str(take_book or "Kalshi")) or "Kalshi"
+    take_key = "".join(ch.lower() for ch in take_canon if ch.isalnum())
     rows_out: List[Dict[str, Any]] = [
         {
-            "book": "Kalshi",
-            "book_key": "kalshi",
+            "book": take_canon,
+            "book_key": take_key or "kalshi",
             "odds": kalshi_am,
             "limit": float(_row_limit_hint(k_row) or 0.0),
         }
@@ -997,7 +1027,7 @@ def _build_display_books_payload(
         med_home = _ml_median_dec(h_acc)
         med_away = _ml_median_dec(a_acc)
     for nm in display_names:
-        if _norm_book(str(nm)).lower() == "kalshi":
+        if _norm_book(str(nm)).lower() == take_canon.lower():
             continue
         mk = _find_market_block(_markets_list_for_book(bks, nm), mname)
         row = _sharp_row_for_market(mk or {}, mname, ref) if ref else (_first_odds_row(mk or {}) or {})
@@ -1153,11 +1183,16 @@ class OddsEVMonitor:
                 "ev_source": str(bet.get("ev_source") or "odds_api_value_bets"),
                 "book_updated_at": bet.get("book_updated_at") or {},
                 "kalshi_last_trade_ts": bet.get("kalshi_last_trade_ts"),
+                "take_book": str(bet.get("take_book") or "Kalshi"),
             }
             alert = EvAlert(alert_data)
             alert.book_updated_at = alert_data["book_updated_at"]
             alert.kalshi_last_trade_ts = alert_data["kalshi_last_trade_ts"]
-            alert.ticker = self.extract_ticker_from_link(link) or bet.get("ticker")
+            alert.take_book = str(bet.get("take_book") or "Kalshi")
+            if alert.take_book.lower() == "plive":
+                alert.ticker = str(bet.get("ticker") or f"PLIVE|{teams}|{selection}|{qualifier}")
+            else:
+                alert.ticker = self.extract_ticker_from_link(link) or bet.get("ticker")
             alert.price_cents = price_cents
             alert.line = line
             return alert
@@ -2053,6 +2088,50 @@ class OddsEVMonitor:
                                 "_canonical_kalshi_row": canon,
                             }
                         )
+            seen_sides = {
+                (str(r.get("eventId")), str(r.get("_scan_mname") or "").upper(), str(r.get("betSide") or "").lower())
+                for r in scan_rows
+                if r.get("eventId") == eid
+            }
+            for mname, pl_mk in _kalshi_scan_gameline_markets(bks, "PLive"):
+                odds_rows = pl_mk.get("odds") or []
+                mu = mname.upper()
+                is_tot = "TOTAL" in mu or ("OVER" in mu and "UNDER" in mu) or mu in ("OU", "O/U")
+                sides: Tuple[str, ...] = ("over", "under") if is_tot else ("home", "away")
+                for ri, p_row in enumerate(odds_rows[:12]):
+                    if not isinstance(p_row, dict):
+                        continue
+                    for bet_side in sides:
+                        key = (str(eid), mu, bet_side)
+                        if key in seen_sides:
+                            continue
+                        dec = _decimal_for_side(p_row, bet_side)
+                        if dec is None or dec <= 1.0:
+                            continue
+                        seen_sides.add(key)
+                        sig = hashlib.md5(
+                            f"{eid}|{mname}|pl|{ri}|{bet_side}".encode("utf-8")
+                        ).hexdigest()[:12]
+                        mk_payload = {"name": mname}
+                        for kk in ("home", "away", "hdp", "over", "under", "max", "line", "draw"):
+                            if p_row.get(kk) is not None:
+                                mk_payload[kk] = p_row.get(kk)
+                        scan_rows.append(
+                            {
+                                "eventId": eid,
+                                "event": ev_stub,
+                                "market": mk_payload,
+                                "betSide": bet_side,
+                                "bookmakerOdds": {bet_side: dec},
+                                "expectedValue": 0.0,
+                                "_live_broad_scan": True,
+                                "_ev_source": "plive_take",
+                                "_take_only": "PLive",
+                                "_scan_teams": teams,
+                                "_scan_mname": mname,
+                                "_canonical_kalshi_row": dict(p_row),
+                            }
+                        )
 
         alerts: List[EvAlert] = []
         self._diag_seen_eids = set()
@@ -2069,28 +2148,33 @@ class OddsEVMonitor:
             )
             if _diagnostic_mode():
                 self._pipeline_log_game_if_new(vb, odds_doc)
-            built = self._value_bet_to_normalized_bet(vb, odds_doc)
-            if not built:
+            takes = [str(vb["_take_only"])] if vb.get("_take_only") else ["Kalshi", "PLive"]
+            kept_any = False
+            for take in takes:
+                built = self._value_bet_to_normalized_bet(vb, odds_doc, take_book=take)
+                if not built:
+                    continue
+                kept_any = True
+                if _diagnostic_mode():
+                    self._pipeline_log_row_ev(vb, odds_doc, built)
+                    sp = built.get("strict_pass", True)
+                    print(
+                        f"[PIPELINE] Candidate LIVE-SCAN kept | {teams} | {mname} | side={bet_side} | "
+                        f"take={take} | strict_pass={sp} (auto-bet only if strict_pass=True)"
+                    )
+                ev_obj = vb.get("event") or {}
+                alert = self.parse_bet_to_alert(built, ev_obj)
+                if not alert:
+                    print(
+                        f"[PIPELINE] Dropped: parse_bet_to_alert failed | {built.get('teams')} | {built.get('selection')}"
+                    )
+                    continue
+                alerts.append(alert)
+            if not kept_any:
                 self._pipeline_log_ev_triplet_preview(vb, odds_doc, teams, mname, bet_side)
                 print(
                     f"[PIPELINE] Candidate LIVE-SCAN dropped after devig/gates | {teams} | {mname} | side={bet_side}"
                 )
-                continue
-            if _diagnostic_mode():
-                self._pipeline_log_row_ev(vb, odds_doc, built)
-                sp = built.get("strict_pass", True)
-                print(
-                    f"[PIPELINE] Candidate LIVE-SCAN kept | {teams} | {mname} | side={bet_side} | "
-                    f"strict_pass={sp} (auto-bet only if strict_pass=True)"
-                )
-            ev_obj = vb.get("event") or {}
-            alert = self.parse_bet_to_alert(built, ev_obj)
-            if not alert:
-                print(
-                    f"[PIPELINE] Dropped: parse_bet_to_alert failed | {built.get('teams')} | {built.get('selection')}"
-                )
-                continue
-            alerts.append(alert)
 
         ms = int((self.filter_payload.get("devigFilter") or {}).get("minSharpBooks", 1))
         self._pipe_log_counter = getattr(self, "_pipe_log_counter", 0) + 1
@@ -2229,21 +2313,22 @@ class OddsEVMonitor:
             odds_doc = odds_by_id.get(int(eid)) if eid is not None else None
             if _diagnostic_mode():
                 self._pipeline_log_game_if_new(vb, odds_doc)
-            built = self._value_bet_to_normalized_bet(vb, odds_doc)
-            if not built:
-                continue
-            if _diagnostic_mode():
-                self._pipeline_log_row_ev(vb, odds_doc, built)
-            ev_obj = vb.get("event") or {}
-            alert = self.parse_bet_to_alert(built, ev_obj)
-            if not alert:
+            for take in ("Kalshi", "PLive"):
+                built = self._value_bet_to_normalized_bet(vb, odds_doc, take_book=take)
+                if not built:
+                    continue
                 if _diagnostic_mode():
-                    print(
-                        f"[PIPELINE] Dropped: parse_bet_to_alert failed | {built.get('teams')} | "
-                        f"{built.get('selection')}"
-                    )
-                continue
-            alerts.append(alert)
+                    self._pipeline_log_row_ev(vb, odds_doc, built)
+                ev_obj = vb.get("event") or {}
+                alert = self.parse_bet_to_alert(built, ev_obj)
+                if not alert:
+                    if _diagnostic_mode():
+                        print(
+                            f"[PIPELINE] Dropped: parse_bet_to_alert failed | {built.get('teams')} | "
+                            f"{built.get('selection')}"
+                        )
+                    continue
+                alerts.append(alert)
 
         ms = int((self.filter_payload.get("devigFilter") or {}).get("minSharpBooks", 1))
         self._pipe_log_counter = getattr(self, "_pipe_log_counter", 0) + 1
@@ -2260,6 +2345,7 @@ class OddsEVMonitor:
         self,
         vb: Dict[str, Any],
         odds_doc: Optional[Dict[str, Any]],
+        take_book: str = "Kalshi",
     ) -> Optional[Dict[str, Any]]:
         ev_obj = vb.get("event") or {}
         home = str(ev_obj.get("home") or "")
@@ -2276,15 +2362,18 @@ class OddsEVMonitor:
             str(vb["_synthetic_ticker"]) if vb.get("_synthetic_ticker") else None
         )
 
+        take_canon = _norm_book(str(take_book or "Kalshi")) or "Kalshi"
+        take_only = vb.get("_take_only")
+        if take_only and _norm_book(str(take_only)).lower() != take_canon.lower():
+            return None
         k_dec = _float_dec(bo.get(bet_side)) if isinstance(bo, dict) else None
-        if k_dec is None or k_dec <= 1.0:
+        if take_canon.lower() == "kalshi" and (k_dec is None or k_dec <= 1.0):
             if _diagnostic_mode():
                 print(
                     f"[PIPELINE] Dropped: invalid Kalshi decimal for side | {teams} | {mname} | "
                     f"side={bet_side} | href={href}"
                 )
             return None
-        price_cents = int(max(1, min(99, round(100.0 / k_dec))))
 
         # --- betTypes / excludedCategories (BookieBeats-style) ---
         bet_types = [str(x).upper() for x in (self.filter_payload.get("betTypes") or ["GAMELINES"])]
@@ -2327,6 +2416,22 @@ class OddsEVMonitor:
             f_row = _sharp_row_for_market(fd_mk, mname, _line_ref) if fd_mk else {}
             if not f_row and fd_mk:
                 f_row = _first_odds_row(fd_mk) or {}
+            if take_canon.lower() == "plive":
+                plive_mk = _find_market_block(_markets_list_for_book(bks, "PLive"), mname)
+                if canon_vb and plive_mk:
+                    k_row = _sharp_row_for_market(plive_mk, mname, canon_vb)
+                else:
+                    k_row = _first_odds_row(plive_mk or {}) or {}
+                if not k_row and plive_mk:
+                    k_row = _first_odds_row(plive_mk) or {}
+                k_dec = _decimal_for_side(k_row, bet_side)
+                if k_dec is None or k_dec <= 1.0:
+                    return None
+        elif take_canon.lower() == "plive":
+            return None
+        if k_dec is None or k_dec <= 1.0:
+            return None
+        price_cents = int(max(1, min(99, round(100.0 / k_dec))))
 
         row_for_pick = k_row if k_row else f_row if f_row else market
         pick, qualifier, line_val = _pick_qualifier_line_for_side(home, away, mname, bet_side, row_for_pick)
@@ -2334,7 +2439,7 @@ class OddsEVMonitor:
         df = self.filter_payload.get("devigFilter") or {}
         method = str(df.get("method", "POWER")).upper()
         comb_type = str(df.get("type", "AVERAGE")).upper()
-        sharp_names = [str(x) for x in (df.get("sharps") or [])]
+        sharp_names = fair_sharp_names([str(x) for x in (df.get("sharps") or [])], take_canon)
         min_sharp = max(1, int(df.get("minSharpBooks", 1)))
         min_sharp_eff = 1 if vb.get("_live_broad_scan") else min_sharp
         min_sharp_rules = self.filter_payload.get("minSharpLimits") or []
@@ -2572,7 +2677,10 @@ class OddsEVMonitor:
             decs_for_devig, ev_percent, 0.0, sharp_books_count=sharp_books_used
         )
         kal_li = _row_limit_hint(k_row)
-        kal_ok = kal_li is None or self._calc.passes_min_limits_kalshi(float(kal_li))
+        if take_canon.lower() == "kalshi":
+            kal_ok = kal_li is None or self._calc.passes_min_limits_kalshi(float(kal_li))
+        else:
+            kal_ok = True
         odds_ok = self._calc.passes_odds_ranges(kalshi_am)
 
         if bet_side == "draw":
@@ -2604,7 +2712,8 @@ class OddsEVMonitor:
 
         fair_odds_am = decimal_to_american(1.0 / fair_prob) if fair_prob and fair_prob > 0 else None
 
-        devig_books = devig_book_labels[:12] if devig_book_labels else [self._reference_book]
+        raw_devig = devig_book_labels[:12] if devig_book_labels else [self._reference_book]
+        devig_books = fair_sharp_names(raw_devig, take_canon)
 
         disp_names = [str(x) for x in (odds_api_master_bookmakers() or [])]
         for extra in extra_local_bookmakers():
@@ -2619,7 +2728,7 @@ class OddsEVMonitor:
             if not any(_norm_book(dn).lower() == _norm_book(x).lower() for x in disp_names):
                 disp_names.append(dn)
         display = _build_display_books_payload(
-            pick, bks, mname, bet_side, disp_names, kalshi_am, k_row
+            pick, bks, mname, bet_side, disp_names, kalshi_am, k_row, take_book=take_canon
         )
         book_ts = {}
         if isinstance(odds_doc, dict) and isinstance(odds_doc.get("book_updated_at"), dict):
@@ -2657,9 +2766,14 @@ class OddsEVMonitor:
             "kalshi_last_trade_ts": kalshi_trade_ts,
             "displayBooks": display,
             "devigBooks": devig_books,
-            "ticker": ticker,
+            "ticker": ticker if take_canon.lower() == "kalshi" else f"PLIVE|{teams}|{pick}|{qualifier}",
             "strict_pass": strict_ok,
-            "ev_source": str(vb.get("_ev_source") or "odds_api_value_bets"),
+            "ev_source": (
+                "plive_take"
+                if take_canon.lower() == "plive"
+                else str(vb.get("_ev_source") or "odds_api_value_bets")
+            ),
+            "take_book": take_canon,
         }
 
     async def check_for_new_alerts(self) -> None:
@@ -2817,7 +2931,7 @@ class OddsEVMonitor:
                 f"(set ODDS_API_WS=true and ODDS_API_KEY to use WebSocket)"
             )
         if plive_wanted():
-            print("   PLive Pandora: local sharp/display book (no BetBCK, no BookieBeats DOM)")
+            print("   PLive Pandora: take venue (not a sharp). Fair is the other pack. No BetBCK.")
         # Desync filters so two dashboard monitors do not hit Odds-API on the same tick.
         h = int(hashlib.md5(self.monitor_label.encode("utf-8")).hexdigest()[:8], 16)
         await asyncio.sleep((h % 36) * 0.08)

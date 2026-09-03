@@ -410,6 +410,8 @@ class OddsWsStore:
                 "live",
                 "isLive",
                 "scores",
+                # Odds-API clock.running is timed sports only (NBA/NFL/soccer).
+                # MLB has no inning / pitching-change field — do not invent one.
                 "clock",
             ):
                 if ev.get(key) is not None:
