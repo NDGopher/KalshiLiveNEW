@@ -438,7 +438,7 @@ def test_event_199298371_live_ws_dump_pair_and_away_sign():
     assert "ML" not in by_name or by_name["ML"]["odds"][0].get("home") != 2.11
 
     odds_home, odds_away = "Houston Astros", "Chicago White Sox"
-    # Home Astros −1.5 stays −1.5. Away Sox on the −1.5 slot must paint −1.5, not +1.5.
+    # Home-centric: Astros −1.5 stays −1.5. Away Sox on hdp −1.5 is +1.5.
     h_pick, h_qual, h_line = _pick_qualifier_line_for_side(
         odds_home, odds_away, "Spread", "home", minus15
     )
@@ -449,8 +449,8 @@ def test_event_199298371_live_ws_dump_pair_and_away_sign():
     assert h_line == -1.5
     assert h_qual == "-1.5"
     assert a_pick == odds_away
-    assert a_line == -1.5
-    assert a_qual == "-1.5"
+    assert a_line == 1.5
+    assert a_qual == "+1.5"
     assert _decimal_for_side(minus15, "home") == 9.78
     assert _decimal_for_side(minus15, "away") == 1.03358
     totals = {"name": "Totals", "odds": [{"hdp": 4.5, "over": 3.79, "under": 1.24}]}

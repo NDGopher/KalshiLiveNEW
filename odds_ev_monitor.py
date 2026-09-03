@@ -49,6 +49,7 @@ from ev_calculator import (
     fair_books_excluding_take,
     fair_books_for_panel,
     filter_sharp_panel,
+    ev_percent_vs_take_american,
     format_ev_percent_display,
     is_junk_vs_kalshi,
     is_polymarket_book,
@@ -435,20 +436,24 @@ def _kalshi_scan_gameline_markets(
 
 
 def _odds_doc_has_kalshi_tradable_gameline(doc: Any) -> bool:
-    """True if merged /odds/multi doc has a Kalshi gameline row with at least one numeric price > 1."""
+    """True if merged /odds/multi doc has a Kalshi or PLive gameline price > 1.
+
+    PLive-take totals must still scan when Kalshi ticker/row is missing.
+    """
     if not isinstance(doc, dict):
         return False
     bks = doc.get("bookmakers")
     if not isinstance(bks, dict):
         return False
-    for _mname, kal_mk in _kalshi_scan_gameline_markets(bks):
-        for row in kal_mk.get("odds") or []:
-            if not isinstance(row, dict):
-                continue
-            for side in ("home", "away", "over", "under"):
-                d = _float_dec(row.get(side))
-                if d is not None and d > 1.0:
-                    return True
+    for book in ("Kalshi", "PLive"):
+        for _mname, mk in _kalshi_scan_gameline_markets(bks, book):
+            for row in mk.get("odds") or []:
+                if not isinstance(row, dict):
+                    continue
+                for side in ("home", "away", "over", "under"):
+                    d = _float_dec(row.get(side))
+                    if d is not None and d > 1.0:
+                        return True
     return False
 
 
@@ -480,6 +485,14 @@ def _pick_matching_odds_row(mk: Dict[str, Any], mname: str, ref_row: Dict[str, A
         for r in rows:
             if isinstance(r, dict) and _numeric_close(r.get("line"), ref_row.get("line")):
                 return r
+    ref_hdp = ref_row.get("hdp")
+    if is_total and ref_hdp is not None:
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            for key in ("hdp", "max", "line"):
+                if r.get(key) is not None and _numeric_close(r.get(key), ref_hdp):
+                    return r
     mk_name = str(mk.get("name") or "").upper()
     if is_spread and "TOTAL" in mk_name:
         return {}
@@ -786,6 +799,13 @@ def _market_names_match(a: str, b: str) -> bool:
     b_u = (b or "").upper().replace(" ", "")
     if a_u == b_u:
         return True
+    # Totals: Odds-API uses "Totals", "Total Runs", "Total Points", etc.
+    if "TOTAL" in a_u and "TOTAL" in b_u:
+        return True
+    if ("OVER" in a_u and "UNDER" in a_u) and ("OVER" in b_u and "UNDER" in b_u):
+        return True
+    if a_u in ("OU", "O/U") and b_u in ("OU", "O/U"):
+        return True
     aliases = (
         ("ML", "MONEYLINE", "MONEY"),
         ("SPREAD", "HANDICAP", "ASIANHANDICAP", "POINTSPREAD"),
@@ -828,14 +848,14 @@ def home_centric_hdp(row: Optional[Dict[str, Any]]) -> Optional[float]:
 
 
 def is_american_run_line_row(row: Optional[Dict[str, Any]]) -> bool:
-    """PLive market 6: both sides of a slot keep that slot's sign on the label."""
+    """PLive market 6 dump tag. Sign still uses home-centric hdp (away = -hdp)."""
     if not isinstance(row, dict):
         return False
     return str(row.get("line_style") or "").lower() == "american"
 
 
 def side_handicap(home_hdp: Optional[float], bet_side: str) -> Optional[float]:
-    """Odds-API / Kalshi: away is the negated home line."""
+    """Hard rule: hdp is home-centric. Home keeps the sign. Away is always -hdp."""
     hf = _float_hdp(home_hdp)
     if hf is None:
         return None
@@ -845,12 +865,10 @@ def side_handicap(home_hdp: Optional[float], bet_side: str) -> Optional[float]:
 
 
 def side_signed_line(row: Optional[Dict[str, Any]], bet_side: str) -> Optional[float]:
-    """Away label: PLive slot sign as-is; Kalshi/Odds-API negate home hdp."""
+    """Label + ticker line. Always home-centric: away = -hdp. No slot-sign exception."""
     hf = home_centric_hdp(row)
     if hf is None:
         return None
-    if is_american_run_line_row(row):
-        return hf
     return side_handicap(hf, bet_side)
 
 
@@ -895,13 +913,15 @@ def _pick_qualifier_line_for_side(
         line = row.get("max")
         if line is None:
             line = row.get("line")
+        if line is None:
+            line = row.get("hdp")
         lf = float(line) if line is not None else None
         if side == "over":
             return "Over", (f"{lf:.1f}" if lf is not None else None), lf
         if side == "under":
             return "Under", (f"{lf:.1f}" if lf is not None else None), lf
     if "SPREAD" in mname or "HANDICAP" in mname or "PUCK LINE" in mname or "PUCKLINE" in mname.replace(" ", ""):
-        # PLive american: same slot sign both sides. Kalshi: negate away.
+        # Home-centric hdp. Away label+ticker is always -hdp.
         hf = side_signed_line(row, side)
         qual = format_spread_qualifier(hf)
         if side == "home":
@@ -1661,13 +1681,15 @@ class OddsEVMonitor:
                                         "three_way": (float(h_home), float(h_d), float(h_away)),
                                     }
                                 )
-                    # Totals
+                    # Totals: sister pair on the rec. Take may be PLive when Kalshi is missing.
                     o, u = f_row.get("over"), f_row.get("under")
                     ko, ku = (k_row or {}).get("over"), (k_row or {}).get("under")
-                    if is_total_m and o and u and ko and ku:
-                        line = f_row.get("max") or f_row.get("line") or ""
-                        queue_two_way(f"Over {line}", o, ko, u)
-                        queue_two_way(f"Under {line}", u, ku, o)
+                    if is_total_m and o and u:
+                        take_o = ko if ko else o
+                        take_u = ku if ku else u
+                        line = f_row.get("max") or f_row.get("line") or f_row.get("hdp") or ""
+                        queue_two_way(f"Over {line}", o, take_o, u)
+                        queue_two_way(f"Under {line}", u, take_u, o)
                     # Spread
                     sh, sa = f_row.get("home"), f_row.get("away")
                     skh, ska = (k_row or {}).get("home"), (k_row or {}).get("away")
@@ -2818,8 +2840,9 @@ class OddsEVMonitor:
         if fair_prob is None:
             return None
 
-        ev_percent = self._calc.ev_percent_vs_kalshi(fair_prob, price_cents)
         kalshi_am = decimal_to_american(k_dec)
+        ev_opt = ev_percent_vs_take_american(fair_prob, kalshi_am)
+        ev_percent = float(ev_opt) if ev_opt is not None else -999.0
         if surviving_books or used_fallback_fair:
             gated = apply_ev_hard_gates(
                 ev_percent,
@@ -2827,6 +2850,7 @@ class OddsEVMonitor:
                 fair_books_excluding_take(surviving_books, take_canon),
                 used_fallback=used_fallback_fair,
                 min_sharp_books=min_sharp,
+                take_book=take_canon,
                 exchange_source=panel_books or surviving_books,
             )
             ev_percent = float(gated["ev_percent"])

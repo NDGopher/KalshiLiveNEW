@@ -37,17 +37,18 @@ SHARP_SIGN_FLIP_CLUSTER = 0.04
 # Kalshi-adjacent pack: seed within this of Kalshi, grow by this gap. Do not
 # use a global median on a bimodal board (that drops the close rec).
 SHARP_ADJACENT_SEED = 0.04
-SHARP_ADJACENT_GROW = 0.03
+SHARP_ADJACENT_GROW = 0.02
 # One egregious screen: |implied(book) − implied(Kalshi)| > 10 cents, or sign flip.
 # Replaces a global-median / pack-median outlier screen. DK +228 vs +245 (~1.5c) stays.
 JUNK_VS_KALSHI_CENTS = 0.10
 SHARP_EGREGIOUS_GAP = JUNK_VS_KALSHI_CENTS
-# |implied(Kalshi) − nearest non-junk rec|. Only drops a plus with nv_better
-# or when Kalshi is not best — never alone (KEEP Astros −133 vs NV −139 is ~1c).
+# |implied(take) − nearest non-junk rec|. Never fires alone (KEEP Astros −133 vs NV −139).
 TIED_REC_CENTS = 0.015
 BETTER_BOOKS_KILL = 3
 # Hide the card when 2+ of {Betfair Exchange, Polymarket, Novig} beat the take.
+# Same-sign favorites count even past 10c (Astros −204 vs NV −130).
 EXCHANGE_BETTER_KILL = 2
+EXCHANGE_HIDE_JUNK_CENTS = 0.12
 MEDIAN_GATE_TOL = 0.005
 # Identity band. KEEP boards with ~8c of juice (57c vs 65c) must not match this.
 TIGHT_CLUSTER_BAND = 0.04
@@ -83,24 +84,29 @@ def hold_from_decimals(decimals: List[float]) -> float:
 
 
 def devig_power(implied: List[float]) -> List[float]:
-    """Find exponent a>1 so sum(p_i**a)==1; fair_i = p_i**a."""
-    s = sum(implied)
-    if s <= 0:
-        return [1.0 / len(implied)] * len(implied) if implied else []
-    p = [x / s for x in implied]
-    if len(p) == 1:
-        return [1.0]
-    lo, hi = 1.0001, 50.0
-    for _ in range(60):
+    """POWER on RAW implieds. Do not renormalize first.
+
+    Find a>0 such that sum(p_i**a)==1. fair_i = p_i**a / sum(p_j**a).
+    After a naive normalize, sum(p)=1 so a flies to the clip and fair
+    collapses to 0/1. Sister pair required — one implied is not POWER.
+    """
+    raw = [float(x) for x in (implied or []) if x is not None and float(x) > 0.0]
+    if len(raw) < 2:
+        return []
+    lo, hi = 0.05, 80.0
+    for _ in range(80):
         mid = (lo + hi) / 2.0
-        sm = sum(math.pow(x, mid) for x in p)
+        sm = sum(math.pow(x, mid) for x in raw)
+        # p_i < 1: larger a shrinks p^a. Overround (sum>1) needs a>1.
         if sm > 1.0:
-            hi = mid
-        else:
             lo = mid
+        else:
+            hi = mid
     a = (lo + hi) / 2.0
-    w = [math.pow(x, a) for x in p]
+    w = [math.pow(x, a) for x in raw]
     sw = sum(w)
+    if sw <= 0:
+        return []
     return [x / sw for x in w]
 
 
@@ -154,6 +160,40 @@ def _coerce_book_american(book: Dict[str, Any], decimal_pick: float) -> Optional
     if decimal_pick > 1.0:
         return decimal_to_american(decimal_pick)
     return None
+
+
+def ev_percent_vs_take_american(fair_prob: float, take_american: int) -> Optional[float]:
+    """EV% = (fair_pick / implied(take) − 1)×100. Uses American, not rounded cents."""
+    if fair_prob is None or fair_prob <= 0.0 or fair_prob >= 1.0:
+        return None
+    take_imp = implied_prob_from_american(int(take_american))
+    if take_imp is None or take_imp <= 0.0:
+        return None
+    return (float(fair_prob) / take_imp - 1.0) * 100.0
+
+
+def two_way_power_fair(pick_american: int, opp_american: int) -> Optional[float]:
+    """Sister-pair POWER fair for the pick. None if a side is missing."""
+    p1 = implied_prob_from_american(int(pick_american))
+    p2 = implied_prob_from_american(int(opp_american))
+    if p1 is None or p2 is None:
+        return None
+    fair = devig_power([p1, p2])
+    if len(fair) < 2:
+        return None
+    return float(fair[0])
+
+
+def two_way_power_ev(
+    pick_american: int,
+    opp_american: int,
+    take_american: int,
+) -> Optional[float]:
+    """Two-way POWER EV vs take. Rejects plus-only (missing sister)."""
+    fp = two_way_power_fair(int(pick_american), int(opp_american))
+    if fp is None:
+        return None
+    return ev_percent_vs_take_american(fp, int(take_american))
 
 
 def american_is_strictly_better(book_american: int, kalshi_american: int) -> bool:
@@ -328,7 +368,7 @@ def is_polymarket_book(name: Any) -> bool:
 
 
 def is_novig_book(name: Any) -> bool:
-    """NoVig / Novig / NV — take book. Better NV suppresses a Kalshi plus card."""
+    """NoVig / Novig / NV. One on-pack NV better does not hide a Kalshi card."""
     key = _book_name_key(name)
     return key in {"novig", "nv"} or key.startswith("novig")
 
@@ -336,7 +376,11 @@ def is_novig_book(name: Any) -> bool:
 def is_betfair_exchange_book(name: Any) -> bool:
     """Betfair Exchange / BFX / BF. Not a lone 'BE' (too ambiguous)."""
     key = _book_name_key(name)
-    return "betfair" in key or key in {"bfx", "bf"}
+    return "betfair" in key or key in {"bfx", "bf", "betfairexchange"}
+
+
+def is_betfair_book(name: Any) -> bool:
+    return is_betfair_exchange_book(name)
 
 
 def is_exchange_kill_book(name: Any) -> bool:
@@ -345,6 +389,11 @@ def is_exchange_kill_book(name: Any) -> bool:
         or is_polymarket_book(name)
         or is_novig_book(name)
     )
+
+
+def is_exchange_for_hide(name: Any) -> bool:
+    """Betfair, Polymarket, Novig — the 2-exchange hide set."""
+    return is_exchange_kill_book(name)
 
 
 def exclude_plive_from_fair(books: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -384,7 +433,7 @@ def fair_books_excluding_take(
     books: List[Dict[str, Any]],
     take_book: str = "Kalshi",
 ) -> List[Dict[str, Any]]:
-    """Fair/devig set: never PLive, never the take venue. Poly stays when on-pack."""
+    """Fair/devig set: never PLive, never the take venue. On-pack Poly may stay."""
     take = _book_name_key(take_book or "Kalshi")
     out: List[Dict[str, Any]] = []
     for b in books or []:
@@ -579,6 +628,11 @@ def count_exchange_better_than_take(
     return len(exchange_better_venues(survivors, take_american))
 
 
+def count_better_exchanges(books: List[Dict[str, Any]], take_american: int) -> int:
+    """Alias for count_exchange_better_than_take (quant test 5)."""
+    return count_exchange_better_than_take(books, take_american)
+
+
 def exchange_better_kill(
     survivors: List[Dict[str, Any]],
     take_american: int,
@@ -594,10 +648,9 @@ def power_average_fair_prob(
 ) -> Optional[float]:
     """Mean of per-book two-way POWER fairs. Same as type=AVERAGE over method=POWER.
 
-    Plus-money / dog takes use POWER only — raw one-sided implied is the
-    13–17% fake (Twins +317 vs +252/+270). Favorite takes still floor at the
-    pack's mean pick implied so a few-cent best price vs DK/FD/CZ/NV (Astros
-    −133 vs −139/−141/−142) keeps printing ~+2%.
+    Two-way POWER via decimal_opp. Never max(pwr, raw_mean) — that inflates
+    a worse favorite (Cardinals-style fake +14%). Plus-money uses POWER only
+    so one-sided implied cannot print a 13–17% fake.
     """
     rows = [
         b
@@ -614,14 +667,7 @@ def power_average_fair_prob(
     raw = [_book_implied(b) for b in rows]
     if not fairs:
         return sum(raw) / float(len(raw)) if raw else None
-    pwr = sum(fairs) / float(len(fairs))
-    raw_mean = sum(raw) / float(len(raw))
-    take_imp: Optional[float] = None
-    if take_american is not None:
-        take_imp = implied_prob_from_american(int(take_american))
-    if take_imp is not None and take_imp < 0.5:
-        return pwr
-    return max(pwr, raw_mean)
+    return sum(fairs) / float(len(fairs))
 
 
 def apply_ev_hard_gates(
@@ -631,9 +677,11 @@ def apply_ev_hard_gates(
     *,
     used_fallback: bool = False,
     min_sharp_books: int = 3,
+    take_book: str = "Kalshi",
     exchange_source: Optional[List[Dict[str, Any]]] = None,
+    exchange_books: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    """Median / tight-cluster / 3-better / fallback gates. Math, not UI hide."""
+    """Median / tight-cluster / 3-better / 2-exchange / PLive-best gates."""
     reasons: List[str] = []
     ev = float(ev_percent)
     allow_plus = True
@@ -641,6 +689,14 @@ def apply_ev_hard_gates(
     k_imp = (1.0 / k_dec) if k_dec > 1.0 else 1.0
     surv_imps = [1.0 / float(b["decimal_pick"]) for b in (survivors or []) if float(b.get("decimal_pick") or 0) > 1.0]
     better = count_better_than_kalshi(survivors, kalshi_american)
+    # Raw board first so a same-sign favorite past 10c (NV −130 vs −204) still hides.
+    if exchange_source is not None:
+        exch_src = exchange_source
+    elif exchange_books is not None:
+        exch_src = exchange_books
+    else:
+        exch_src = survivors
+    exch_better = count_exchange_better_than_take(exch_src, kalshi_american)
 
     if used_fallback:
         return {
@@ -683,22 +739,26 @@ def apply_ev_hard_gates(
         allow_plus = False
         reasons.append("better_books")
 
-    nv_better = novig_better_than_take(survivors, kalshi_american)
-    if nv_better:
-        ev = min(ev, 0.0)
-        allow_plus = False
-        reasons.append("nv_better")
-
-    if exchange_better_kill(exchange_source if exchange_source is not None else survivors, kalshi_american):
+    # 2-exchange hide: 2+ of {Betfair, Polymarket, Novig} strictly better.
+    # Same-sign favorites count past 10c. One NV better alone does not hide.
+    if exch_better >= EXCHANGE_BETTER_KILL:
         ev = min(ev, 0.0)
         allow_plus = False
         reasons.append("exchange_better")
+        reasons.append("two_exchange")
 
-    # tied_rec never fires alone. KEEP Astros −133 vs NV −139 is ~1c and Kalshi is best.
+    take_key = _book_name_key(take_book or "Kalshi")
+    # PLive take: KEEP only if PLive is strictly best vs the rec pack.
+    if take_key == "plive" and better > 0:
+        ev = min(ev, 0.0)
+        allow_plus = False
+        reasons.append("plive_not_best")
+
+    # tied_rec never fires alone. KEEP Astros −133 vs NV −139 is ~1c and take is best.
     tied_gap = nearest_non_junk_implied_gap(survivors, kalshi_american)
     tied_rec = tied_gap is not None and tied_gap <= TIED_REC_CENTS + 1e-12
-    kalshi_best = better == 0
-    if tied_rec and (nv_better or not kalshi_best):
+    take_best = better == 0
+    if tied_rec and not take_best:
         ev = min(ev, 0.0)
         allow_plus = False
         reasons.append("tied_rec")
@@ -712,6 +772,7 @@ def apply_ev_hard_gates(
         "better_count": better,
         "kalshi_implied": k_imp,
         "survivor_median_implied": _median_floats(surv_imps) if surv_imps else None,
+        "exchange_better": exch_better,
     }
 
 
@@ -740,24 +801,18 @@ def evaluate_sharp_panel_ev(
     price_cents = int(max(1, min(99, round(100.0 / k_dec)))) if k_dec > 1.0 else 0
     fair: Optional[float] = None
     ev = 0.0
+    gate_kw = dict(
+        used_fallback=False,
+        min_sharp_books=min_sharp_books,
+        take_book=take_book,
+        exchange_source=books,
+    )
     if used_fallback:
         gated = apply_ev_hard_gates(
-            0.0,
-            kalshi_american,
-            fair_eligible,
-            used_fallback=True,
-            min_sharp_books=min_sharp_books,
-            exchange_source=books,
+            0.0, kalshi_american, fair_eligible, used_fallback=True, **{k: v for k, v in gate_kw.items() if k != "used_fallback"}
         )
     elif len(fair_eligible) < int(min_sharp_books):
-        gated = apply_ev_hard_gates(
-            0.0,
-            kalshi_american,
-            fair_eligible,
-            used_fallback=False,
-            min_sharp_books=min_sharp_books,
-            exchange_source=books,
-        )
+        gated = apply_ev_hard_gates(0.0, kalshi_american, fair_eligible, **gate_kw)
     else:
         fair_src = fair_books_for_panel(fair_eligible, kalshi_american, take_book=take_book)
         if (method or "POWER").upper() == "POWER":
@@ -768,15 +823,9 @@ def evaluate_sharp_panel_ev(
                 for b in fair_src
             ]
             fair = sum(fairs) / float(len(fairs)) if fairs else None
-        ev = calc.ev_percent_vs_kalshi(fair, price_cents) if fair is not None else -999.0
-        gated = apply_ev_hard_gates(
-            ev,
-            kalshi_american,
-            fair_eligible,
-            used_fallback=False,
-            min_sharp_books=min_sharp_books,
-            exchange_source=books,
-        )
+        ev_opt = ev_percent_vs_take_american(fair, kalshi_american) if fair is not None else None
+        ev = float(ev_opt) if ev_opt is not None else -999.0
+        gated = apply_ev_hard_gates(ev, kalshi_american, fair_eligible, **gate_kw)
     hdp_gate = spread_keep_on_labeled_side(
         painted_hdp=painted_side_hdp,
         actual_hdp=kalshi_side_hdp,
@@ -846,6 +895,8 @@ class EVCalculator:
         method: str,
     ) -> Tuple[float, float]:
         implied = implied_probs([dec_a, dec_b])
+        if len(implied) < 2:
+            return 0.0, 0.0
         m = (method or "POWER").upper()
         if m == "POWER":
             fair = devig_power(implied)
@@ -855,6 +906,8 @@ class EVCalculator:
             fair = devig_normalized_implied(implied)
         else:
             fair = devig_normalized_implied(implied)
+        if len(fair) < 2:
+            return 0.0, 0.0
         return fair[0], fair[1]
 
     def fair_probs_three_way(self, dec_h: float, dec_d: float, dec_a: float, method: str) -> Tuple[float, float, float]:

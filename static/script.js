@@ -708,9 +708,10 @@ function orderBooksTakeFirst(books, alert) {
 }
 
 /**
- * Tile paint lock: take=green (left), same-side strictly better=red, worse=unshaded.
- * Skip empty tiles or sign-flip junk. Never skip a worse rec — except junk Poly
- * (10c or sign-flip), which skip-paints instead of going gray.
+ * Tile paint lock: take=green (left), on-pack strictly better=red, worse=unshaded.
+ * Skip: empty, real sign-flip, or better-and-off-pack (|implied-take|>10c).
+ * Worse recs always paint (even if >10c). Poly on-pack better is red.
+ * Green is the betting book (Kalshi or PLive), not the best price.
  */
 function tilePaintState(bookName, bookOdds, alert, takeAm) {
     if (!bookTileHasLine(bookOdds)) {
@@ -728,8 +729,12 @@ function tilePaintState(bookName, bookOdds, alert, takeAm) {
         return { skip: true, take: false, better: false };
     }
     const take = isCardTakeBook(bookName, alert);
-    const better = !take && takeAm != null && bookAmericanIsBetter(bookOdds, takeAm);
-    return { skip: false, take: take, better: better };
+    const strictlyBetter = !take && takeAm != null && bookAmericanIsBetter(bookOdds, takeAm);
+    const junk = takeAm != null && isJunkVsKalshi(bookOdds, takeAm);
+    if (!take && strictlyBetter && junk) {
+        return { skip: true, take: false, better: false };
+    }
+    return { skip: false, take: take, better: strictlyBetter && !junk };
 }
 
 function parseFreshnessTs(value) {
@@ -1970,8 +1975,11 @@ if (stoppagesOnlyCb) {
         evs.forEach((row) => {
             const pr = row.books || {};
             const parts = (row.teams || '').split(/\s+@\s+/).map((s) => s.trim());
-            const away = parts[0] || 'Away';
-            const home = parts[1] || 'Home';
+            const kind = String(row.market_kind || '').toLowerCase();
+            const mkt = String(row.market || '');
+            const isTotal = kind === 'total' || /total/i.test(mkt);
+            const away = isTotal ? 'Over' : (parts[0] || 'Away');
+            const home = isTotal ? 'Under' : (parts[1] || 'Home');
             const meta = `${escapeHtml(row.league || '')} · ${escapeHtml(row.market || '')}`;
             const best = row.best || {};
 

@@ -86,8 +86,8 @@ def test_brewers_away_plus25_label_was_minus25_prices():
     assert away_qual == "-2.5"
 
 
-def test_plive_american_minus15_slot_away_stays_minus15():
-    """Dump −1.5 slot: Astros −1.5 / Sox −1.5. Do not paint Sox +1.5."""
+def test_plive_american_row_still_negates_away_hdp():
+    """Hard rule: even a PLive american dump row is home-centric. Away is -hdp."""
     row = {"hdp": -1.5, "home": 9.78, "away": 1.03358, "line_style": "american"}
     home_pick, home_qual, home_line = _pick_qualifier_line_for_side(
         "Houston Astros", "Chicago White Sox", "Spread", "home", row
@@ -99,10 +99,40 @@ def test_plive_american_minus15_slot_away_stays_minus15():
     assert home_line == -1.5
     assert home_qual == "-1.5"
     assert away_pick == "Chicago White Sox"
-    assert away_line == -1.5
-    assert away_qual == "-1.5"
-    assert side_signed_line(row, "away") == -1.5
+    assert away_line == 1.5
+    assert away_qual == "+1.5"
+    assert side_signed_line(row, "away") == 1.5
     assert side_signed_line(row, "home") == -1.5
+
+
+def test_tigers_away_plus15_label_is_actually_minus15():
+    """DET@MIN: Tigers are away. Home hdp +1.5 → Tigers −1.5 on label and ticker."""
+    pick, qual, line = _pick_qualifier_line_for_side(
+        "Minnesota Twins",
+        "Detroit Tigers",
+        "Spread",
+        "away",
+        {"hdp": 1.5, "home": 1.28, "away": 4.69},
+    )
+    assert pick == "Detroit Tigers"
+    assert line == -1.5
+    assert qual == "-1.5"
+    assert side_handicap(1.5, "away") == -1.5
+    assert side_signed_line({"hdp": 1.5, "line_style": "american"}, "away") == -1.5
+
+
+def test_marlins_away_painted_plus15_is_minus15():
+    """Marlins @ KC painted +1.5; away is always −hdp → Marlins −1.5."""
+    pick, qual, line = _pick_qualifier_line_for_side(
+        "Kansas City Royals",
+        "Miami Marlins",
+        "Spread",
+        "away",
+        {"hdp": 1.5, "home": 1.45, "away": 2.63},
+    )
+    assert pick == "Miami Marlins"
+    assert line == -1.5
+    assert qual == "-1.5"
 
 
 def test_do_not_keep_on_painted_plus15_when_actual_is_minus15():
