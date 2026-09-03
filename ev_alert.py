@@ -47,6 +47,8 @@ class EvAlert:
         self.clock_running = data.get("clock_running")
         self.status_detail = data.get("status_detail") or data.get("statusDetail") or ""
         self.score = data.get("score") or ""
+        self.scores = data.get("scores")
+        self.game_status = data.get("game_status") or ""
 
     def extract_ticker_from_url(self):
         """Extract Kalshi ticker from market URL."""
@@ -79,8 +81,11 @@ class EvAlert:
             "take_book": self.take_book,
             "autobet_allow": self.autobet_allow,
             "live": self.live,
+            "clock": self.clock,
             "clock_running": self.clock_running,
             "status_detail": self.status_detail,
             "score": self.score,
+            "scores": self.scores,
+            "game_status": self.game_status,
             "line": self.line,
         }

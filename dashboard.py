@@ -722,6 +722,18 @@ def _event_matches_league_focus(ev: Dict[str, Any], focus: str) -> bool:
         if "ncaa" in slug or "NCAA" in name or "COLLEGE" in name:
             return False
         return "nfl" in slug or "NFL" in name or "NATIONAL FOOTBALL" in name
+    if f in ("ncaaf", "cfb"):
+        if sk != "americanfootball":
+            return False
+        return (
+            "ncaa" in slug
+            or "ncaaf" in slug
+            or "cfb" in slug
+            or "NCAA" in name
+            or "COLLEGE" in name
+            or "NCAAF" in name
+            or "CFB" in name
+        )
     return True
 
 
@@ -1005,6 +1017,8 @@ def _live_odds_finish_row(
     status_detail: Any,
     market: str,
     prices: Dict[str, Dict[str, Any]],
+    score: Any = "",
+    game_status: Any = "",
     side_a: Optional[str] = None,
     side_b: Optional[str] = None,
     line: Any = None,
@@ -1022,6 +1036,8 @@ def _live_odds_finish_row(
         "clock": clock,
         "clock_running": clock_running,
         "statusDetail": status_detail,
+        "score": score,
+        "game_status": game_status,
         "start_display": start_display,
         "market": market,
         "market_kind": {"ml": "ml", "spread": "spread", "totals": "total"}.get(
@@ -1057,11 +1073,13 @@ def live_odds_board_rows_from_bookmakers(
     live: bool,
     status: str,
     start_display: str,
+    bks: Dict[str, Any],
+    books: List[str],
     clock: Any = "",
     clock_running: Any = None,
     status_detail: Any = "",
-    bks: Dict[str, Any],
-    books: List[str],
+    score: Any = "",
+    game_status: Any = "",
     plive_only: bool = False,
 ) -> List[Dict[str, Any]]:
     """One ML row plus Spread and Totals (Over/Under with the line). Team totals omitted."""
@@ -1076,6 +1094,8 @@ def live_odds_board_rows_from_bookmakers(
         clock=clock,
         clock_running=clock_running,
         status_detail=status_detail,
+        score=score,
+        game_status=game_status,
         plive_only=plive_only,
     )
     out: List[Dict[str, Any]] = []
@@ -1546,6 +1566,8 @@ async def _live_odds_build_snapshot_with_client(
                 clock=clock_fields["clock"],
                 clock_running=clock_fields["clock_running"],
                 status_detail=clock_fields["statusDetail"],
+                score=clock_fields.get("score") or "",
+                game_status=clock_fields.get("game_status") or "",
                 bks=bks,
                 books=books,
             )
@@ -2307,7 +2329,10 @@ async def handle_plive_take_display_alert(alert: EvAlert) -> None:
         "clock": getattr(alert, "clock", None),
         "clock_running": getattr(alert, "clock_running", None),
         "status_detail": getattr(alert, "status_detail", None) or "",
+        "statusDetail": getattr(alert, "status_detail", None) or getattr(alert, "statusDetail", None) or "",
         "score": getattr(alert, "score", None) or "",
+        "scores": getattr(alert, "scores", None),
+        "game_status": getattr(alert, "game_status", None) or "",
         "book_updated_at": getattr(alert, "book_updated_at", None) or {},
         "kalshi_last_trade_ts": getattr(alert, "kalshi_last_trade_ts", None),
     }
@@ -2881,7 +2906,10 @@ async def handle_new_alert(alert: EvAlert):
             'clock': getattr(alert, 'clock', None),
             'clock_running': getattr(alert, 'clock_running', None),
             'status_detail': getattr(alert, 'status_detail', None) or getattr(alert, 'statusDetail', None) or '',
+            'statusDetail': getattr(alert, 'status_detail', None) or getattr(alert, 'statusDetail', None) or '',
             'score': getattr(alert, 'score', None) or '',
+            'scores': getattr(alert, 'scores', None),
+            'game_status': getattr(alert, 'game_status', None) or '',
             'book_updated_at': getattr(alert, 'book_updated_at', None) or {},
             'kalshi_last_trade_ts': getattr(alert, 'kalshi_last_trade_ts', None) or (
                 (match_result.get('market') or {}).get('last_trade_ts')
@@ -2937,10 +2965,20 @@ async def handle_new_alert(alert: EvAlert):
             if getattr(alert, "line", None) is not None:
                 existing_alert["line"] = alert.line
                 updated = True
-            for _lk in ("live", "clock", "clock_running", "status_detail", "score"):
+            for _lk in (
+                "live",
+                "clock",
+                "clock_running",
+                "status_detail",
+                "score",
+                "scores",
+                "game_status",
+            ):
                 if getattr(alert, _lk, None) is not None:
                     existing_alert[_lk] = getattr(alert, _lk)
                     updated = True
+            if existing_alert.get("status_detail"):
+                existing_alert["statusDetail"] = existing_alert["status_detail"]
             
             # CRITICAL: Preserve filter_name - use existing if new alert doesn't have it, otherwise update
             if hasattr(alert, 'filter_name') and alert.filter_name:
@@ -4243,6 +4281,19 @@ def run_monitor_loop():
                 if hasattr(alert, 'strict_pass'):
                     alert_data['strict_pass'] = alert.strict_pass
                 alert_data['autobet_allow'] = bool(getattr(alert, 'autobet_allow', False))
+                for _lk in (
+                    "live",
+                    "clock",
+                    "clock_running",
+                    "status_detail",
+                    "score",
+                    "scores",
+                    "game_status",
+                ):
+                    if getattr(alert, _lk, None) is not None:
+                        alert_data[_lk] = getattr(alert, _lk)
+                if alert_data.get("status_detail"):
+                    alert_data["statusDetail"] = alert_data["status_detail"]
                 # Update last_seen timestamp for stale alert detection
                 alert_data['last_seen'] = time.time()
                 # CRITICAL: Preserve filter_name - use existing if new alert doesn't have it, otherwise update
@@ -4286,6 +4337,14 @@ def run_monitor_loop():
                         'kalshi_last_trade_ts': alert_data.get(
                             'kalshi_last_trade_ts', getattr(alert, 'kalshi_last_trade_ts', None)
                         ),
+                        'live': alert_data.get('live', getattr(alert, 'live', None)),
+                        'clock': alert_data.get('clock', getattr(alert, 'clock', None)),
+                        'clock_running': alert_data.get('clock_running', getattr(alert, 'clock_running', None)),
+                        'status_detail': alert_data.get('status_detail', getattr(alert, 'status_detail', None) or ''),
+                        'statusDetail': alert_data.get('statusDetail', alert_data.get('status_detail', '')),
+                        'score': alert_data.get('score', getattr(alert, 'score', None) or ''),
+                        'scores': alert_data.get('scores', getattr(alert, 'scores', None)),
+                        'game_status': alert_data.get('game_status', getattr(alert, 'game_status', None) or ''),
                     })
                     # Only log if EV or liquidity actually changed (not just reappearing)
                     if ev_changed or liq_changed:

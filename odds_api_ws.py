@@ -56,7 +56,7 @@ _MLB_CLOCK_LOG_GAP_SEC = 30.0
 
 
 def _copy_ws_clock_fields(meta: Dict[str, Any], src: Dict[str, Any]) -> None:
-    """Persist Odds-API clock / statusDetail. Do not invent baseball innings."""
+    """Persist Odds-API clock / statusDetail / scores. Do not invent baseball innings."""
     nest = src.get("event") if isinstance(src.get("event"), dict) else {}
     for blob in (src, nest):
         if not isinstance(blob, dict):
@@ -66,6 +66,9 @@ def _copy_ws_clock_fields(meta: Dict[str, Any], src: Dict[str, Any]) -> None:
         for key in ("statusDetail", "status_detail"):
             if blob.get(key) is not None:
                 meta["statusDetail"] = blob.get(key)
+                meta[key] = blob.get(key)
+        for key in ("scores", "score", "ss"):
+            if blob.get(key) is not None:
                 meta[key] = blob.get(key)
         if blob.get("sport") is not None:
             meta["sport"] = blob.get("sport")

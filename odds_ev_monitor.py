@@ -86,6 +86,7 @@ from plive_pandora import (
     plive_wanted,
 )
 from stoppage_gate import (
+    clock_fields_for_live_odds,
     is_baseball_event,
     live_take_blocked_by_stoppage,
     merge_event_clock_fields,
@@ -1529,14 +1530,22 @@ class OddsEVMonitor:
                 "take_book": str(bet.get("take_book") or "Kalshi"),
                 "autobet_allow": bool(bet.get("autobet_allow", False)),
             }
-            ctx = live_context_from_event(event if isinstance(event, dict) else {})
+            ev_ctx = event if isinstance(event, dict) else {}
+            clock_fields = clock_fields_for_live_odds(ev_ctx)
+            ctx = live_context_from_event(ev_ctx)
             alert_data.update(
                 {
                     "live": ctx.get("live"),
-                    "clock": ctx.get("clock"),
-                    "clock_running": ctx.get("clock_running"),
-                    "status_detail": ctx.get("status_detail") or "",
-                    "score": ctx.get("score") or "",
+                    "clock": clock_fields.get("clock")
+                    if clock_fields.get("clock") is not None
+                    else ctx.get("clock"),
+                    "clock_running": clock_fields.get("clock_running")
+                    if clock_fields.get("clock_running") is not None
+                    else ctx.get("clock_running"),
+                    "status_detail": clock_fields.get("statusDetail") or ctx.get("status_detail") or "",
+                    "score": clock_fields.get("score") or ctx.get("score") or "",
+                    "scores": clock_fields.get("scores"),
+                    "game_status": clock_fields.get("game_status") or "",
                 }
             )
             alert = EvAlert(alert_data)
@@ -1552,11 +1561,13 @@ class OddsEVMonitor:
                 alert.ticker = self.extract_ticker_from_link(link) or bet.get("ticker")
             alert.price_cents = price_cents
             alert.line = line
-            alert.live = ctx.get("live")
-            alert.clock = ctx.get("clock")
-            alert.clock_running = ctx.get("clock_running")
-            alert.status_detail = ctx.get("status_detail") or ""
-            alert.score = ctx.get("score") or ""
+            alert.live = alert_data.get("live")
+            alert.clock = alert_data.get("clock")
+            alert.clock_running = alert_data.get("clock_running")
+            alert.status_detail = alert_data.get("status_detail") or ""
+            alert.score = alert_data.get("score") or ""
+            alert.scores = alert_data.get("scores")
+            alert.game_status = alert_data.get("game_status") or ""
             return alert
         except Exception as e:
             print(f"[WARN] Error parsing bet: {e}")
@@ -2176,27 +2187,23 @@ class OddsEVMonitor:
             league_obj = doc.get("league")
             raw_ev = (meta_by_id.get(int(eid)) or {}).get("raw") or {}
             is_live = _vb_is_live_for_bookflow(raw_ev) or _vb_is_live_for_bookflow(doc)
+            ws_meta = _ws_event_meta(eid)
+            clock_fields = clock_fields_for_live_odds(doc, raw_ev, ws_meta)
             ev_stub = {
                 "home": home,
                 "away": away,
                 "league": league_obj,
-                "sport": doc.get("sport") or raw_ev.get("sport"),
+                "sport": doc.get("sport") or raw_ev.get("sport") or (ws_meta or {}).get("sport"),
                 "sport_slug": doc.get("sport_slug") or raw_ev.get("sport_slug"),
                 "live": is_live,
                 "status": doc.get("status") or doc.get("state") or raw_ev.get("status") or raw_ev.get("state"),
-                "clock": doc.get("clock") if doc.get("clock") is not None else raw_ev.get("clock"),
-                "statusDetail": (
-                    doc.get("statusDetail")
-                    or raw_ev.get("statusDetail")
-                    or doc.get("status_detail")
-                    or raw_ev.get("status_detail")
-                ),
-                "status_detail": (
-                    doc.get("status_detail")
-                    or raw_ev.get("status_detail")
-                    or doc.get("statusDetail")
-                    or raw_ev.get("statusDetail")
-                ),
+                "clock": clock_fields.get("clock"),
+                "clock_running": clock_fields.get("clock_running"),
+                "statusDetail": clock_fields.get("statusDetail"),
+                "status_detail": clock_fields.get("statusDetail") or "",
+                "scores": clock_fields.get("scores"),
+                "score": clock_fields.get("score") or "",
+                "game_status": clock_fields.get("game_status") or "",
             }
             for mname, kal_mk in _kalshi_scan_gameline_markets(bks):
                 odds_rows = kal_mk.get("odds") or []

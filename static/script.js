@@ -247,6 +247,9 @@ socket.on('alert_update', (data) => {
         if (data.sharp_books !== undefined) alert.sharp_books = data.sharp_books;
         if (data.book_updated_at !== undefined) alert.book_updated_at = data.book_updated_at;
         if (data.kalshi_last_trade_ts !== undefined) alert.kalshi_last_trade_ts = data.kalshi_last_trade_ts;
+        for (const k of ['live', 'clock', 'clock_running', 'status_detail', 'statusDetail', 'score', 'scores', 'game_status']) {
+            if (data[k] !== undefined) alert[k] = data[k];
+        }
         
         // Update the card in place instead of re-rendering everything
         const alertCard = document.querySelector(`[data-alert-id="${alertId}"]`);
@@ -379,6 +382,23 @@ socket.on('alert_update', (data) => {
                 }
             }
             
+            const statusLine = formatAlertGameStatus(alert);
+            const statusEl = alertCard.querySelector('.alert-game-status');
+            if (statusLine) {
+                if (statusEl) {
+                    if (statusEl.textContent !== statusLine) {
+                        statusEl.textContent = statusLine;
+                        hasChanges = true;
+                    }
+                } else {
+                    needsRerender = true;
+                    hasChanges = true;
+                }
+            } else if (statusEl) {
+                statusEl.remove();
+                hasChanges = true;
+            }
+
             // Check if EV changed - ALWAYS update if value is provided (even small changes)
             if (data.ev_percent !== undefined) {
                 const newEv = data.ev_percent;
@@ -798,6 +818,57 @@ function bookMatchesDevigOrSharp(bookName, devigList, sharpList) {
     });
 }
 
+function formatAlertGameStatus(alert) {
+    if (!alert) return '';
+    const ready = String(alert.game_status || '').trim();
+    if (ready) return ready;
+    const clock = (alert.clock && typeof alert.clock === 'object') ? alert.clock : {};
+    const statusDetail = String(alert.status_detail || alert.statusDetail || clock.statusDetail || '').trim();
+    let homeAway = String(alert.score || '').trim().replace('–', '-');
+    if (!homeAway && alert.scores && typeof alert.scores === 'object'
+        && alert.scores.home != null && alert.scores.away != null) {
+        homeAway = `${alert.scores.home}-${alert.scores.away}`;
+    }
+    const inningHit = statusDetail.toLowerCase().includes('inning');
+    const parts = [];
+    if (homeAway) parts.push(homeAway);
+    if (inningHit) {
+        const m = statusDetail.toLowerCase().match(/(\d+)(?:st|nd|rd|th)?\s+inning/);
+        if (m) {
+            const n = parseInt(m[1], 10);
+            const suf = (n % 100 >= 11 && n % 100 <= 13) ? 'th' : ({ 1: 'st', 2: 'nd', 3: 'rd' }[n % 10] || 'th');
+            parts.push(`${n}${suf}`);
+        }
+        return parts.join(' · ');
+    }
+    const period = clock.period;
+    const played = clock.playedSeconds != null ? Number(clock.playedSeconds)
+        : (clock.played_seconds != null ? Number(clock.played_seconds) : NaN);
+    const minute = clock.minute != null ? Number(clock.minute) : NaN;
+    let periodLab = '';
+    if (period != null && String(period).trim() !== '') {
+        periodLab = /^\d+$/.test(String(period)) ? `Q${period}` : String(period);
+    }
+    let timeLab = '';
+    if (typeof clock.time === 'string' && clock.time.includes(':')) {
+        timeLab = clock.time.trim();
+    } else if (Number.isFinite(played) && played >= 0) {
+        timeLab = `${Math.floor(played / 60)}:${String(played % 60).padStart(2, '0')}`;
+    } else if (Number.isFinite(minute) && minute >= 0) {
+        timeLab = `${minute}'`;
+    }
+    const clockChunk = [periodLab, timeLab].filter(Boolean).join(' ');
+    if (clockChunk) parts.push(clockChunk);
+    else if (statusDetail && !['in progress', 'live'].includes(statusDetail.toLowerCase())) {
+        parts.push(statusDetail);
+    }
+    const timedClock = period != null || Number.isFinite(played) || Number.isFinite(minute);
+    if (timedClock && (clock.running === false || alert.clock_running === false)) {
+        parts.push('STOPPED');
+    }
+    return parts.join(' · ');
+}
+
 // Create alert card element (live multi-book layout)
 function createAlertCard(alert) {
     const card = document.createElement('div');
@@ -919,6 +990,7 @@ function createAlertCard(alert) {
                     <span class="ev-source-sub" title="${escapeHtml(evSourceTitle)}">${escapeHtml(evSourceLabel)}</span>
                 </div>
                 <div class="teams-bb">${escapeHtml(alert.teams)}</div>
+                ${formatAlertGameStatus(alert) ? `<div class="alert-game-status">${escapeHtml(formatAlertGameStatus(alert))}</div>` : ''}
                 <div class="ev-display-left">
                     <div class="ev-value ${alert.ev_percent >= 0 ? 'positive' : 'negative'}">${evDisplay}</div>
                     <div class="ev-team">${escapeHtml(submarketName)}</div>
@@ -1776,20 +1848,38 @@ function isBaseballSportSelection() {
     return sport === 'baseball' || sport === 'mlb';
 }
 
+function isTimedBoardSportSelection() {
+    const sel = document.getElementById('odds-sport-sel');
+    const raw = sel && sel.value ? String(sel.value) : '';
+    const parts = raw.split('|');
+    const sport = (parts[0] || '').trim().toLowerCase();
+    const league = (parts[1] || 'all').trim().toLowerCase();
+    if (sport === 'baseball' || sport === 'mlb') return false;
+    if (sport === 'basketball' || sport === 'nba') return true;
+    if (sport === 'americanfootball' || sport === 'nfl' || sport === 'ncaaf' || sport === 'cfb') {
+        return league === 'all' || league === 'nfl' || league === 'ncaaf' || league === 'cfb';
+    }
+    if (sport === 'football' || sport === 'soccer') return true;
+    return false;
+}
+
 function syncStoppagesOnlyForSport() {
     const el = document.getElementById('stoppages-only');
     const label = document.getElementById('stoppages-only-label');
     if (!el) return;
     const baseball = isBaseballSportSelection();
-    el.disabled = baseball;
+    const timed = isTimedBoardSportSelection();
+    el.disabled = !timed;
     const liveTitle =
         'Live takes only when Odds-API clock exists and clock.running is false, or statusDetail is Halftime/Break. Omitted clock fails closed. Baseball unsupported.';
     const mlbTitle =
         'MLB has no Odds-API clock. statusDetail is inning-only (1st inning…9th inning). Do not invent mid-inning or between-innings.';
-    el.title = baseball ? mlbTitle : liveTitle;
+    const idleTitle =
+        'Stoppages Only applies to NBA, NFL, soccer, and CFB. Select one of those sports on the odds board to enable.';
+    el.title = baseball ? mlbTitle : (timed ? liveTitle : idleTitle);
     if (label) {
         label.title = el.title;
-        label.classList.toggle('is-disabled', baseball);
+        label.classList.toggle('is-disabled', !timed);
     }
 }
 
