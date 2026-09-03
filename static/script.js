@@ -48,6 +48,21 @@ function priceToAmericanOdds(priceCents) {
     }
 }
 
+/** Asian quarters stay 1.75 — never toFixed(1) → 1.8. Half/integer stay 8.5 / 2.5. */
+function formatTotalQualifier(line) {
+    const lf = Number(line);
+    if (!Number.isFinite(lf)) return null;
+    const fourths = lf * 4;
+    if (Math.abs(fourths - Math.round(fourths)) <= 1e-9) {
+        const q = Math.round(fourths) / 4;
+        if (Math.abs(q * 2 - Math.round(q * 2)) <= 1e-9) {
+            return q.toFixed(1);
+        }
+        return q.toFixed(2);
+    }
+    return String(lf);
+}
+
 /** Odds-API limit / stake on the take row (USD); ASCII '-' when unknown. Never an emdash. */
 function formatLiquidityUsd(n) {
     const x = Number(n);
@@ -894,6 +909,10 @@ function createAlertCard(alert) {
     let qualifierDisplay = alert.qualifier;
     if (alert.market_type && alert.market_type.toLowerCase() === 'moneyline' && (qualifierDisplay === '0.0' || qualifierDisplay === '0' || !qualifierDisplay)) {
         qualifierDisplay = 'ML';
+    }
+    const mt = String(alert.market_type || '').toLowerCase();
+    if (mt.includes('total') && alert.line != null && alert.line !== '') {
+        qualifierDisplay = formatTotalQualifier(alert.line) || qualifierDisplay;
     }
     const submarketName = qualifierDisplay ? `${alert.pick} ${qualifierDisplay}`.trim() : alert.pick;
     

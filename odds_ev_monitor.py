@@ -1605,6 +1605,12 @@ def _build_display_books_payload(
             # Never paint Odds-API / Kalshi-copied PLive. Missing live Draw
             # omits the tile; Kalshi-take can still print.
             continue
+        if is_plive_book(nm) and _market_is_total(mname):
+            # Fail-closed: PLive 1.75 is not a 1.8 / 2.0 / 2.5 tile.
+            ref_ln = total_line_value(ref) if ref else None
+            row_ln = total_line_value(row)
+            if ref_ln is None or row_ln is None or not _numeric_close(ref_ln, row_ln):
+                continue
         d = _decimal_for_side(row, bet_side)
         if d and d > 1.0:
             am = decimal_to_american(float(d))
@@ -1716,6 +1722,8 @@ class OddsEVMonitor:
             selection = bet.get("selection", "")
             line = bet.get("line")
             qualifier = bet.get("qualifier")
+            if line is not None and "total" in str(market_type).lower():
+                qualifier = format_total_qualifier(line) or qualifier
             odds_american = bet.get("odds")
             odds_str = None
             if odds_american is not None:
@@ -3132,6 +3140,8 @@ class OddsEVMonitor:
 
         row_for_pick = k_row if k_row else f_row if f_row else market
         pick, qualifier, line_val = _pick_qualifier_line_for_side(home, away, mname, bet_side, row_for_pick)
+        if _market_is_total(mname) and line_val is not None:
+            qualifier = format_total_qualifier(line_val)
         if _market_is_spread(mname):
             actual_hdp = side_signed_line(row_for_pick, bet_side)
             if actual_hdp is not None:
