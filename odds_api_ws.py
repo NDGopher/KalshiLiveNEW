@@ -375,6 +375,8 @@ class OddsWsStore:
     event_meta: Dict[int, Dict[str, Any]] = field(default_factory=dict)
     # (event_id, canonical_bookie) -> full markets list (replaced on each odds message)
     books: Dict[Tuple[int, str], List[Dict[str, Any]]] = field(default_factory=dict)
+    # Last time we replaced that book's markets (WS created/updated or REST snapshot).
+    book_updated_at: Dict[Tuple[int, str], float] = field(default_factory=dict)
     generation: int = 0
 
     def note_seq(self, seq: Any) -> Optional[int]:
@@ -432,6 +434,7 @@ class OddsWsStore:
                     self.books[(eid, bookie)] = list(markets)
                 else:
                     self.books[(eid, bookie)] = []
+                self.book_updated_at[(eid, bookie)] = time.time()
             self.generation += 1
 
     def _replace_markets(self, eid: int, bookie: str, markets: Any) -> None:
@@ -440,6 +443,7 @@ class OddsWsStore:
             self.books[(eid, ck)] = list(markets)
         else:
             self.books[(eid, ck)] = []
+        self.book_updated_at[(eid, ck)] = time.time()
 
     def apply_message(self, msg: Dict[str, Any]) -> AppliedMessage:
         """Apply one official WS JSON object. Replace markets; never merge."""
@@ -508,6 +512,7 @@ class OddsWsStore:
         if t == "deleted":
             if eid is not None and bookie:
                 self.books.pop((eid, bookie), None)
+                self.book_updated_at.pop((eid, bookie), None)
                 leftover = any(k[0] == eid for k in self.books)
                 if not leftover:
                     self.event_meta.pop(eid, None)
@@ -516,6 +521,7 @@ class OddsWsStore:
                 to_drop = [k for k in self.books if k[0] == eid]
                 for k in to_drop:
                     del self.books[k]
+                    self.book_updated_at.pop(k, None)
                 self.event_meta.pop(eid, None)
                 self.generation += 1
             return AppliedMessage(type=t, event_id=eid, bookie=bookie, seq=seq, dirty=True)
@@ -531,6 +537,11 @@ class OddsWsStore:
             if eid == event_id:
                 bks[book] = list(markets)
         meta["bookmakers"] = bks
+        meta["book_updated_at"] = {
+            book: self.book_updated_at.get((event_id, book))
+            for book in bks
+            if self.book_updated_at.get((event_id, book)) is not None
+        }
         return meta
 
     def merged_docs(self, event_ids: Optional[Sequence[int]] = None) -> List[Dict[str, Any]]:

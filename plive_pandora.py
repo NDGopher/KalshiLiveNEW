@@ -27,6 +27,7 @@ import gzip
 import json
 import os
 import re
+import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from odds_api_client import _canonical_odds_api_bookmaker
@@ -171,6 +172,30 @@ def handshake_emits() -> List[Tuple[str, Any]]:
         ("subscribe", topics),
         ("getCache", topics),
     ]
+
+
+# Acks the public UI / confirmed live feed return after the handshake.
+EXPECTED_SYSTEM_EVENT_ROOMS = ("system-events", "notifications.partner.113")
+EXPECTED_SUBSCRIBED_ROOMS = (
+    "live.sports",
+    "sports",
+    "live.main.U0VWU1NWUkJSMFU9",
+    "live.events",
+)
+
+
+def note_handshake_ack(event_name: Optional[str], data: Any = None) -> Optional[str]:
+    """Normalize socketMetadataSet / subscribedSystemEvents / subscribed acks."""
+    name = str(event_name or "")
+    if isinstance(data, dict) and data.get("event") == "socketMetadataSet":
+        return "socketMetadataSet"
+    if name in ("socketMetadataSet", "setSocketMetadata"):
+        return "socketMetadataSet"
+    if name == "subscribedSystemEvents":
+        return "subscribedSystemEvents"
+    if name == "subscribed":
+        return "subscribed"
+    return None
 
 
 def coeff_room_for_event(event_id: str) -> str:
@@ -522,11 +547,23 @@ class PliveStore:
                 changed = True
         if changed:
             self.generation += 1
+            sample = {k: self.sport_catalog.get(k) for k in (1, 2, 3, 4, 5, 8, 102, 114, 214, 220)}
+            print(
+                f"[PLIVE] live.sports catalog (trust WS, not Selenium map): {sample}"
+            )
 
     def apply_event_catalog(self, data: Any) -> List[str]:
-        """Ingest eventData / live.events snapshot. Returns event ids seen."""
+        """Ingest eventData / live.events snapshot. MLB-first (sport 1)."""
         seen: List[str] = []
+        want = int(self.sport_id)
         for eid, rec in iter_event_records(data):
+            sid = rec.get("sportId") or rec.get("sport_id") or rec.get("si") or rec.get("s")
+            if sid is not None:
+                try:
+                    if int(sid) != want:
+                        continue
+                except (TypeError, ValueError):
+                    continue
             self.apply_meta(eid, rec)
             seen.append(eid)
         return seen
@@ -868,6 +905,27 @@ class PlivePandoraFeed:
             return []
         return self.store.markets_for_event(eid)
 
+    def _record_ack(self, event_name: Optional[str], data: Any = None) -> None:
+        kind = note_handshake_ack(event_name, data)
+        if not kind:
+            return
+        first = kind not in self._ack_names
+        self._ack_names.add(kind)
+        if not first:
+            return
+        if kind == "socketMetadataSet":
+            print("[PLIVE] ack socketMetadataSet")
+        elif kind == "subscribedSystemEvents":
+            rooms = []
+            if isinstance(data, dict):
+                if data.get("room"):
+                    rooms.append(str(data["room"]))
+                rooms.extend(str(r) for r in (data.get("rooms") or []) if r)
+            print(f"[PLIVE] ack subscribedSystemEvents rooms={rooms}")
+        elif kind == "subscribed":
+            preview = repr(data)
+            print(f"[PLIVE] ack subscribed {preview[:220]}")
+
     def _bind_room(self, sio: Any, room: str) -> None:
         """Binary snapshots arrive on the room name, not on the catch-all ``*``."""
         if not room or room in self._bound_rooms:
@@ -1006,27 +1064,27 @@ class PlivePandoraFeed:
 
         @sio.on("socketMetadataSet")
         async def _on_meta(data: Any = None) -> None:
-            self._ack_names.add("socketMetadataSet")
-            print("[PLIVE] ack socketMetadataSet")
+            self._record_ack("socketMetadataSet", data)
+
+        @sio.on("setSocketMetadata")
+        async def _on_meta_alias(data: Any = None) -> None:
+            self._record_ack("setSocketMetadata", data)
 
         @sio.on("subscribedSystemEvents")
         async def _on_sys(data: Any = None) -> None:
-            self._ack_names.add("subscribedSystemEvents")
-            rooms = []
-            if isinstance(data, dict):
-                if data.get("room"):
-                    rooms.append(str(data["room"]))
-                rooms.extend(str(r) for r in (data.get("rooms") or []) if r)
-            print(f"[PLIVE] ack subscribedSystemEvents rooms={rooms}")
+            self._record_ack("subscribedSystemEvents", data)
 
         @sio.on("subscribed")
         async def _on_sub(data: Any = None) -> None:
-            self._ack_names.add("subscribed")
-            print(f"[PLIVE] ack subscribed {data!r}"[:240])
+            self._record_ack("subscribed", data)
 
         @sio.on("*")
         async def _on_any(event_name: str, *args: Any) -> None:
             for arg in args:
+                ack = note_handshake_ack(event_name, arg)
+                if ack:
+                    self._record_ack(event_name, arg)
+                    continue
                 self.ingest_raw(arg, event_name)
             if _is_event_list_topic(event_name) or event_name in ("live.events", "sports"):
                 await self._subscribe_mlb_coefficients(sio)
@@ -1111,10 +1169,16 @@ def merge_plive_into_docs(docs: List[Dict[str, Any]]) -> int:
             doc["bookmakers"] = {}
             bks = doc["bookmakers"]
         if markets:
-            bks[book] = list(markets)  # replace PLive markets only
+            bks[book] = list(markets)  # replace PLive markets only — never Betfair
+            stamps = doc.setdefault("book_updated_at", {})
+            if isinstance(stamps, dict):
+                stamps[book] = time.time()
             n += 1
         elif book in bks:
             del bks[book]
+            stamps = doc.get("book_updated_at")
+            if isinstance(stamps, dict):
+                stamps.pop(book, None)
     return n
 
 

@@ -3605,6 +3605,10 @@ def run_monitor_loop():
                         'sharp_books': alert_data.get('sharp_books', []),  # Preserve sharp books from filter
                         'devig_books': alert_data.get('devig_books', getattr(alert, 'devig_books', [])),
                         'strict_pass': alert_data.get('strict_pass', getattr(alert, 'strict_pass', True)),
+                        'book_updated_at': alert_data.get('book_updated_at', getattr(alert, 'book_updated_at', {}) or {}),
+                        'kalshi_last_trade_ts': alert_data.get(
+                            'kalshi_last_trade_ts', getattr(alert, 'kalshi_last_trade_ts', None)
+                        ),
                     })
                     # Only log if EV or liquidity actually changed (not just reappearing)
                     if ev_changed or liq_changed:

@@ -135,6 +135,8 @@ def test_store_replaces_markets_never_merges():
     assert names == ["ML"]  # Totals gone — replace, not merge
     assert fd[0]["odds"][0]["home"] == "1.8"
     assert store.last_seq == 11
+    assert "FanDuel" in doc["book_updated_at"]
+    assert store.book_updated_at[(100, "FanDuel")] == doc["book_updated_at"]["FanDuel"]
 
 
 def test_store_deleted_and_no_markets():

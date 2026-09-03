@@ -244,6 +244,8 @@ socket.on('alert_update', (data) => {
         if (data.display_books !== undefined) alert.display_books = data.display_books;
         if (data.devig_books !== undefined) alert.devig_books = data.devig_books;
         if (data.sharp_books !== undefined) alert.sharp_books = data.sharp_books;
+        if (data.book_updated_at !== undefined) alert.book_updated_at = data.book_updated_at;
+        if (data.kalshi_last_trade_ts !== undefined) alert.kalshi_last_trade_ts = data.kalshi_last_trade_ts;
         
         // Update the card in place instead of re-rendering everything
         const alertCard = document.querySelector(`[data-alert-id="${alertId}"]`);
@@ -637,6 +639,28 @@ function isJunkVsKalshi(bookAmerican, kalshiAmerican) {
     return Math.abs(bp - kp) > 0.10 + 1e-12;
 }
 
+function parseFreshnessTs(value) {
+    if (value == null || value === '') return null;
+    if (typeof value === 'number' && Number.isFinite(value)) {
+        return value > 1e12 ? value : value * 1000;
+    }
+    const n = Number(value);
+    if (Number.isFinite(n) && String(value).trim() !== '') {
+        return n > 1e12 ? n : n * 1000;
+    }
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) ? parsed : null;
+}
+
+function formatFreshnessAge(value, nowMs) {
+    const ms = parseFreshnessTs(value);
+    if (ms == null) return '';
+    const sec = Math.max(0, Math.round(((nowMs || Date.now()) - ms) / 1000));
+    if (sec < 60) return sec + 's';
+    if (sec < 3600) return Math.round(sec / 60) + 'm';
+    return Math.round(sec / 3600) + 'h';
+}
+
 function bookAmericanIsBetter(bookAmerican, kalshiAmerican) {
     const b = Number(bookAmerican);
     const k = Number(kalshiAmerican);
@@ -779,12 +803,21 @@ function createAlertCard(alert) {
                 
                 const logoHtml = bookLogoHtml(bookName);
                 const bookKey = book.book_key || normalizeBookKey(bookName);
+                const kTrade = alert.kalshi_last_trade_ts;
+                const bookTs = book.book_updated_at || (isKalshi ? kTrade : null)
+                    || ((alert.book_updated_at || {})[bookName]);
+                const bookAge = formatFreshnessAge(bookTs);
+                const kAge = formatFreshnessAge(kTrade);
+                const titleBits = [bookName];
+                if (bookAge) titleBits.push('updated ' + bookAge + ' ago');
+                if (!isKalshi && kAge) titleBits.push('Kalshi last trade ' + kAge + ' ago');
                 
                 booksTableHtml += `
-                    <div class="book-cell ${isKalshi ? 'kalshi-book' : ''} ${isGrayedOut ? 'grayed-out' : ''} ${junkVsKalshi ? 'junk-tile' : ''} ${hasBetterOdds ? 'better-than-kalshi' : ''}" data-book-name="${escapeHtml(bookName)}" data-book-key="${escapeHtml(bookKey)}" title="${escapeHtml(bookName)}">
+                    <div class="book-cell ${isKalshi ? 'kalshi-book' : ''} ${isGrayedOut ? 'grayed-out' : ''} ${junkVsKalshi ? 'junk-tile' : ''} ${hasBetterOdds ? 'better-than-kalshi' : ''}" data-book-name="${escapeHtml(bookName)}" data-book-key="${escapeHtml(bookKey)}" title="${escapeHtml(titleBits.join(' · '))}">
                         <div class="book-logo">${logoHtml}</div>
                         <div class="book-odds" data-book-odds="${bookOdds}">${bookOdds > 0 ? '+' : ''}${bookOdds}</div>
                         ${bookLimitDisplay ? `<div class="book-limit" data-book-limit="${bookLimit}">${bookLimitDisplay}</div>` : ''}
+                        ${bookAge ? `<div class="book-fresh">${escapeHtml(bookAge)}</div>` : ''}
                     </div>
                 `;
             });
@@ -827,6 +860,10 @@ function createAlertCard(alert) {
     }
     const mt = (alert.market_type || '').trim();
     const marketTitle = mt ? toTitleCaseWords(mt) : 'Market';
+    const kTradeAge = formatFreshnessAge(alert.kalshi_last_trade_ts);
+    const kTradeBadge = kTradeAge
+        ? `<span class="alert-liq-badge" title="Kalshi last trade age vs per-book last update">K last ${escapeHtml(kTradeAge)}</span>`
+        : '';
 
     card.innerHTML = `
         <div class="alert-header-bb alert-header-bb--grid">
@@ -834,6 +871,7 @@ function createAlertCard(alert) {
                 <div class="market-row-bb">
                     <span class="market-type-bb">${escapeHtml(marketTitle)}</span>
                     <span class="alert-liq-badge" title="Kalshi line limit / stake from Odds-API (if provided)">Liq ${escapeHtml(liqBadge)}</span>
+                    ${kTradeBadge}
                     <span class="ev-source-sub" title="${escapeHtml(evSourceTitle)}">${escapeHtml(evSourceLabel)}</span>
                 </div>
                 <div class="teams-bb">${escapeHtml(alert.teams)}</div>

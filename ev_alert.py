@@ -36,6 +36,8 @@ class EvAlert:
         self.strict_pass = bool(data.get("strict_pass", True))
         # How the opportunity was discovered: e.g. odds_api_value_bets vs local_odds_scan (future).
         self.ev_source = str(data.get("ev_source") or "odds_api_value_bets")
+        self.book_updated_at = data.get("book_updated_at") or {}
+        self.kalshi_last_trade_ts = data.get("kalshi_last_trade_ts")
 
     def extract_ticker_from_url(self):
         """Extract Kalshi ticker from market URL."""
@@ -63,4 +65,6 @@ class EvAlert:
             "timestamp": self.timestamp.isoformat(),
             "strict_pass": self.strict_pass,
             "ev_source": self.ev_source,
+            "book_updated_at": self.book_updated_at or {},
+            "kalshi_last_trade_ts": self.kalshi_last_trade_ts,
         }

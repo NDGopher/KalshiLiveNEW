@@ -1270,6 +1270,13 @@ body.dark .filter-name-badge-block {
     box-shadow: 0 4px 8px var(--shadow);
 }
 
+.book-fresh {
+    font-size: 10px;
+    line-height: 1.2;
+    color: var(--text-tertiary);
+    margin-top: 2px;
+}
+
 .book-cell.kalshi-book {
     background: rgba(31, 213, 154, 0.1);
     border-color: var(--accent);

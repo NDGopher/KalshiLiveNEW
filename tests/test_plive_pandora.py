@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from plive_pandora import (
+    EXPECTED_SUBSCRIBED_ROOMS,
+    EXPECTED_SYSTEM_EVENT_ROOMS,
     PLIVE_BOOK_NAME,
     PLIVE_LINE_SET,
     PLIVE_PARTNER_ID,
@@ -9,8 +11,10 @@ from plive_pandora import (
     PliveStore,
     coeff_room_for_event,
     event_id_from_channel,
+    extra_local_bookmakers,
     handshake_emits,
     match_plive_event_to_odds_doc,
+    note_handshake_ack,
     parse_coeff_path,
     parse_sport_hash,
     plive_wanted,
@@ -97,6 +101,16 @@ def test_team_match_to_odds_doc():
     assert PLIVE_BOOK_NAME == "PLive"
 
 
+def test_plive_is_its_own_book_not_betfair():
+    from odds_api_client import _canonical_odds_api_bookmaker, api_wire_bookmakers
+
+    assert _canonical_odds_api_bookmaker("PLive") == "PLive"
+    assert _canonical_odds_api_bookmaker("plive") == "PLive"
+    assert _canonical_odds_api_bookmaker("PLive") != "Betfair Exchange"
+    assert "PLive" not in api_wire_bookmakers(["PLive", "Betfair Exchange", "Kalshi"])
+    assert extra_local_bookmakers() == ["PLive"] or extra_local_bookmakers() == []
+
+
 def test_sport_1_filter_drops_other_sports():
     store = PliveStore()
     store.apply_meta("mlb", {"sportId": 1, "home": "A", "away": "B"})
@@ -119,6 +133,11 @@ def test_handshake_matches_public_ui():
     assert f"live.main.{PLIVE_LINE_SET}.eventData" in topics
     assert f"live.main.{PLIVE_LINE_SET}.eventCoefficients" in topics
     assert emits[3][1] == topics
+    for room in EXPECTED_SUBSCRIBED_ROOMS:
+        assert room in topics
+    assert EXPECTED_SYSTEM_EVENT_ROOMS == ("system-events", "notifications.partner.113")
+    assert note_handshake_ack("setSocketMetadata", {"event": "socketMetadataSet", "data": {}}) == "socketMetadataSet"
+    assert note_handshake_ack("subscribedSystemEvents", {"rooms": list(EXPECTED_SYSTEM_EVENT_ROOMS)}) == "subscribedSystemEvents"
 
 
 def test_sport_hash_top_soccer_is_220_not_mlb():
