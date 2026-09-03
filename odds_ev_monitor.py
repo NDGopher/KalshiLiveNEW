@@ -74,6 +74,7 @@ from plive_pandora import (
     peek_shared_plive_feed,
     plive_wanted,
 )
+from stoppage_gate import live_take_blocked_by_stoppage, merge_event_clock_fields
 
 _DOTENV_BOOTSTRAP_DONE = False
 _MONITOR_MASTER_BOOKS_LOGGED = False
@@ -83,6 +84,39 @@ def _reload_dotenv_safely() -> None:
     """Re-apply .env from project root and cwd (override=True)."""
     load_dotenv(_DOTENV_SCRIPT, override=True, encoding="utf-8-sig")
     load_dotenv(_DOTENV_CWD, override=True, encoding="utf-8-sig")
+
+
+def _ws_event_meta(event_id: Any) -> Optional[Dict[str, Any]]:
+    feed = peek_shared_odds_ws_feed()
+    if feed is None or event_id is None:
+        return None
+    try:
+        return feed.store.event_meta.get(int(event_id))
+    except (TypeError, ValueError):
+        return None
+
+
+def _clock_event_for_value_bet(
+    vb: Dict[str, Any],
+    odds_doc: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    ev = vb.get("event") if isinstance(vb.get("event"), dict) else {}
+    return merge_event_clock_fields(ev, odds_doc, _ws_event_meta(vb.get("eventId")))
+
+
+def _stoppage_drop_reason(
+    vb: Dict[str, Any],
+    odds_doc: Optional[Dict[str, Any]],
+    *,
+    enabled: Optional[bool] = None,
+) -> Optional[str]:
+    """Odds-API clock/statusDetail only. Never BookieBeats."""
+    if enabled is None:
+        enabled = bool(getattr(OddsEVMonitor, "stoppages_only", False))
+    return live_take_blocked_by_stoppage(
+        _clock_event_for_value_bet(vb, odds_doc),
+        enabled=enabled,
+    )
 
 
 def print_env_debug(*, standalone: bool = False) -> None:
@@ -1080,6 +1114,8 @@ class OddsEVMonitor:
     include_pregame_value_bets: bool = False
     # Diagnostic broad scan: when True, merge pregame /events (slower; extra HTTP per sport). Off until UI enables it.
     broad_scan_include_pregame: bool = False
+    # Live takes only when Odds-API clock is stopped (or Halftime/Break). Off by default. Never BookieBeats.
+    stoppages_only: bool = False
     # Serialize broad-scan HTTP across filters (same process) to avoid duplicate /events/live + /odds/multi bursts.
     _broad_scan_lock: Optional[asyncio.Lock] = None
 
@@ -2044,8 +2080,23 @@ class OddsEVMonitor:
                 "home": home,
                 "away": away,
                 "league": league_obj,
+                "sport": doc.get("sport") or raw_ev.get("sport"),
+                "sport_slug": doc.get("sport_slug") or raw_ev.get("sport_slug"),
                 "live": is_live,
                 "status": doc.get("status") or doc.get("state") or raw_ev.get("status") or raw_ev.get("state"),
+                "clock": doc.get("clock") if doc.get("clock") is not None else raw_ev.get("clock"),
+                "statusDetail": (
+                    doc.get("statusDetail")
+                    or raw_ev.get("statusDetail")
+                    or doc.get("status_detail")
+                    or raw_ev.get("status_detail")
+                ),
+                "status_detail": (
+                    doc.get("status_detail")
+                    or raw_ev.get("status_detail")
+                    or doc.get("statusDetail")
+                    or raw_ev.get("statusDetail")
+                ),
             }
             for mname, kal_mk in _kalshi_scan_gameline_markets(bks):
                 odds_rows = kal_mk.get("odds") or []
@@ -2153,6 +2204,12 @@ class OddsEVMonitor:
             )
             if _diagnostic_mode():
                 self._pipeline_log_game_if_new(vb, odds_doc)
+            stop_reason = _stoppage_drop_reason(vb, odds_doc)
+            if stop_reason:
+                print(
+                    f"[PIPELINE] Stoppages Only drop reason={stop_reason} | {teams} | {mname} | side={bet_side}"
+                )
+                continue
             takes = [str(vb["_take_only"])] if vb.get("_take_only") else ["Kalshi", "PLive"]
             kept_any = False
             for take in takes:
@@ -2318,6 +2375,12 @@ class OddsEVMonitor:
             odds_doc = odds_by_id.get(int(eid)) if eid is not None else None
             if _diagnostic_mode():
                 self._pipeline_log_game_if_new(vb, odds_doc)
+            stop_reason = _stoppage_drop_reason(vb, odds_doc)
+            if stop_reason:
+                ev_obj = vb.get("event") or {}
+                teams = f"{ev_obj.get('away') or ''} @ {ev_obj.get('home') or ''}".strip()
+                print(f"[PIPELINE] Stoppages Only drop reason={stop_reason} | {teams}")
+                continue
             for take in ("Kalshi", "PLive"):
                 built = self._value_bet_to_normalized_bet(vb, odds_doc, take_book=take)
                 if not built:

@@ -99,6 +99,7 @@ socket.on('connect', () => {
     loadAutoBetSettings();
     loadAlertFeedPrefs();
     loadBroadScanPregame();
+    loadStoppagesOnly();
 });
 
 socket.on('disconnect', () => {
@@ -627,7 +628,7 @@ function impliedProbFromAmerican(am) {
     return Math.abs(n) / (Math.abs(n) + 100);
 }
 
-/** Same 10c-from-take / real-sign-flip test as ev_calculator.is_junk_vs_kalshi. */
+/** Same 10c-from-take / real-sign-flip test as ev_calculator.is_junk_vs_kalshi. Pick'em +113/−110 is not junk. */
 function isJunkVsKalshi(bookAmerican, kalshiAmerican) {
     const b = Number(bookAmerican);
     const k = Number(kalshiAmerican);
@@ -1744,6 +1745,76 @@ if (broadScanPregameCb) {
     });
 }
 
+function isBaseballSportSelection() {
+    const sel = document.getElementById('odds-sport-sel');
+    const raw = sel && sel.value ? String(sel.value) : '';
+    const sport = raw.split('|')[0].trim().toLowerCase();
+    return sport === 'baseball' || sport === 'mlb';
+}
+
+function syncStoppagesOnlyForSport() {
+    const el = document.getElementById('stoppages-only');
+    const label = document.getElementById('stoppages-only-label');
+    if (!el) return;
+    const baseball = isBaseballSportSelection();
+    el.disabled = baseball;
+    const liveTitle =
+        'Live takes only when Odds-API clock exists and clock.running is false, or statusDetail is Halftime/Break. Omitted clock fails closed. Baseball unsupported.';
+    const mlbTitle =
+        'MLB has no Odds-API clock. statusDetail is inning-only (1st inning…9th inning). Do not invent mid-inning or between-innings.';
+    el.title = baseball ? mlbTitle : liveTitle;
+    if (label) {
+        label.title = el.title;
+        label.classList.toggle('is-disabled', baseball);
+    }
+}
+
+async function loadStoppagesOnly() {
+    const el = document.getElementById('stoppages-only');
+    if (!el) return;
+    try {
+        const response = await fetch('/api/stoppages_only');
+        const data = await response.json();
+        if (data.enabled !== undefined) {
+            el.checked = !!data.enabled;
+        }
+    } catch (error) {
+        console.error('Error loading Stoppages Only toggle:', error);
+    }
+    syncStoppagesOnlyForSport();
+}
+
+async function saveStoppagesOnly(enabled) {
+    try {
+        const response = await fetch('/api/stoppages_only', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled: !!enabled }),
+        });
+        const data = await response.json();
+        if (data.enabled !== undefined) {
+            showToast(
+                'success',
+                enabled
+                    ? 'Stoppages Only: live takes require a stopped Odds-API clock or Halftime/Break'
+                    : 'Stoppages Only off',
+                null
+            );
+        }
+    } catch (error) {
+        console.error('Error saving Stoppages Only toggle:', error);
+        showToast('error', 'Failed to update Stoppages Only', null);
+    }
+}
+
+const stoppagesOnlyCb = document.getElementById('stoppages-only');
+if (stoppagesOnlyCb) {
+    stoppagesOnlyCb.addEventListener('change', () => {
+        if (stoppagesOnlyCb.disabled) return;
+        saveStoppagesOnly(stoppagesOnlyCb.checked);
+    });
+}
+
 // --- Dashboard | Odds board tabs (header; uses /api/live_odds) ---
 (function () {
     const tabAlerts = document.getElementById('tab-btn-dashboard');
@@ -1937,6 +2008,8 @@ if (broadScanPregameCb) {
     [sportSel, timingSel, dateSel].forEach((el) => {
         if (el) el.addEventListener('change', () => { loadOddsOnce(); bumpOddsTimer(); });
     });
+    if (sportSel) sportSel.addEventListener('change', syncStoppagesOnlyForSport);
+    syncStoppagesOnlyForSport();
     if (autoRef) autoRef.addEventListener('change', bumpOddsTimer);
 
     bumpOddsTimer();

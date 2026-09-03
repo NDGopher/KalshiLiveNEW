@@ -65,7 +65,7 @@ from odds_api_client import (
     odds_api_sports_list,
     sport_slug_query_for_api,
 )
-from odds_api_ws import resolve_odds_docs
+from odds_api_ws import peek_shared_odds_ws_feed, resolve_odds_docs
 from plive_pandora import (
     extra_local_bookmakers,
     merge_plive_into_docs,
@@ -73,6 +73,7 @@ from plive_pandora import (
     plive_wanted,
 )
 from ev_calculator import decimal_to_american
+from stoppage_gate import clock_fields_for_live_odds
 
 
 def monitor_poll_seconds() -> float:
@@ -1031,6 +1032,11 @@ async def _live_odds_build_snapshot_with_client(
         dt = _parse_event_start(e)
         if dt is not None:
             start_s = dt.astimezone().strftime("%Y-%m-%d %H:%M %Z")
+        ws_meta = None
+        _ws = peek_shared_odds_ws_feed()
+        if _ws is not None:
+            ws_meta = _ws.store.event_meta.get(eid)
+        clock_fields = clock_fields_for_live_odds(e, doc, ws_meta)
         rows_out.append(
             {
                 "event_id": eid,
@@ -1038,7 +1044,16 @@ async def _live_odds_build_snapshot_with_client(
                 "league": league_s,
                 "sport_slug": _sport_slug_event(e),
                 "live": _event_is_live(e),
-                "status": str(e.get("status") or e.get("state") or ""),
+                "status": str(
+                    e.get("status")
+                    or e.get("state")
+                    or (doc or {}).get("status")
+                    or (ws_meta or {}).get("status")
+                    or ""
+                ),
+                "clock": clock_fields["clock"],
+                "clock_running": clock_fields["clock_running"],
+                "statusDetail": clock_fields["statusDetail"],
                 "start_display": start_s,
                 "market": ml_name,
                 "books": prices,
@@ -7422,6 +7437,21 @@ def set_max_bet():
 def get_max_bet():
     """Get user's max bet amount"""
     return jsonify({'max_bet_amount': user_max_bet_amount})
+
+
+@app.route("/api/stoppages_only", methods=["GET", "POST"])
+def stoppages_only():
+    """Odds-API clock/statusDetail stoppage filter. Off by default. Never BookieBeats."""
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        EvMonitorImpl.stoppages_only = bool(data.get("enabled", False))
+        print(f"[DASHBOARD] Stoppages Only={EvMonitorImpl.stoppages_only} (Odds-API clock only)")
+    return jsonify(
+        {
+            "enabled": bool(getattr(EvMonitorImpl, "stoppages_only", False)),
+            "baseball_supported": False,
+        }
+    )
 
 
 @app.route("/api/broad_scan_pregame", methods=["GET", "POST"])

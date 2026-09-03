@@ -32,8 +32,10 @@ from ev_calculator import (
     fair_books_for_panel,
     filter_sharp_panel,
     is_junk_vs_kalshi,
+    is_novig_book,
     is_plive_book,
     is_real_sign_flip,
+    novig_better_than_take,
 )
 
 
@@ -413,10 +415,11 @@ def test_junk_vs_kalshi_ten_cent_or_sign_flip():
     assert is_junk_vs_kalshi(228, 245) is False  # ~1.5c stays
     assert is_junk_vs_kalshi(-139, -133) is False  # ~1c keep, not red (−139 worse)
     assert is_junk_vs_kalshi(-270, -133) is True  # ~16c
-    assert is_junk_vs_kalshi(-154, 186) is True  # real sign flip
+    assert is_junk_vs_kalshi(-154, 186) is True  # real sign flip / ~26c off-pack
     # Pick'em around 50% is not a flip (Brewers +113 vs −110).
     assert is_real_sign_flip(-110, 113) is False
     assert is_junk_vs_kalshi(-110, 113) is False
+    assert is_junk_vs_kalshi(113, -110) is False
     assert is_real_sign_flip(-154, 186) is True
 
 
@@ -537,3 +540,61 @@ def test_plive_card_may_use_kalshi_in_fair():
     fair = fair_books_excluding_take(plive_card["surviving"], "PLive")
     assert any(is_plive_book(b.get("name")) is False for b in fair)
     assert any(str(b.get("name")) == "Kalshi" for b in fair)
+
+
+def _fixture_kill_plus335_nv_better_tied_rec():
+    """KILL tape: Kalshi +335 vs BF +320 / FD +300 / CZ +300 / NV +456.
+
+    Take is ~1c better than nearest rec (BF) and worse than NV. Printed
+    +0.81% is noise — nv_better and tied_rec both drop the plus card.
+    """
+    return 335, [
+        _book("BF", 320),
+        _book("FD", 300),
+        _book("CZ", 300),
+        _book("NV", 456),
+    ]
+
+
+def test_kill_plus335_nv_better_and_tied_rec_no_plus():
+    """KILL: Kalshi +335 vs +320/+300/+300 and NV +456 must not print +0.81%."""
+    kalshi, books = _fixture_kill_plus335_nv_better_tied_rec()
+    assert is_novig_book("NV") is True
+    assert is_junk_vs_kalshi(456, 335) is False
+    assert novig_better_than_take(books, kalshi) is True
+    out = evaluate_sharp_panel_ev(books, kalshi, min_sharp_books=3)
+    assert "NV" in out["surviving_names"]
+    assert {"BF", "FD", "CZ"}.issubset(set(out["surviving_names"]))
+    assert "nv_better" in out["reasons"]
+    assert "tied_rec" in out["reasons"]
+    assert out["plus_alert"] is False
+    assert out["ev_percent"] <= 0.0
+
+
+def test_tied_rec_alone_does_not_kill_astros_keep():
+    """Control: Kalshi −133 best, NV −139 ~1c worse. tied_rec must not fire alone."""
+    kalshi, books = _fixture_keep_cws_hou_astros_ml()
+    assert novig_better_than_take(books, kalshi) is False
+    out = evaluate_sharp_panel_ev(books, kalshi, min_sharp_books=3)
+    assert "nv_better" not in out["reasons"]
+    assert "tied_rec" not in out["reasons"]
+    assert out["plus_alert"] is True
+    assert 1.0 <= out["ev_percent"] <= 5.5
+
+
+def test_pickem_plus113_vs_minus110_survives_panel():
+    """+113 vs −110 is pick'em juice, not an off-pack sign-flip."""
+    books = [_book("A", -110), _book("B", 105), _book("C", -105)]
+    surviving = filter_sharp_panel(books, kalshi_american=113)
+    names = {b["name"] for b in surviving}
+    assert names == {"A", "B", "C"}
+
+
+def test_long_plus_tight_pack_two_way_power_not_fake_seven():
+    """Astros −1.5-style long plus vs a tight pack must not invent 7–14% from raw implied."""
+    kalshi = 355
+    books = [_book("A", 320), _book("B", 340), _book("C", 345), _book("D", 310)]
+    out = evaluate_sharp_panel_ev(books, kalshi, min_sharp_books=3)
+    assert out["raw_ev_percent"] < 7.0
+    assert out["ev_percent"] < 7.0
+    assert "nv_better" not in out["reasons"]

@@ -47,6 +47,56 @@ MAX_EVENT_IDS = 50
 ALLOWED_CHANNELS = ("odds", "scores", "status")
 ALLOWED_STATUS = ("live", "prematch")
 
+_MLB_CLOCK_LOG_GAP_SEC = 30.0
+
+
+def _copy_ws_clock_fields(meta: Dict[str, Any], src: Dict[str, Any]) -> None:
+    """Persist Odds-API clock / statusDetail. Do not invent baseball innings."""
+    nest = src.get("event") if isinstance(src.get("event"), dict) else {}
+    for blob in (src, nest):
+        if not isinstance(blob, dict):
+            continue
+        if blob.get("clock") is not None:
+            meta["clock"] = blob.get("clock")
+        for key in ("statusDetail", "status_detail"):
+            if blob.get(key) is not None:
+                meta["statusDetail"] = blob.get(key)
+                meta[key] = blob.get(key)
+        if blob.get("sport") is not None:
+            meta["sport"] = blob.get("sport")
+        if blob.get("league") is not None:
+            meta["league"] = blob.get("league")
+
+
+def maybe_log_mlb_clock_sample(
+    store: "OddsWsStore",
+    event_id: int,
+    meta: Dict[str, Any],
+    *,
+    source: str,
+) -> None:
+    """Sample raw MLB clock + statusDetail from the WS. Never call BookieBeats."""
+    try:
+        from stoppage_gate import is_baseball_event
+    except Exception:
+        return
+    detail_hint = str(meta.get("statusDetail") or meta.get("status_detail") or "")
+    if not is_baseball_event(meta) and "inning" not in detail_hint.lower():
+        return
+    now = time.time()
+    last = store.mlb_clock_log_at.get(event_id) or 0.0
+    if now - last < _MLB_CLOCK_LOG_GAP_SEC:
+        return
+    store.mlb_clock_log_at[event_id] = now
+    clock = meta.get("clock")
+    detail = meta.get("statusDetail")
+    if detail is None:
+        detail = meta.get("status_detail")
+    print(
+        f"[ODDS-WS] MLB clock sample source={source} event_id={event_id} "
+        f"status={meta.get('status')!r} statusDetail={detail!r} clock={clock!r}"
+    )
+
 # Odds-channel types that carry per-book markets.
 ODDS_MARKET_TYPES = frozenset({"created", "updated", "deleted", "no_markets"})
 
@@ -111,7 +161,8 @@ def parse_ws_channels(raw: Any = None) -> List[str]:
     """
     vals = [v.lower() for v in _parse_csv_values(raw if raw is not None else os.getenv("ODDS_API_WS_CHANNELS"))]
     if not vals:
-        vals = ["odds"]
+        # scores + status carry clock / statusDetail (needed for Stoppages Only + MLB samples).
+        vals = ["odds", "scores", "status"]
     unknown = [v for v in vals if v not in ALLOWED_CHANNELS]
     if unknown:
         raise WsFilterError(f"Invalid channel: {unknown[0]}. Allowed: odds, scores, status")
@@ -377,6 +428,9 @@ class OddsWsStore:
     books: Dict[Tuple[int, str], List[Dict[str, Any]]] = field(default_factory=dict)
     # Last time we replaced that book's markets (WS created/updated or REST snapshot).
     book_updated_at: Dict[Tuple[int, str], float] = field(default_factory=dict)
+    # Rate-limit raw MLB clock/statusDetail samples so we can see if Odds-API
+    # ever sends top/bottom or Break (docs only list "1st inning"…"9th inning").
+    mlb_clock_log_at: Dict[int, float] = field(default_factory=dict)
     generation: int = 0
 
     def note_seq(self, seq: Any) -> Optional[int]:
@@ -413,10 +467,13 @@ class OddsWsStore:
                 # Odds-API clock.running is timed sports only (NBA/NFL/soccer).
                 # MLB has no inning / pitching-change field — do not invent one.
                 "clock",
+                "statusDetail",
+                "status_detail",
             ):
                 if ev.get(key) is not None:
                     meta[key] = ev.get(key)
             meta["id"] = eid
+            maybe_log_mlb_clock_sample(self, eid, meta, source="slate")
 
     def apply_rest_docs(self, docs: Iterable[Dict[str, Any]]) -> None:
         """Ingest /odds or /odds/multi snapshots (replace each book's markets)."""
@@ -466,10 +523,8 @@ class OddsWsStore:
         if t == "score":
             if eid is not None:
                 meta = self.event_meta.setdefault(eid, {"id": eid})
-                if msg.get("scores") is not None:
-                    meta["scores"] = msg.get("scores")
-                if msg.get("clock") is not None:
-                    meta["clock"] = msg.get("clock")
+                _copy_ws_clock_fields(meta, msg)
+                maybe_log_mlb_clock_sample(self, eid, meta, source="score")
             return AppliedMessage(type="score", event_id=eid, seq=seq, dirty=False)
 
         if t == "status":
@@ -479,8 +534,8 @@ class OddsWsStore:
                     meta["status"] = msg.get("status")
                 if msg.get("scores") is not None:
                     meta["scores"] = msg.get("scores")
-                if msg.get("clock") is not None:
-                    meta["clock"] = msg.get("clock")
+                _copy_ws_clock_fields(meta, msg)
+                maybe_log_mlb_clock_sample(self, eid, meta, source="status")
                 st = str(msg.get("status") or "").lower()
                 if st in ("settled", "cancelled"):
                     to_drop = [k for k in self.books if k[0] == eid]

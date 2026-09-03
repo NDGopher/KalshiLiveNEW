@@ -1180,6 +1180,10 @@ body.dark .filter-name-badge-block {
 }
 
 .scan-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 12px 18px;
     flex: 1 1 220px;
     padding: 10px 14px;
     border: 1px solid var(--border);
@@ -1197,6 +1201,12 @@ body.dark .filter-name-badge-block {
     color: var(--text-primary);
     cursor: pointer;
     user-select: none;
+}
+
+.scan-toggle-label.is-disabled,
+.scan-toggle-label:has(input:disabled) {
+    opacity: 0.55;
+    cursor: not-allowed;
 }
 
 .controls-wrapper--flex {

@@ -42,6 +42,9 @@ SHARP_ADJACENT_GROW = 0.03
 # Replaces a global-median / pack-median outlier screen. DK +228 vs +245 (~1.5c) stays.
 JUNK_VS_KALSHI_CENTS = 0.10
 SHARP_EGREGIOUS_GAP = JUNK_VS_KALSHI_CENTS
+# |implied(Kalshi) − nearest non-junk rec|. Only drops a plus with nv_better
+# or when Kalshi is not best — never alone (KEEP Astros −133 vs NV −139 is ~1c).
+TIED_REC_CENTS = 0.015
 BETTER_BOOKS_KILL = 3
 MEDIAN_GATE_TOL = 0.005
 # Identity band. KEEP boards with ~8c of juice (57c vs 65c) must not match this.
@@ -168,7 +171,11 @@ def implied_prob_from_american(american: int) -> Optional[float]:
 
 
 def is_sign_flip_american(book_american: int, kalshi_american: int) -> bool:
-    """Plus vs minus on the same pick. Even money is not a flip."""
+    """Plus vs minus on the same pick. Even money is not a flip.
+
+    Pick'em juice (+113 vs −110) is a sign change around 50% — not junk by itself.
+    Off-pack sign-flips (+186 vs −154) fail the 10c implied gap.
+    """
     b, k = int(book_american), int(kalshi_american)
     if b == 0 or k == 0:
         return False
@@ -203,7 +210,7 @@ def is_junk_vs_kalshi(
     """Display and fair share this test. True → gray tile and drop from POWER/AVERAGE.
 
     Junk if |implied − take implied| > 10 cents, or a real (sided) sign flip.
-    Pick'em plus/minus around 50% is not junk.
+    Pick'em plus/minus around 50% (+113 vs −110) is not junk.
     """
     if is_real_sign_flip(book_american, kalshi_american):
         return True
@@ -223,23 +230,35 @@ def kalshi_adjacent_pack(
 ) -> List[Dict[str, Any]]:
     """Consensus recs next to Kalshi. Does not use a global all-book median.
 
-    Seed = books within ``seed`` of Kalshi implied (same side of 0.50).
-    Grow by attaching books within ``grow`` of someone already in the pack.
-    A far steam cluster is a second mode and stays out.
+    Seed = books within ``seed`` of Kalshi implied (same side of 0.50, or
+    pick'em juice straddling even). Grow by attaching books within ``grow``
+    of someone already in the pack. A far steam cluster stays out.
     """
     rows = [b for b in (books or []) if float(b.get("decimal_pick") or 0) > 1.0]
     if not rows:
         return []
     k_dec = american_to_decimal(int(kalshi_american))
     k_imp = (1.0 / k_dec) if k_dec > 1.0 else 0.5
+
+    def _same_market_side(p: float) -> bool:
+        # Pick'em: +113 vs −110 is one market. Even money (k_imp==0.5) must
+        # not treat −149 juice as the same side of a zero product.
+        if abs(k_imp - 0.5) <= SHARP_SIGN_FLIP_CLUSTER:
+            return abs(p - 0.5) <= SHARP_SIGN_FLIP_CLUSTER + 0.04
+        return (p - 0.5) * (k_imp - 0.5) >= 0
+
     scored = [(b, _book_implied(b)) for b in rows]
+    # Pick'em juice sits ~5c across even; the 4c favorite seed would isolate one rec.
+    seed_eff = float(seed)
+    if abs(k_imp - 0.5) <= SHARP_SIGN_FLIP_CLUSTER:
+        seed_eff = max(seed_eff, JUNK_VS_KALSHI_CENTS)
     pack = [
         b
         for b, p in scored
-        if abs(p - k_imp) <= seed and (p - 0.5) * (k_imp - 0.5) >= 0
+        if abs(p - k_imp) <= seed_eff and _same_market_side(p)
     ]
     if not pack:
-        same = [(b, p) for b, p in scored if (p - 0.5) * (k_imp - 0.5) >= 0]
+        same = [(b, p) for b, p in scored if _same_market_side(p)]
         same.sort(key=lambda t: abs(t[1] - k_imp))
         pack = [b for b, _ in same[:1]] if same else []
     if not pack:
@@ -251,7 +270,7 @@ def kalshi_adjacent_pack(
         for b, p in scored:
             if any(b is x for x in pack):
                 continue
-            if abs(p - k_imp) > seed:
+            if abs(p - k_imp) > seed_eff:
                 continue
             if min(abs(p - q) for q in pack_imps) <= grow:
                 pack.append(b)
@@ -306,6 +325,12 @@ def is_polymarket_book(name: Any) -> bool:
     return "polymarket" in key or key in ("poly", "pm")
 
 
+def is_novig_book(name: Any) -> bool:
+    """NoVig / Novig / NV — take book. Better NV suppresses a Kalshi plus card."""
+    key = _book_name_key(name)
+    return key in {"novig", "nv"} or key.startswith("novig")
+
+
 def exclude_plive_from_fair(books: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [b for b in (books or []) if not is_plive_book(b.get("name"))]
 
@@ -324,6 +349,50 @@ def fair_books_excluding_take(
             continue
         out.append(b)
     return out
+
+
+def novig_better_than_take(
+    survivors: List[Dict[str, Any]],
+    take_american: int,
+) -> bool:
+    """True when a non-junk NV quote is strictly better than the take (higher decimal)."""
+    for book in survivors or []:
+        if not is_novig_book(book.get("name")):
+            continue
+        try:
+            am = int(book.get("american"))
+        except (TypeError, ValueError):
+            continue
+        if is_junk_vs_kalshi(am, int(take_american)):
+            continue
+        if american_is_strictly_better(am, int(take_american)):
+            return True
+    return False
+
+
+def nearest_non_junk_implied_gap(
+    survivors: List[Dict[str, Any]],
+    kalshi_american: int,
+) -> Optional[float]:
+    """|implied(Kalshi) − implied(nearest non-junk survivor)| in probability points."""
+    k_imp = implied_prob_from_american(int(kalshi_american))
+    if k_imp is None:
+        return None
+    best: Optional[float] = None
+    for book in survivors or []:
+        try:
+            am = int(book.get("american"))
+        except (TypeError, ValueError):
+            continue
+        if is_junk_vs_kalshi(am, int(kalshi_american)):
+            continue
+        p = implied_prob_from_american(am)
+        if p is None:
+            continue
+        gap = abs(k_imp - p)
+        if best is None or gap < best:
+            best = gap
+    return best
 
 
 def filter_sharp_panel(
@@ -511,6 +580,21 @@ def apply_ev_hard_gates(
         allow_plus = False
         reasons.append("better_books")
 
+    nv_better = novig_better_than_take(survivors, kalshi_american)
+    if nv_better:
+        ev = min(ev, 0.0)
+        allow_plus = False
+        reasons.append("nv_better")
+
+    # tied_rec never fires alone. KEEP Astros −133 vs NV −139 is ~1c and Kalshi is best.
+    tied_gap = nearest_non_junk_implied_gap(survivors, kalshi_american)
+    tied_rec = tied_gap is not None and tied_gap <= TIED_REC_CENTS + 1e-12
+    kalshi_best = better == 0
+    if tied_rec and (nv_better or not kalshi_best):
+        ev = min(ev, 0.0)
+        allow_plus = False
+        reasons.append("tied_rec")
+
     plus_alert = bool(allow_plus and ev > 0.0)
     return {
         "ev_percent": ev,
@@ -536,6 +620,7 @@ def evaluate_sharp_panel_ev(
 
     Returns surviving books, EV, and whether a plus alert may print.
     Does not mention teams or tickers — callers pass anonymous boards.
+    PLive never sits in a Kalshi take's fair. Kalshi may sit in a PLive take's fair.
     """
     surviving = filter_sharp_panel(books, kalshi_american=kalshi_american)
     fair_eligible = fair_books_excluding_take(surviving, take_book)
