@@ -1605,8 +1605,10 @@ def _build_display_books_payload(
             # Never paint Odds-API / Kalshi-copied PLive. Missing live Draw
             # omits the tile; Kalshi-take can still print.
             continue
-        if is_plive_book(nm) and _market_is_total(mname):
-            # Fail-closed: PLive 1.75 is not a 1.8 / 2.0 / 2.5 tile.
+        if _market_is_total(mname):
+            # Exact strike only. Kalshi soccer totals are halves (1.5 / 2.5).
+            # PLive 1.75 must not join Kalshi 1.5/2.5 or a rounded 1.8.
+            # Missing strike → omit the tile (Kalshi is not required on 1.75).
             ref_ln = total_line_value(ref) if ref else None
             row_ln = total_line_value(row)
             if ref_ln is None or row_ln is None or not _numeric_close(ref_ln, row_ln):

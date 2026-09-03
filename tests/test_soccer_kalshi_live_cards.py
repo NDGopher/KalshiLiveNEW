@@ -619,7 +619,6 @@ def test_soccer_store_scan_matches_baseball_bar_live_coeff_exact_line():
         },
     )
     under175 = american_to_decimal(186)
-    kalshi_under = american_to_decimal(140)
     store.apply_message(
         {
             "isDiff": False,
@@ -653,7 +652,14 @@ def test_soccer_store_scan_matches_baseball_bar_live_coeff_exact_line():
             "Kalshi": [
                 {
                     "name": "Totals",
-                    "odds": [{"max": 1.75, "over": 1.55, "under": kalshi_under, "href": ""}],
+                    "odds": [
+                        {
+                            "max": 2.5,
+                            "over": 1.55,
+                            "under": american_to_decimal(140),
+                            "href": "",
+                        }
+                    ],
                 }
             ],
             "Betfair Exchange": [
@@ -673,7 +679,7 @@ def test_soccer_store_scan_matches_baseball_bar_live_coeff_exact_line():
         and r.get("betSide") == "under"
         and abs(float((r.get("_canonical_kalshi_row") or {}).get("hdp") or 0) - 1.75) < 1e-9
     ]
-    kalshi_u = [
+    kalshi_175 = [
         r
         for r in rows
         if r.get("_take_only") == "Kalshi"
@@ -681,16 +687,17 @@ def test_soccer_store_scan_matches_baseball_bar_live_coeff_exact_line():
         and abs(float((r.get("market") or {}).get("max") or 0) - 1.75) < 1e-9
     ]
     assert plive_u
-    assert kalshi_u
+    assert kalshi_175 == []
     plive = mon._value_bet_to_normalized_bet(plive_u[0], doc, take_book="PLive")
     assert plive is not None
     assert plive["take_book"] == "PLive"
     assert plive["qualifier"] == "1.75"
     assert plive["qualifier"] != "1.8"
     assert int(plive["odds"]) == 186
-    assert int(plive["odds"]) != 140
     assert plive["autobet_allow"] is False
-    assert (plive["displayBooks"][plive["selection"]] or [])[0]["book"] == "PLive"
+    tiles = plive["displayBooks"][plive["selection"]] or []
+    assert tiles[0]["book"] == "PLive"
+    assert all(t.get("book") != "Kalshi" for t in tiles)
     assert mon._value_bet_to_normalized_bet(plive_u[0], doc, take_book="Kalshi") is None
 
 
@@ -912,6 +919,199 @@ def test_kortrijk_82_under_175_prints_175_not_18_and_not_25():
     )
     assert painted_175["Under"][0]["book"] == "PLive"
     assert int(painted_175["Under"][0]["odds"]) == -316
+
+
+def test_kalshi_soccer_totals_halves_only_plive_keeps_quarters():
+    """Kalshi soccer totals are 1.5 / 2.5 / 3.5. PLive has extra 1.75 / 2.25.
+
+    Independent takes, exact strike. Do not round 1.75 → 1.8 or 1.5.
+    Do not map PLive Under 1.75 onto Kalshi Under 1.5 or 2.5.
+    """
+    store = PliveStore()
+    eid = 2201752
+    store.apply_meta(
+        str(eid),
+        {
+            "sportId": 5,
+            "home": "RSC Anderlecht",
+            "away": "KV Kortrijk",
+            "leagueName": "Belgium Jupiler League",
+            "ip": True,
+        },
+    )
+    plive_u175 = american_to_decimal(186)
+    plive_u225 = american_to_decimal(160)
+    plive_u25 = american_to_decimal(110)
+    kalshi_u25 = american_to_decimal(178)
+    store.apply_message(
+        {
+            "isDiff": False,
+            "payload": {
+                "c": {
+                    "m": {
+                        "5": {
+                            "o": {
+                                "over_1.5": {0: 1.40, 1: 1.50},
+                                "under_1.5": {0: 2.90, 1: 3.10},
+                                "over_1.75": {0: 1.55, 1: 1.61},
+                                "under_1.75": {0: plive_u175, 1: 2.10},
+                                "over_2.25": {0: 1.72, 1: 1.80},
+                                "under_2.25": {0: plive_u225, 1: 2.00},
+                                "over_2.5": {0: 1.85, 1: 1.95},
+                                "under_2.5": {0: plive_u25, 1: 2.05},
+                            }
+                        }
+                    }
+                }
+            },
+        },
+        event_name=f"live.main.{PLIVE_LINE_SET}.eventCoefficients.{eid}",
+    )
+    ident = soccer_totals_identity_rows(store.markets_for_event(str(eid)))
+    by_line = {round(float(r["line"]), 2): r for r in ident}
+    assert set(by_line) >= {1.5, 1.75, 2.25, 2.5}
+    assert 1.8 not in by_line
+    assert by_line[1.75]["under_am"] == 186
+    assert by_line[2.5]["under_am"] == 110
+
+    mon = _soccer_mon()
+    doc = {
+        "id": eid,
+        "home": "RSC Anderlecht",
+        "away": "KV Kortrijk",
+        "sport": {"slug": "football"},
+        "league": {"name": "Belgium Jupiler League"},
+        "live": True,
+        "bookmakers": {
+            "PLive": store.markets_for_event(str(eid)),
+            "Kalshi": [
+                {
+                    "name": "Totals",
+                    "odds": [
+                        {
+                            "max": 2.5,
+                            "hdp": 2.5,
+                            "over": 1.70,
+                            "under": kalshi_u25,
+                            "href": "",
+                        }
+                    ],
+                }
+            ],
+            "Betfair Exchange": [
+                {
+                    "name": "Totals",
+                    "odds": [
+                        {"max": 1.75, "over": 1.55, "under": 2.40},
+                        {"max": 2.5, "over": 1.72, "under": 2.20},
+                    ],
+                }
+            ],
+            "Bet365": [
+                {
+                    "name": "Totals",
+                    "odds": [
+                        {"max": 1.75, "over": 1.56, "under": 2.38},
+                        {"max": 2.5, "over": 1.74, "under": 2.18},
+                    ],
+                }
+            ],
+            "DraftKings": [
+                {
+                    "name": "Totals",
+                    "odds": [
+                        {"max": 1.75, "over": 1.54, "under": 2.42},
+                        {"max": 2.5, "over": 1.73, "under": 2.22},
+                    ],
+                }
+            ],
+            "Polymarket": [
+                {
+                    "name": "Totals",
+                    "odds": [
+                        {"max": 1.75, "over": 1.57, "under": 2.36},
+                        {"max": 2.5, "over": 1.71, "under": 2.24},
+                    ],
+                }
+            ],
+        },
+    }
+    rows = mon.live_scan_value_bets_from_docs({eid: doc})
+    plive_175 = [
+        r
+        for r in rows
+        if r.get("_take_only") == "PLive"
+        and r.get("betSide") == "under"
+        and abs(float((r.get("_canonical_kalshi_row") or {}).get("hdp") or 0) - 1.75) < 1e-9
+    ]
+    kalshi_25 = [
+        r
+        for r in rows
+        if r.get("_take_only") == "Kalshi"
+        and r.get("betSide") == "under"
+        and abs(float((r.get("market") or {}).get("max") or 0) - 2.5) < 1e-9
+    ]
+    kalshi_175 = [
+        r
+        for r in rows
+        if r.get("_take_only") == "Kalshi"
+        and r.get("betSide") == "under"
+        and abs(float((r.get("market") or {}).get("max") or 0) - 1.75) < 1e-9
+    ]
+    assert plive_175
+    assert kalshi_25
+    assert kalshi_175 == []
+
+    plive = mon._value_bet_to_normalized_bet(plive_175[0], doc, take_book="PLive")
+    assert plive is not None
+    assert plive["take_book"] == "PLive"
+    assert plive["qualifier"] == "1.75"
+    assert plive["qualifier"] != "1.8"
+    assert float(plive["line"]) == 1.75
+    assert int(plive["odds"]) == 186
+    tiles = plive["displayBooks"][plive["selection"]] or []
+    assert tiles[0]["book"] == "PLive"
+    assert all(t.get("book") != "Kalshi" for t in tiles)
+    rec_names = {t.get("book") for t in tiles[1:]}
+    assert rec_names <= {"Betfair Exchange", "Bet365", "DraftKings", "Polymarket"}
+    assert mon._value_bet_to_normalized_bet(plive_175[0], doc, take_book="Kalshi") is None
+
+    kalshi = mon._value_bet_to_normalized_bet(kalshi_25[0], doc, take_book="Kalshi")
+    assert kalshi is not None
+    assert kalshi["take_book"] == "Kalshi"
+    assert kalshi["qualifier"] == "2.5"
+    assert float(kalshi["line"]) == 2.5
+    assert int(kalshi["odds"]) == 178
+    k_tiles = kalshi["displayBooks"][kalshi["selection"]] or []
+    assert k_tiles[0]["book"] == "Kalshi"
+    plive_on_k = [t for t in k_tiles if t.get("book") == "PLive"]
+    assert all(int(t["odds"]) != 186 for t in plive_on_k)
+    assert all(int(t["odds"]) != 160 for t in plive_on_k)
+    if plive_on_k:
+        assert int(plive_on_k[0]["odds"]) == 110
+
+    painted_15 = _build_display_books_payload(
+        "Under",
+        doc["bookmakers"],
+        "Totals",
+        "under",
+        ["Kalshi", "PLive"],
+        140,
+        {"max": 1.5, "hdp": 1.5, "line": 1.5},
+        take_book="Kalshi",
+    )
+    assert all(t.get("book") != "PLive" or int(t["odds"]) != 186 for t in painted_15["Under"])
+    painted_175 = _build_display_books_payload(
+        "Under",
+        doc["bookmakers"],
+        "Totals",
+        "under",
+        ["Kalshi", "PLive", "Bet365"],
+        186,
+        {"max": 1.75, "hdp": 1.75, "line": 1.75, "under": plive_u175, "over": 1.55},
+        take_book="PLive",
+    )
+    assert all(t.get("book") != "Kalshi" for t in painted_175["Under"])
 
 
 def test_paper_kalshi_ticker_is_not_kxscan_and_not_executable():

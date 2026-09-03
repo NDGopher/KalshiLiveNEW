@@ -383,6 +383,7 @@ def _floor_strike(market: Dict[str, Any]) -> Optional[float]:
         m = re.search(r"(\d+)$", parts[-1])
         if m:
             n = int(m.group(1))
+            # Kalshi totals are halves only (2 → 2.5). Never invent 1.75 / 1.25.
             return float(n) + 0.5
     return None
 
