@@ -8,12 +8,15 @@ Handshake matches the public live UI at https://plive.becoms.co/live/ :
   After CONNECT:
     1) setSocketMetadata {partnerId: 113, flavor: "live"}
     2) subscribeSystemEvents {partnerId: 113}
-    3) subscribe + getCache for live.sports (names) and
-       live.main.<LINE_SET>.eventData (directory once). live.events is dead.
-    4) Keep eventCoefficients (click-in full book, including alt spreads)
-       and subscribe eventCoefficients.{eventId} per live MLB id.
+    3) subscribe + getCache once for live.sports (catalog names) and
+       live.main.<LINE_SET>.eventData (directory). live.events is dead.
+    4) For each live MLB eventId (sport 1, league 8) subscribe
+       eventCoefficients.{eventId} (click-in full book: run lines, team
+       totals, margins). Unsubscribe that room when the event is finished.
 
-Bare connect is silent. Do not scrape BetBCK. Do not send cookies.
+Do not scrape ``https://plive.becoms.co/live/?#!/event/{id}`` — the hash
+is a client-side route; ``{id}`` is the pandora event id. This is not a
+per-sport price socket. Bare connect is silent. No BetBCK. No cookies.
 
 MLB is catalog sport 1 (hash ``#!/sport/1``). ``#!/sport/220`` is Top Soccer.
 Trust the live.sports catalog over any old Selenium sport map.
@@ -65,6 +68,7 @@ PLIVE_SPORT_CATALOG_FALLBACK: Dict[int, str] = {
 }
 
 _SPORT_HASH_RE = re.compile(r"#!?/sport/(\d+)", re.I)
+_EVENT_HASH_RE = re.compile(r"#!?/event/(\d+)", re.I)
 
 # Ganchrow coefficient tree (live MLB, event 199298371):
 #   /c/m/{market}/o/{outcome}/{index}
@@ -124,6 +128,14 @@ def parse_sport_hash(value: str) -> Optional[int]:
         return None
 
 
+def parse_event_hash(value: str) -> Optional[str]:
+    """Parse ``#!/event/199298371`` — the pandora event id. No HTML fetch."""
+    if not value:
+        return None
+    m = _EVENT_HASH_RE.search(str(value))
+    return m.group(1) if m else None
+
+
 def plive_sport_id() -> int:
     page = (os.getenv("PLIVE_PAGE") or os.getenv("PLIVE_HASH") or "").strip()
     hashed = parse_sport_hash(page)
@@ -151,16 +163,16 @@ def plive_event_coefficients_topic() -> str:
 
 
 def public_ui_subscribe_topics() -> List[str]:
-    """Directory + click-in coeff prefix. ``live.events`` is dead."""
+    """Directory + catalog names only. Per-event prices are ``eventCoefficients.{id}``."""
     flavor = (os.getenv("PLIVE_FLAVOR") or PLIVE_FLAVOR).strip() or PLIVE_FLAVOR
-    return [
+    topics = [
         f"{flavor}.sports",
         plive_event_data_topic(),
-        plive_event_coefficients_topic(),
-        f"{flavor}.leagues",
-        f"{flavor}.wagerTypes",
-        f"{flavor}.sportPeriod",
     ]
+    extra = os.getenv("PLIVE_SUBSCRIBE_ROOMS", "").strip()
+    if extra:
+        topics.extend(p.strip() for p in extra.split(",") if p.strip())
+    return list(dict.fromkeys(topics))
 
 
 def handshake_emits() -> List[Tuple[str, Any]]:
@@ -181,7 +193,6 @@ EXPECTED_SYSTEM_EVENT_ROOMS = ("system-events", "notifications.partner.113")
 EXPECTED_SUBSCRIBED_ROOMS = (
     "live.sports",
     f"live.main.{PLIVE_LINE_SET}.eventData",
-    f"live.main.{PLIVE_LINE_SET}.eventCoefficients",
 )
 
 
@@ -541,6 +552,22 @@ def _unwrap_catalog(data: Any) -> List[Tuple[str, Dict[str, Any]]]:
     return out
 
 
+def _catalog_has_s_tree(data: Any) -> bool:
+    """True when this payload is a full ``payload.s`` directory (not a lone event)."""
+    if not isinstance(data, dict):
+        return False
+    if isinstance(data.get("s"), dict):
+        return True
+    payload = data.get("payload")
+    if (
+        isinstance(payload, dict)
+        and isinstance(payload.get("s"), dict)
+        and data.get("isDiff") is not True
+    ):
+        return True
+    return False
+
+
 def event_id_from_channel(event_name: Optional[str]) -> Optional[str]:
     if not event_name:
         return None
@@ -723,6 +750,21 @@ class PliveStore:
                     continue
             self.apply_meta(eid, rec)
             seen.append(eid)
+        if _catalog_has_s_tree(data):
+            seen_set = set(seen)
+            for eid, ev in list(self.events.items()):
+                if eid in seen_set:
+                    continue
+                sid = ev.get("sport_id")
+                if sid is not None:
+                    try:
+                        if int(sid) != want:
+                            continue
+                    except (TypeError, ValueError):
+                        pass
+                if not ev.get("finished"):
+                    ev["finished"] = True
+                    self.generation += 1
         return seen
 
     def apply_meta(self, eid: str, data: Dict[str, Any]) -> None:
@@ -1221,8 +1263,34 @@ class PlivePandoraFeed:
                 print(f"[PLIVE] [WARN] emit {event} failed: {ex}")
         print(f"[PLIVE] handshake emitted setSocketMetadata + subscribe/getCache ({len(topics)} rooms)")
 
+    def _coeff_rooms_to_drop(self) -> List[str]:
+        drop: List[str] = []
+        for room in list(self._coeff_subscribed):
+            eid = event_id_from_channel(room)
+            ev = self.store.events.get(str(eid)) if eid else None
+            if ev is None or not self.store.wants_mlb_coeff(ev):
+                drop.append(room)
+        return drop
+
+    async def _unsubscribe_finished_coefficients(self, sio: Any) -> None:
+        """Drop eventCoefficients.{id} when the event is finished or gone."""
+        rooms = self._coeff_rooms_to_drop()
+        if not rooms:
+            return
+        for i in range(0, len(rooms), 80):
+            batch = rooms[i : i + 80]
+            try:
+                await sio.emit("unsubscribe", batch)
+            except Exception as ex:
+                print(f"[PLIVE] [WARN] coeff unsubscribe failed: {ex}")
+            for room in batch:
+                self._coeff_subscribed.discard(room)
+                self._bound_rooms.discard(room)
+            print(f"[PLIVE] unsubscribed eventCoefficients for {len(batch)} finished events")
+
     async def _subscribe_mlb_coefficients(self, sio: Any) -> None:
-        """Per-event click-in coeff rooms (full book, including alt spreads)."""
+        """Per-event click-in coeff rooms (full book: run lines, team totals, margins)."""
+        await self._unsubscribe_finished_coefficients(sio)
         want = int(self.store.sport_id)
         new_rooms: List[str] = []
         for eid, ev in self.store.events.items():
@@ -1236,13 +1304,14 @@ class PlivePandoraFeed:
             new_rooms.append(room)
         if not new_rooms:
             return
-        batch = new_rooms[:80]
-        try:
-            await sio.emit("subscribe", batch)
-            await sio.emit("getCache", batch)
-            print(f"[PLIVE] subscribed eventCoefficients for {len(batch)} events (sport {want})")
-        except Exception as ex:
-            print(f"[PLIVE] [WARN] coeff subscribe failed: {ex}")
+        for i in range(0, len(new_rooms), 80):
+            batch = new_rooms[i : i + 80]
+            try:
+                await sio.emit("subscribe", batch)
+                await sio.emit("getCache", batch)
+                print(f"[PLIVE] subscribed eventCoefficients for {len(batch)} events (sport {want})")
+            except Exception as ex:
+                print(f"[PLIVE] [WARN] coeff subscribe failed: {ex}")
 
     async def start(self) -> None:
         if self._running:

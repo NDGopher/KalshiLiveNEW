@@ -22,6 +22,7 @@ from plive_pandora import (
     plive_sport_id,
     note_handshake_ack,
     parse_coeff_path,
+    parse_event_hash,
     parse_sport_hash,
     plive_wanted,
     public_ui_subscribe_topics,
@@ -143,7 +144,9 @@ def test_handshake_matches_public_ui():
     assert "live.sports" in topics
     assert "live.events" not in topics
     assert f"live.main.{PLIVE_LINE_SET}.eventData" in topics
-    assert f"live.main.{PLIVE_LINE_SET}.eventCoefficients" in topics
+    assert f"live.main.{PLIVE_LINE_SET}.eventCoefficients" not in topics
+    assert not any(t.endswith(".eventCoefficients") for t in topics)
+    assert "live.leagues" not in topics
     assert emits[3][1] == topics
     for room in EXPECTED_SUBSCRIBED_ROOMS:
         assert room in topics
@@ -203,10 +206,99 @@ def test_live_sports_catalog_overrides_fallback():
 
 def test_public_ui_topics_include_required_rooms():
     topics = public_ui_subscribe_topics()
+    assert topics == ["live.sports", f"live.main.{PLIVE_LINE_SET}.eventData"]
     assert any(t.endswith(".eventData") for t in topics)
-    assert any(t.endswith(".eventCoefficients") for t in topics)
+    assert not any(t.endswith(".eventCoefficients") for t in topics)
     assert "live.events" not in topics
-    assert coeff_room_for_event("199298371").endswith(".eventCoefficients.199298371")
+    assert coeff_room_for_event("199298371") == (
+        f"live.main.{PLIVE_LINE_SET}.eventCoefficients.199298371"
+    )
+
+
+def test_parse_event_hash_is_pandora_id_no_html():
+    """#!/event/{id} is a client-side route. Do not scrape the HTML page."""
+    assert parse_event_hash("https://plive.becoms.co/live/?#!/event/199298371") == "199298371"
+    assert parse_event_hash("#!/event/199298371") == "199298371"
+    assert parse_event_hash("https://plive.becoms.co/live/?#!/sport/1") is None
+    assert parse_event_hash("") is None
+
+
+def test_unsubscribe_finished_mlb_coefficients():
+    import asyncio
+
+    class _FakeSio:
+        def __init__(self) -> None:
+            self.emits: list = []
+
+        async def emit(self, event, payload=None):
+            self.emits.append((event, payload))
+
+        def on(self, _name):
+            def _deco(fn):
+                return fn
+
+            return _deco
+
+    feed = PlivePandoraFeed(connect_fn=lambda _f: None)
+    feed.store.apply_meta(
+        "199298371",
+        {
+            "home": "Houston Astros",
+            "away": "Chicago White Sox",
+            "sportId": 1,
+            "leagueId": 8,
+            "ip": True,
+        },
+    )
+    sio = _FakeSio()
+    asyncio.run(feed._subscribe_mlb_coefficients(sio))
+    room = coeff_room_for_event("199298371")
+    assert room in feed._coeff_subscribed
+    assert any(e[0] == "subscribe" and room in (e[1] or []) for e in sio.emits)
+    assert any(e[0] == "getCache" and room in (e[1] or []) for e in sio.emits)
+
+    feed.store.apply_meta("199298371", {"finished": True})
+    assert feed.store.wants_mlb_coeff(feed.store.events["199298371"]) is False
+    asyncio.run(feed._subscribe_mlb_coefficients(sio))
+    assert room not in feed._coeff_subscribed
+    assert any(e[0] == "unsubscribe" and room in (e[1] or []) for e in sio.emits)
+
+
+def test_event_data_s_tree_marks_missing_mlb_finished():
+    store = PliveStore()
+    store.apply_message(
+        {
+            "isDiff": False,
+            "payload": {
+                "s": {
+                    "1": {
+                        "2": {
+                            "8": {
+                                "199298371": [
+                                    ["Houston Astros", "", "", 2],
+                                    ["Chicago White Sox", "", "", 1],
+                                    1,
+                                    None,
+                                    {"ip": True},
+                                ]
+                            }
+                        }
+                    }
+                }
+            },
+        },
+        event_name=f"live.main.{PLIVE_LINE_SET}.eventData",
+    )
+    assert store.wants_mlb_coeff(store.events["199298371"]) is True
+    store.apply_message(
+        {
+            "isDiff": False,
+            "payload": {"s": {"1": {"2": {"8": {}}}}},
+        },
+        event_name=f"live.main.{PLIVE_LINE_SET}.eventData",
+    )
+    assert store.events["199298371"].get("finished") is True
+    assert store.wants_mlb_coeff(store.events["199298371"]) is False
 
 
 def test_event_data_s_tree_extracts_mlb_teams():

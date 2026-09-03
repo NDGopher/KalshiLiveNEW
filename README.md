@@ -59,7 +59,7 @@ Public handshake (bare connect is silent):
 1. `wss://pandora.ganchrow.com/socket.io/?EIO=4&transport=websocket`
 2. Header `Origin: https://plive.becoms.co`
 3. After CONNECT emit `setSocketMetadata {partnerId: 113, flavor: "live"}`
-4. Then `subscribeSystemEvents` + `subscribe` / `getCache` for `live.sports`, `live.main.<LINE_SET>.eventData`, and `eventCoefficients` (click-in full book). Per-event `eventCoefficients.{id}` for live MLB (sport 1, league 8). `live.events` is dead.
+4. Then `subscribeSystemEvents` + `subscribe` / `getCache` once for `live.sports` (names) and `live.main.<LINE_SET>.eventData` (directory). For each live MLB id (sport 1, league 8) subscribe `eventCoefficients.{id}` (click-in full book: run lines, team totals, margins) and unsubscribe when finished. `live.events` is dead. `#!/event/{id}` is a client-side route — do not scrape the HTML.
 
 - MLB is catalog **sport 1** (`#!/sport/1`). `https://plive.becoms.co/live/?#!/sport/220` is **Top Soccer**, not MLB.
 - `eventData` list is **[home, away]** (stadium home first). Market 6 `[idx0, idx1]` is a 2-way decimal pair, not money/decimal.
