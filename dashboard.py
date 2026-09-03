@@ -1777,6 +1777,8 @@ async def handle_plive_take_display_alert(alert: EvAlert) -> None:
         payload = saved_filters[filter_name]
         sharp_books = list((payload.get("devigFilter") or {}).get("sharps") or [])
     sharp_books = [b for b in sharp_books if str(b).strip().lower() != "plive"]
+    if not any(str(b).strip().lower() == "kalshi" for b in sharp_books):
+        sharp_books = ["Kalshi", *sharp_books]
     ticker = getattr(alert, "ticker", None) or f"PLIVE|{alert.teams}|{alert.pick}|{alert.qualifier}"
     alert_data = {
         "id": alert_id,

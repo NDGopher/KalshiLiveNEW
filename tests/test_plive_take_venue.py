@@ -35,7 +35,8 @@ def test_fair_pack_excludes_plive_and_take_venue():
     plive_fair = fair_sharp_names(pack, "PLive")
     plive_names = {n.lower() for n in plive_fair}
     assert "plive" not in plive_names
-    assert "kalshi" not in plive_names
+    # PLive cards may use Kalshi in fair/devig. Kalshi cards never use PLive.
+    assert "kalshi" in plive_names
     assert is_betting_take_book("PLive")
     assert is_betting_take_book("Kalshi")
     assert not is_betting_take_book("FanDuel")
@@ -117,6 +118,8 @@ def test_plive_take_emits_when_plus_vs_pack():
     assert left["book"] == "PLive"
     if kalshi is not None:
         assert "PLive" not in (kalshi.get("devigBooks") or [])
+        assert all(str(n).lower() != "kalshi" for n in (kalshi.get("devigBooks") or []))
+    assert any(str(n).lower() == "kalshi" for n in (plive.get("devigBooks") or []))
 
 
 def test_plive_missing_price_does_not_emit():

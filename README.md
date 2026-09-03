@@ -52,7 +52,7 @@ Docs: [WebSockets](https://docs.odds-api.io/guides/websockets) · [API](https://
 
 Origin-only Socket.IO. **No login. No cookies. No BetBCK. No BookieBeats DOM.**
 
-PLive is **not** a sharp / minSharp / `devig_books` book. Betting books are **Kalshi and PLive**. Fair is the configured pack (DK / FD / NV / Bet365 / Betfair / MGM / Caesars / Circa / Poly) minus PLive and the take venue. If PLive is +EV vs that pack, the dashboard emits a PLive take card (PLive on the left; same min-EV whole-card hide). Auto-bet stays OFF and never fires on PLive cards.
+PLive is **not** a sharp / minSharp / `devig_books` book. Betting books are **Kalshi and PLive**. Fair is the rec pack (DK / FD / Caesars / NV / Bet365 / Betfair / MGM / Circa). Kalshi cards never put PLive in fair (tile only). PLive cards may use Kalshi in fair/devig. If PLive is +EV vs that pack, the dashboard emits a PLive take card (PLive on the left; same min-EV whole-card hide). Auto-bet stays OFF and never fires on PLive cards.
 
 Public handshake (bare connect is silent):
 

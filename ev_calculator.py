@@ -26,7 +26,8 @@ _POWER_FAIR_CLIP_HI = 0.99
 _POWER_FAIR_CLIP_LO = 0.01
 
 # Sharp-panel screen (Kalshi All Sports POWER+AVERAGE). Junk uses the quote, not
-# the book name. PLive is display/take only — never POWER/AVERAGE fair.
+# the book name. PLive is never POWER/AVERAGE fair. Kalshi may be fair on a
+# PLive take card only.
 SHARP_ABS_AMERICAN_CAP = 1000
 SHARP_OUTLIER_IMPLIED_FLOOR = 0.08
 SHARP_OUTLIER_MAD_MULT = 2.5
@@ -167,11 +168,30 @@ def implied_prob_from_american(american: int) -> Optional[float]:
 
 
 def is_sign_flip_american(book_american: int, kalshi_american: int) -> bool:
-    """Plus vs minus on the same pick (NV −154 vs Kalshi +186). Even money is not a flip."""
+    """Plus vs minus on the same pick. Even money is not a flip."""
     b, k = int(book_american), int(kalshi_american)
     if b == 0 or k == 0:
         return False
     return (b > 0) != (k > 0)
+
+
+def is_real_sign_flip(
+    book_american: int,
+    kalshi_american: int,
+    *,
+    cluster: float = SHARP_SIGN_FLIP_CLUSTER,
+) -> bool:
+    """Sided plus vs sided minus (NV −154 vs +186). Pick'em around 50% is not a flip.
+
+    Brewers +113 vs a −110 pack stays. Giants NV −154 vs +186 is junk.
+    """
+    if not is_sign_flip_american(book_american, kalshi_american):
+        return False
+    bp = implied_prob_from_american(book_american)
+    kp = implied_prob_from_american(kalshi_american)
+    if bp is None or kp is None:
+        return False
+    return abs(bp - 0.5) >= float(cluster) and abs(kp - 0.5) >= float(cluster)
 
 
 def is_junk_vs_kalshi(
@@ -182,9 +202,10 @@ def is_junk_vs_kalshi(
 ) -> bool:
     """Display and fair share this test. True → gray tile and drop from POWER/AVERAGE.
 
-    Junk if the book flips sign vs Kalshi, or |implied − Kalshi implied| > 10 cents.
+    Junk if |implied − take implied| > 10 cents, or a real (sided) sign flip.
+    Pick'em plus/minus around 50% is not junk.
     """
-    if is_sign_flip_american(book_american, kalshi_american):
+    if is_real_sign_flip(book_american, kalshi_american):
         return True
     bp = implied_prob_from_american(book_american)
     kp = implied_prob_from_american(kalshi_american)
@@ -266,14 +287,43 @@ def _eligible_sharp_books(books: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return eligible
 
 
+def _book_name_key(name: Any) -> str:
+    return "".join(ch.lower() for ch in str(name or "") if ch.isalnum())
+
+
 def is_plive_book(name: Any) -> bool:
-    """PLive is a tile / take book. It is never a fair (POWER/AVERAGE) rec."""
-    key = "".join(ch.lower() for ch in str(name or "") if ch.isalnum())
+    """PLive is a take / tile book. It is never a fair (POWER/AVERAGE) rec."""
+    key = _book_name_key(name)
     return key == "plive" or key.startswith("plive")
+
+
+def is_kalshi_book(name: Any) -> bool:
+    return _book_name_key(name) == "kalshi"
+
+
+def is_polymarket_book(name: Any) -> bool:
+    key = _book_name_key(name)
+    return "polymarket" in key or key in ("poly", "pm")
 
 
 def exclude_plive_from_fair(books: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [b for b in (books or []) if not is_plive_book(b.get("name"))]
+
+
+def fair_books_excluding_take(
+    books: List[Dict[str, Any]],
+    take_book: str = "Kalshi",
+) -> List[Dict[str, Any]]:
+    """Fair/devig set: never PLive. Never the take venue. Kalshi allowed on PLive cards."""
+    take = _book_name_key(take_book or "Kalshi")
+    out: List[Dict[str, Any]] = []
+    for b in books or []:
+        if is_plive_book(b.get("name")):
+            continue
+        if _book_name_key(b.get("name")) == take:
+            continue
+        out.append(b)
+    return out
 
 
 def filter_sharp_panel(
@@ -287,14 +337,14 @@ def filter_sharp_panel(
     junk, red if better and inside 10c). PLive is stripped later from fair.
 
     When ``kalshi_american`` is set, egregious quotes use ``is_junk_vs_kalshi``
-    (10c from Kalshi or sign flip) — not a global median.
+    (10c from take or a real sign flip) — not a global median.
     """
     eligible = _eligible_sharp_books(books)
     if not eligible:
         return []
 
     if kalshi_american is not None:
-        # 10c-from-Kalshi (or sign flip) is the only egregious screen — not a global median.
+        # 10c-from-take (or real sign flip) is the only egregious screen — not a global median.
         surviving: List[Dict[str, Any]] = []
         for book in eligible:
             if is_junk_vs_kalshi(int(book["american"]), int(kalshi_american)):
@@ -325,16 +375,21 @@ def _american_sign(am: int) -> int:
     return 0
 
 
-def fair_books_for_panel(survivors: List[Dict[str, Any]], kalshi_american: int) -> List[Dict[str, Any]]:
-    """POWER/AVERAGE uses the Kalshi-adjacent pack, never a far second cluster.
+def fair_books_for_panel(
+    survivors: List[Dict[str, Any]],
+    kalshi_american: int,
+    take_book: str = "Kalshi",
+) -> List[Dict[str, Any]]:
+    """POWER/AVERAGE uses the take-adjacent rec pack, never a far second cluster.
 
     Same-sign juice that is not egregious may remain in ``survivors`` (minSharp /
     3-better). It must not pull fair. If no adjacent pack exists, fall back to
-    same-sign survivors, then the full set.
+    same-sign survivors, then the full set. PLive never enters fair. Kalshi may
+    when the take book is PLive.
     """
     rows = [
         b
-        for b in exclude_plive_from_fair(survivors)
+        for b in fair_books_excluding_take(survivors, take_book)
         if not is_junk_vs_kalshi(int(b.get("american") or 0), int(kalshi_american))
     ]
     if not rows:
@@ -361,12 +416,17 @@ def count_better_than_kalshi(survivors: List[Dict[str, Any]], kalshi_american: i
     return n
 
 
-def power_average_fair_prob(survivors: List[Dict[str, Any]], calc: Optional[EVCalculator] = None) -> Optional[float]:
-    """Mean of per-book POWER fairs. Same as type=AVERAGE over method=POWER.
+def power_average_fair_prob(
+    survivors: List[Dict[str, Any]],
+    calc: Optional[EVCalculator] = None,
+    take_american: Optional[int] = None,
+) -> Optional[float]:
+    """Mean of per-book two-way POWER fairs. Same as type=AVERAGE over method=POWER.
 
-    Floor at the pack's mean pick implied. POWER relaxation can collapse a
-    two-way onto AVERAGE and erase a real best-price edge vs close recs
-    (KEEP ~+2% vs -139/-141/-142).
+    Plus-money / dog takes use POWER only — raw one-sided implied is the
+    13–17% fake (Twins +317 vs +252/+270). Favorite takes still floor at the
+    pack's mean pick implied so a few-cent best price vs DK/FD/CZ/NV (Astros
+    −133 vs −139/−141/−142) keeps printing ~+2%.
     """
     rows = [
         b
@@ -385,6 +445,11 @@ def power_average_fair_prob(survivors: List[Dict[str, Any]], calc: Optional[EVCa
         return sum(raw) / float(len(raw)) if raw else None
     pwr = sum(fairs) / float(len(fairs))
     raw_mean = sum(raw) / float(len(raw))
+    take_imp: Optional[float] = None
+    if take_american is not None:
+        take_imp = implied_prob_from_american(int(take_american))
+    if take_imp is not None and take_imp < 0.5:
+        return pwr
     return max(pwr, raw_mean)
 
 
@@ -465,14 +530,15 @@ def evaluate_sharp_panel_ev(
     min_sharp_books: int = 3,
     method: str = "POWER",
     used_fallback: bool = False,
+    take_book: str = "Kalshi",
 ) -> Dict[str, Any]:
-    """Filter → POWER/AVERAGE fair → EV vs Kalshi → hard gates.
+    """Filter → POWER/AVERAGE fair → EV vs take → hard gates.
 
     Returns surviving books, EV, and whether a plus alert may print.
     Does not mention teams or tickers — callers pass anonymous boards.
     """
     surviving = filter_sharp_panel(books, kalshi_american=kalshi_american)
-    fair_eligible = exclude_plive_from_fair(surviving)
+    fair_eligible = fair_books_excluding_take(surviving, take_book)
     calc = EVCalculator({})
     k_dec = american_to_decimal(int(kalshi_american))
     price_cents = int(max(1, min(99, round(100.0 / k_dec)))) if k_dec > 1.0 else 0
@@ -487,9 +553,9 @@ def evaluate_sharp_panel_ev(
             0.0, kalshi_american, fair_eligible, used_fallback=False, min_sharp_books=min_sharp_books
         )
     else:
-        fair_src = fair_books_for_panel(fair_eligible, kalshi_american)
+        fair_src = fair_books_for_panel(fair_eligible, kalshi_american, take_book=take_book)
         if (method or "POWER").upper() == "POWER":
-            fair = power_average_fair_prob(fair_src, calc)
+            fair = power_average_fair_prob(fair_src, calc, take_american=kalshi_american)
         else:
             fairs = [
                 calc.fair_probs_two_way(float(b["decimal_pick"]), float(b["decimal_opp"]), method)[0]

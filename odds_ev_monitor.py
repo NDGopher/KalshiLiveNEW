@@ -46,7 +46,7 @@ from ev_calculator import (
     decimal_to_american,
     ev_percent_three_methods_multi_sharp,
     ev_percent_three_methods_three_way,
-    exclude_plive_from_fair,
+    fair_books_excluding_take,
     fair_books_for_panel,
     filter_sharp_panel,
     format_ev_percent_display,
@@ -356,7 +356,10 @@ def is_betting_take_book(name: str) -> bool:
 
 
 def fair_sharp_names(sharps: List[str], take_book: str = "Kalshi") -> List[str]:
-    """Configured fair pack minus PLive and the take venue. Never a betting book."""
+    """Configured rec pack for fair/devig.
+
+    Never PLive. Never the take venue. Kalshi is allowed only on a PLive card.
+    """
     take = _norm_book(str(take_book or "")).lower()
     out: List[str] = []
     seen: Set[str] = set()
@@ -364,7 +367,9 @@ def fair_sharp_names(sharps: List[str], take_book: str = "Kalshi") -> List[str]:
         n = _norm_book(str(raw)).lower()
         if not n or n in seen:
             continue
-        if n in ("kalshi", "plive") or n == take:
+        if n == "plive" or n == take:
+            continue
+        if n == "kalshi" and take != "plive":
             continue
         seen.add(n)
         out.append(str(raw))
@@ -2440,6 +2445,10 @@ class OddsEVMonitor:
         method = str(df.get("method", "POWER")).upper()
         comb_type = str(df.get("type", "AVERAGE")).upper()
         sharp_names = fair_sharp_names([str(x) for x in (df.get("sharps") or [])], take_canon)
+        if take_canon.lower() == "plive" and not any(
+            _norm_book(x).lower() == "kalshi" for x in sharp_names
+        ):
+            sharp_names = ["Kalshi", *sharp_names]
         min_sharp = max(1, int(df.get("minSharpBooks", 1)))
         min_sharp_eff = 1 if vb.get("_live_broad_scan") else min_sharp
         min_sharp_rules = self.filter_payload.get("minSharpLimits") or []
@@ -2532,14 +2541,18 @@ class OddsEVMonitor:
                 surviving_books = filter_sharp_panel(
                     panel_books, kalshi_american=decimal_to_american(k_dec)
                 )
-                fair_eligible = exclude_plive_from_fair(surviving_books)
+                fair_eligible = fair_books_excluding_take(surviving_books, take_canon)
                 # minSharp is the filter floor — do not lower it for live scan.
-                # PLive is a tile/take book and does not count toward minSharp or fair.
+                # PLive never counts toward minSharp or fair. Kalshi may on a PLive card.
                 if len(fair_eligible) >= min_sharp:
-                    fair_src = fair_books_for_panel(fair_eligible, decimal_to_american(k_dec))
+                    fair_src = fair_books_for_panel(
+                        fair_eligible, decimal_to_american(k_dec), take_book=take_canon
+                    )
                     fair_for_avg = fair_src or fair_eligible
                     if (method or "POWER").upper() == "POWER" and comb_type != "WORST_CASE":
-                        fair_prob = power_average_fair_prob(fair_for_avg, self._calc)
+                        fair_prob = power_average_fair_prob(
+                            fair_for_avg, self._calc, take_american=decimal_to_american(k_dec)
+                        )
                     else:
                         pick_probs = [
                             _panel_relaxed_pick_fair_two_way(
@@ -2637,7 +2650,7 @@ class OddsEVMonitor:
             gated = apply_ev_hard_gates(
                 ev_percent,
                 kalshi_am,
-                exclude_plive_from_fair(surviving_books),
+                fair_books_excluding_take(surviving_books, take_canon),
                 used_fallback=used_fallback_fair,
                 min_sharp_books=min_sharp,
             )

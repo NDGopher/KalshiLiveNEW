@@ -11,6 +11,12 @@ Labeled live fixtures (pattern boards only; do not pin tickers):
   FD -142 / CA -141 / NV -139 tight rec cluster; DK/BE juice -170..-185.
   UI +2.33%. Filters MUST still allow this small plus. Do not over-filter.
 
+- KEEP smaller EV: Twins +317 vs +252/+270 pack — two-way POWER, not a
+  13–17% one-sided implied fake. Brewers +113 vs a −110 pick'em pack.
+
+- KILL: Pirates −104 vs FD/NV −110 fattened by Poly −178. Take worse
+  than NV (Kalshi −488). 3-better kill stays.
+
 Prior Cubs 3-better kill and Houston/Rays wrong-line drop still stand.
 Auto-bet stays OFF. No SharpMoney.
 """
@@ -22,10 +28,12 @@ from ev_calculator import (
     decimal_to_american,
     evaluate_sharp_panel_ev,
     exclude_plive_from_fair,
+    fair_books_excluding_take,
     fair_books_for_panel,
     filter_sharp_panel,
     is_junk_vs_kalshi,
     is_plive_book,
+    is_real_sign_flip,
 )
 
 
@@ -399,13 +407,17 @@ def test_bimodal_steam_does_not_eat_close_rec():
 
 
 def test_junk_vs_kalshi_ten_cent_or_sign_flip():
-    """Anonymous boards. One threshold vs Kalshi — do not pin tickers."""
+    """Anonymous boards. One threshold vs take — do not pin tickers."""
     assert is_junk_vs_kalshi(122, 245) is True  # ~16c
     assert is_junk_vs_kalshi(138, 245) is True  # ~13c
     assert is_junk_vs_kalshi(228, 245) is False  # ~1.5c stays
     assert is_junk_vs_kalshi(-139, -133) is False  # ~1c keep, not red (−139 worse)
     assert is_junk_vs_kalshi(-270, -133) is True  # ~16c
-    assert is_junk_vs_kalshi(-154, 186) is True  # sign flip even if someone measures <10c
+    assert is_junk_vs_kalshi(-154, 186) is True  # real sign flip
+    # Pick'em around 50% is not a flip (Brewers +113 vs −110).
+    assert is_real_sign_flip(-110, 113) is False
+    assert is_junk_vs_kalshi(-110, 113) is False
+    assert is_real_sign_flip(-154, 186) is True
 
 
 def test_plus245_drops_far_shorts_not_small_gap():
@@ -426,3 +438,102 @@ def test_plus245_drops_far_shorts_not_small_gap():
     out = evaluate_sharp_panel_ev(books, kalshi, min_sharp_books=3)
     assert out["ev_percent"] < 8.0
     assert out["raw_ev_percent"] < 11.0
+
+
+def _fixture_keep_twins_plus317():
+    """KEEP smaller EV: take +317 vs DK/FD/NV +252/+270/+260."""
+    return 317, [
+        _book("DK", 252, -320),
+        _book("FD", 270, -340),
+        _book("NV", 260, -330),
+    ]
+
+
+def _fixture_keep_brewers_plus113():
+    """KEEP smaller EV: take +113 vs a −110 pick'em pack (not a sign flip)."""
+    return 113, [
+        _book("FD", -110, -110),
+        _book("DK", -110, -110),
+        _book("NV", -108, -112),
+        _book("CA", -112, -108),
+    ]
+
+
+def _fixture_kill_pirates_poly_fat():
+    """KILL: take −104 vs FD/NV −110, Poly −178 off-pack fattening."""
+    return -104, [
+        _book("FD", -110, -110),
+        _book("NV", -110, -110),
+        _book("DK", -108, -112),
+        _book("CA", -112, -108),
+        _book("Poly", -178, 145),
+    ]
+
+
+def _fixture_kill_take_worse_than_nv():
+    """KILL: huge favorite take worse than NV/FD/DK."""
+    return -488, [
+        _book("NV", -400),
+        _book("FD", -420),
+        _book("DK", -410),
+    ]
+
+
+def test_keep_twins_plus317_smaller_ev_not_onesided_fake():
+    take, books = _fixture_keep_twins_plus317()
+    out = evaluate_sharp_panel_ev(books, take, min_sharp_books=3)
+    assert out["plus_alert"] is True
+    assert out["ev_percent"] > 0.0
+    # Two-way POWER, not the ~15% one-sided implied fake.
+    assert out["ev_percent"] < 13.0
+    assert out["raw_ev_percent"] < 13.0
+
+
+def test_keep_brewers_plus113_vs_minus110_pack():
+    take, books = _fixture_keep_brewers_plus113()
+    surviving = filter_sharp_panel(books, kalshi_american=take)
+    names = {b["name"] for b in surviving}
+    assert {"FD", "DK", "NV", "CA"}.issubset(names)
+    out = evaluate_sharp_panel_ev(books, take, min_sharp_books=3)
+    assert out["plus_alert"] is True
+    assert 0.0 < out["ev_percent"] < 12.0
+    assert out["ev_percent"] < 13.0
+
+
+def test_kill_pirates_barely_better_fattened_by_poly():
+    take, books = _fixture_kill_pirates_poly_fat()
+    surviving = filter_sharp_panel(books, kalshi_american=take)
+    names = {b["name"] for b in surviving}
+    assert "Poly" not in names
+    out = evaluate_sharp_panel_ev(books, take, min_sharp_books=3)
+    assert out["plus_alert"] is False
+    assert out["ev_percent"] <= 2.0
+
+
+def test_kill_take_worse_than_nv():
+    take, books = _fixture_kill_take_worse_than_nv()
+    out = evaluate_sharp_panel_ev(books, take, min_sharp_books=3)
+    assert out["plus_alert"] is False
+    assert out["ev_percent"] <= 0.0
+    assert out["better_count"] >= 3 or "median_gate" in out["reasons"] or "better_books" in out["reasons"]
+
+
+def test_plive_card_may_use_kalshi_in_fair():
+    take = -120
+    books = [
+        _book("Kalshi", -133),
+        _book("FD", -142),
+        _book("NV", -139),
+        _book("CA", -141),
+        _book("PLive", -120),
+    ]
+    kalshi_card = evaluate_sharp_panel_ev(books, -133, min_sharp_books=3, take_book="Kalshi")
+    assert "PLive" in kalshi_card["surviving_names"]
+    assert "PLive" not in kalshi_card["fair_names"]
+    assert "Kalshi" not in kalshi_card["fair_names"]
+    plive_card = evaluate_sharp_panel_ev(books, take, min_sharp_books=3, take_book="PLive")
+    assert "PLive" not in plive_card["fair_names"]
+    assert "Kalshi" in plive_card["fair_names"]
+    fair = fair_books_excluding_take(plive_card["surviving"], "PLive")
+    assert any(is_plive_book(b.get("name")) is False for b in fair)
+    assert any(str(b.get("name")) == "Kalshi" for b in fair)

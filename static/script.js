@@ -627,16 +627,22 @@ function impliedProbFromAmerican(am) {
     return Math.abs(n) / (Math.abs(n) + 100);
 }
 
-/** Same 10c-from-Kalshi / sign-flip test as ev_calculator.is_junk_vs_kalshi. */
+/** Same 10c-from-take / real-sign-flip test as ev_calculator.is_junk_vs_kalshi. */
 function isJunkVsKalshi(bookAmerican, kalshiAmerican) {
     const b = Number(bookAmerican);
     const k = Number(kalshiAmerican);
     if (!Number.isFinite(b) || !Number.isFinite(k) || b === 0 || k === 0) return false;
-    if ((b > 0) !== (k > 0)) return true;
     const bp = impliedProbFromAmerican(b);
     const kp = impliedProbFromAmerican(k);
     if (bp == null || kp == null) return true;
+    const sidedFlip = (b > 0) !== (k > 0) && Math.abs(bp - 0.5) >= 0.04 && Math.abs(kp - 0.5) >= 0.04;
+    if (sidedFlip) return true;
     return Math.abs(bp - kp) > 0.10 + 1e-12;
+}
+
+function isPolymarketBook(name) {
+    const key = normalizeBookKey(name);
+    return key.includes('polymarket') || key === 'poly' || key === 'pm';
 }
 
 function parseFreshnessTs(value) {
@@ -799,9 +805,11 @@ function createAlertCard(alert) {
                         normalizeBookKey(alert.take_book || 'Kalshi') === 'kalshi');
                 const usedForLine =
                     isTakeBook || bookMatchesDevigOrSharp(bookName, alert.devig_books, alert.sharp_books);
+                const inFair = bookMatchesDevigOrSharp(bookName, alert.devig_books, []);
                 const junkVsKalshi = !isTakeBook && kalshiOddsNum !== null && isJunkVsKalshi(bookOdds, kalshiOddsNum);
                 // Junk is display-gray only. Min EV never grays a tile.
-                let isGrayedOut = !usedForLine || junkVsKalshi;
+                // Poly off the rec pack: gray or don't paint (even if still a configured sharp).
+                let isGrayedOut = !usedForLine || junkVsKalshi || (isPolymarketBook(bookName) && !inFair && !isTakeBook);
                 
                 // Red only when strictly better than the take venue AND inside the 10c band.
                 let hasBetterOdds = false;
