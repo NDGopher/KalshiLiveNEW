@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Live odds — Kalshi Dashboard</title>
+    <title>Live odds - Kalshi Dashboard</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
     <style>
         .live-odds-wrap { max-width: 1600px; margin: 0 auto; padding: 16px; }
@@ -74,9 +74,9 @@
         const tbody = document.getElementById('odds-body');
 
         function fmtAm(v) {
-            if (v === null || v === undefined) return '—';
+            if (v === null || v === undefined) return '-';
             const n = Number(v);
-            if (!Number.isFinite(n)) return '—';
+            if (!Number.isFinite(n)) return '-';
             return (n > 0 ? '+' : '') + n;
         }
 
@@ -106,7 +106,7 @@
                 let cells = `<td>${escapeHtml(row.teams || '')}</td>` +
                     `<td>${escapeHtml(row.league || '')}</td>` +
                     `<td>${row.live ? 'Yes' : 'No'}</td>` +
-                    `<td>${escapeHtml(row.market || '')}</td>`;
+                    `<td>${escapeHtml(row.market || '')}${row.line != null && row.line !== '' ? ' ' + escapeHtml(String(row.line)) : ''}${row.side_a ? ' · ' + escapeHtml(row.side_a) + ' / ' + escapeHtml(row.side_b || '') : ''}</td>`;
                 for (const b of books) {
                     const p = pr[b] || {};
                     cells += `<td>${fmtAm(p.home_am)}</td><td>${fmtAm(p.away_am)}</td>`;

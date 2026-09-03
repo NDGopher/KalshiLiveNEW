@@ -19,7 +19,7 @@
         .dashboard-ui-fingerprint{width:100%;margin:0;padding:8px 18px 12px;font-size:11px;line-height:1.4;color:#64748b;font-family:ui-monospace,Consolas,monospace;border-top:1px dashed #cbd5e1;background:#fff}
         body.dark .dashboard-ui-fingerprint{color:#94a3b8;background:#111}
     </style>
-    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=8">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=10">
     <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
 </head>
 <body>
@@ -67,6 +67,10 @@
             <label class="scan-toggle-label">
                 <input type="checkbox" id="broad-scan-include-pregame">
                 <span>Broad scan: include pregame</span>
+            </label>
+            <label class="scan-toggle-label" id="stoppages-only-label" title="Live takes only when Odds-API clock exists and clock.running is false, or statusDetail is Halftime/Break. Omitted clock fails closed. Baseball unsupported until Odds-API sends a real field.">
+                <input type="checkbox" id="stoppages-only">
+                <span>Stoppages Only</span>
             </label>
         </div>
         <details class="controls-wrapper controls-wrapper--flex">
@@ -157,6 +161,7 @@
                         <option value="basketball|nba">NBA</option>
                         <option value="icehockey|nhl">NHL</option>
                         <option value="americanfootball|nfl">NFL</option>
+                        <option value="americanfootball|ncaaf">CFB</option>
                         <option value="baseball|all">All baseball</option>
                         <option value="basketball|all">All basketball</option>
                         <option value="football|all">Soccer (football)</option>
@@ -196,7 +201,7 @@
         </div>
     </div>
 
-    <script src="{{ url_for('static', filename='script.js') }}?v=13"></script>
+    <script src="{{ url_for('static', filename='script.js') }}?v=24"></script>
 </body>
 </html>
 

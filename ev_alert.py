@@ -31,11 +31,24 @@ class EvAlert:
         self.timestamp = datetime.now()
         self.raw_html = data.get("raw_html", "")
         self.price_cents = None
-        self.line = None
+        self.line = data.get("line")
         # False = diagnostic display candidate (failed strict minRoi/minEv but passed relaxed gates)
         self.strict_pass = bool(data.get("strict_pass", True))
         # How the opportunity was discovered: e.g. odds_api_value_bets vs local_odds_scan (future).
         self.ev_source = str(data.get("ev_source") or "odds_api_value_bets")
+        self.book_updated_at = data.get("book_updated_at") or {}
+        self.kalshi_last_trade_ts = data.get("kalshi_last_trade_ts")
+        # Kalshi or PLive — both are take venues. PLive is never a sharp.
+        self.take_book = str(data.get("take_book") or "Kalshi")
+        # Royals-shape allowlist for later auto-bet. Default deny. Switch stays OFF.
+        self.autobet_allow = bool(data.get("autobet_allow", False))
+        self.live = data.get("live")
+        self.clock = data.get("clock")
+        self.clock_running = data.get("clock_running")
+        self.status_detail = data.get("status_detail") or data.get("statusDetail") or ""
+        self.score = data.get("score") or ""
+        self.scores = data.get("scores")
+        self.game_status = data.get("game_status") or ""
 
     def extract_ticker_from_url(self):
         """Extract Kalshi ticker from market URL."""
@@ -63,4 +76,16 @@ class EvAlert:
             "timestamp": self.timestamp.isoformat(),
             "strict_pass": self.strict_pass,
             "ev_source": self.ev_source,
+            "book_updated_at": self.book_updated_at or {},
+            "kalshi_last_trade_ts": self.kalshi_last_trade_ts,
+            "take_book": self.take_book,
+            "autobet_allow": self.autobet_allow,
+            "live": self.live,
+            "clock": self.clock,
+            "clock_running": self.clock_running,
+            "status_detail": self.status_detail,
+            "score": self.score,
+            "scores": self.scores,
+            "game_status": self.game_status,
+            "line": self.line,
         }

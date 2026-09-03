@@ -54,7 +54,11 @@ from kalshi_client import KalshiClient
 from odds_ev_monitor import (
     OddsEVMonitor as EvMonitorImpl,
     _market_names_match,
+    _numeric_close,
+    _pick_matching_odds_row,
+    _pick_qualifier_line_for_side,
     apply_betmgm_ml_grid_consensus_fix,
+    total_line_value,
 )
 from odds_api_client import (
     get_shared_odds_client,
@@ -65,7 +69,24 @@ from odds_api_client import (
     odds_api_sports_list,
     sport_slug_query_for_api,
 )
-from ev_calculator import decimal_to_american
+from odds_api_ws import _ws_market_family, peek_shared_odds_ws_feed, resolve_odds_docs
+from plive_pandora import (
+    extra_local_bookmakers,
+    is_run_line_spread_row,
+    is_team_total_market_id,
+    merge_plive_into_docs,
+    peek_shared_plive_feed,
+    plive_wanted,
+)
+from auto_bet_sheet import (
+    AUTO_BET_CSV_FIELDNAMES,
+    AUTO_BET_SHEET_HEADERS,
+    auto_bet_sheet_row,
+    build_auto_bet_sheet_record,
+    ensure_sheet_extra_headers,
+)
+from ev_calculator import decimal_to_american, is_plus_print_ev
+from stoppage_gate import clock_fields_for_live_odds
 
 
 def monitor_poll_seconds() -> float:
@@ -279,6 +300,31 @@ def store_failed_auto_bet(alert_id, alert, alert_data, error, reason=None, ticke
             failed_auto_bets = failed_auto_bets[-MAX_FAILED_BETS:]
         
         print(f"[FAILED-BETS] ✅ Stored failure: {alert.teams if alert else 'N/A'} - {alert.pick if alert else 'N/A'} | Error: {error} | Total stored: {len(failed_auto_bets)}")
+        skip_reason = str(reason or error or "").strip()
+        try:
+            write_auto_bet_to_sheets(
+                build_auto_bet_sheet_record(
+                    alert=alert,
+                    alert_data=alert_data if isinstance(alert_data, dict) else {},
+                    skipped=True,
+                    skip_reason=skip_reason,
+                    fill={
+                        "ticker": failure_entry.get("ticker") or "",
+                        "side": failure_entry.get("side") or "",
+                        "teams": failure_entry.get("teams") or "",
+                        "market_type": failure_entry.get("market_type") or "",
+                        "pick": failure_entry.get("pick") or "",
+                        "qualifier": failure_entry.get("qualifier") or "",
+                        "ev_percent": failure_entry.get("ev_percent"),
+                        "expected_price_cents": failure_entry.get("expected_price") or "",
+                        "american_odds": failure_entry.get("odds") or "",
+                        "filter_name": failure_entry.get("filter_name") or "",
+                        "status": "SKIPPED",
+                    },
+                )
+            )
+        except Exception as sheet_exc:
+            print(f"[FAILED-BETS] Sheet SKIPPED row failed: {sheet_exc}")
     except Exception as e:
         print(f"[FAILED-BETS] ❌ ERROR storing failed bet: {e}")
         print(f"[FAILED-BETS] Traceback: {traceback.format_exc()}")
@@ -317,15 +363,15 @@ odds_ev_monitor = None  # primary monitor (first selected dashboard filter)
 # Sharps: all subscribed books except Kalshi unless ODDS_API_DEVIG_SHARPS is set (filter JSON can still override).
 DEFAULT_FILTER_NAME = "Kalshi All Sports (3 Sharps Live)"
 _DEFAULT_SHARPS_ORDER = [
-    "Circa", "BookMaker", "Novig", "ProphetX", "SportTrade",
-    "FanDuel", "DraftKings", "Polymarket", "Betfair",
+    "Circa", "BookMaker", "NoVig", "ProphetX", "SportTrade",
+    "FanDuel", "DraftKings", "Polymarket", "Betfair Exchange",
 ]
 DEFAULT_FILTER_PAYLOAD = {
     "state": "ND",
     "bettingBooks": ["Kalshi"],
     "displayBooks": [
         "Kalshi", "FanDuel", "Circa", "BookMaker", "DraftKings",
-        "Novig", "ProphetX", "SportTrade", "Polymarket", "Betfair",
+        "NoVig", "ProphetX", "SportTrade", "Polymarket", "Betfair Exchange",
     ],
     "leagues": [
         "SOCCER_ALL", "TENNIS_ALL", "BASKETBALL_ALL", "FOOTBALL_ALL",
@@ -350,13 +396,13 @@ DEFAULT_FILTER_PAYLOAD = {
     "minSharpLimits": [
         {"book": "BookMaker", "min": 250},
         {"book": "Circa", "min": 250},
-        {"book": "Novig", "min": 200},
+        {"book": "NoVig", "min": 200},
         {"book": "ProphetX", "min": 200},
         {"book": "SportTrade", "min": 200},
         {"book": "DraftKings", "min": 200},
         {"book": "FanDuel", "min": 200},
         {"book": "Polymarket", "min": 0},
-        {"book": "Betfair", "min": 0},
+        {"book": "Betfair Exchange", "min": 0},
     ],
     "linkType": "DESKTOP_BETSLIP",
 }
@@ -369,7 +415,7 @@ CBB_FILTER_PAYLOAD = {
     "bettingBooks": ["Kalshi"],
     "displayBooks": [
         "Kalshi", "FanDuel", "Circa", "BookMaker", "DraftKings",
-        "Novig", "ProphetX", "SportTrade", "Polymarket", "Betfair",
+        "NoVig", "ProphetX", "SportTrade", "Polymarket", "Betfair Exchange",
     ],
     "leagues": ["NCAAB"],
     "excludedCategories": ["1st Quarter", "2nd Quarter", "3rd Quarter", "4th Quarter", "1st Half", "2nd Half"],
@@ -379,7 +425,7 @@ CBB_FILTER_PAYLOAD = {
     "middleFilters": [{"sport": "Any", "minHold": 0, "minMiddle": 0}],
     "sortOrder": "ROI",
     "devigFilter": {
-        "sharps": ["FanDuel", "DraftKings", "BookMaker", "ProphetX", "Novig", "SportTrade", "Polymarket", "Betfair"],
+        "sharps": ["FanDuel", "DraftKings", "BookMaker", "ProphetX", "NoVig", "SportTrade", "Polymarket", "Betfair Exchange"],
         "method": "WORST_CASE",
         "type": "AVERAGE",
         "minEv": 0,
@@ -390,14 +436,14 @@ CBB_FILTER_PAYLOAD = {
     "oddsRanges": [{"book": "Any", "min": -500, "max": 500}],
     "minLimits": [{"book": "Any", "min": 25}, {"book": "Kalshi", "min": 75}],
     "minSharpLimits": [
-        {"book": "Novig", "min": 1000},
+        {"book": "NoVig", "min": 1000},
         {"book": "ProphetX", "min": 1000},
         {"book": "SportTrade", "min": 1000},
         {"book": "FanDuel", "min": 200},
         {"book": "DraftKings", "min": 200},
         {"book": "BookMaker", "min": 250},
         {"book": "Polymarket", "min": 0},
-        {"book": "Betfair", "min": 0},
+        {"book": "Betfair Exchange", "min": 0},
     ],
     "linkType": "DESKTOP_BETSLIP",
 }
@@ -409,6 +455,9 @@ saved_filters[CBB_FILTER_NAME] = CBB_FILTER_PAYLOAD
 # request /odds/multi for that full list; a filter may list fewer displayBooks only for alert-card columns.
 DEFAULT_FILTER_PAYLOAD["bettingBooks"] = ["Kalshi"]
 display_books_list = odds_api_master_bookmakers()
+for _extra_bk in extra_local_bookmakers():
+    if not any(str(_extra_bk).strip().lower() == str(x).strip().lower() for x in display_books_list):
+        display_books_list = list(display_books_list) + [_extra_bk]
 DEFAULT_FILTER_PAYLOAD["displayBooks"] = display_books_list
 CBB_FILTER_PAYLOAD["displayBooks"] = list(display_books_list)
 
@@ -425,10 +474,11 @@ if _sharps_csv:
         if x.strip() and _dnorm(x) != "pinnacle"
     ]
 else:
-    # Pool for minSharpBooks: every book in ODDS_API_BOOKMAKERS except Kalshi (target leg).
-    sharps_list = [b for b in display_books_list if _dnorm(b) != "kalshi"]
+    # Pool for minSharpBooks: subscribed books minus betting take venues (Kalshi, PLive).
+    sharps_list = [b for b in display_books_list if _dnorm(b) not in ("kalshi", "plive")]
 if not sharps_list:
     sharps_list = ["FanDuel", "DraftKings", "Circa"]
+sharps_list = [b for b in sharps_list if _dnorm(b) not in ("kalshi", "plive")]
 
 DEFAULT_FILTER_PAYLOAD["devigFilter"]["sharps"] = sharps_list
 # CBB: same sharp panel as main filter but keep WORST_CASE + minSharpBooks 2 in payload above.
@@ -514,8 +564,104 @@ _load_filters_state()
 
 
 def _live_odds_display_books() -> List[str]:
-    """Odds tab + /api/live_odds: always full ODDS_API_BOOKMAKERS master list (e.g. all 10)."""
-    return list(odds_api_master_bookmakers())
+    """Odds tab + /api/live_odds: Odds-API master list plus local books (PLive)."""
+    books = list(odds_api_master_bookmakers())
+    for extra in extra_local_bookmakers():
+        if not any(str(extra).strip().lower() == str(x).strip().lower() for x in books):
+            books.append(extra)
+    return books
+
+
+def _plive_status_payload() -> Dict[str, Any]:
+    feed = peek_shared_plive_feed()
+    if feed is None:
+        return {
+            "wanted": plive_wanted(),
+            "connected": False,
+            "receiving_events": False,
+            "receiving_prices": False,
+            "mlb_events": 0,
+            "mlb_with_prices": 0,
+            "samples": [],
+            "partner_id": 113,
+            "flavor": "live",
+            "sport_id": 1,
+            "message": "PLive feed not started" if plive_wanted() else "PLive disabled",
+        }
+    snap = feed.status_snapshot()
+    snap["wanted"] = True
+    if snap.get("receiving_prices"):
+        snap["message"] = (
+            f"PLive connected and receiving events with prices "
+            f"({snap.get('mlb_with_prices') or 0} MLB)"
+        )
+    elif snap.get("connected"):
+        snap["message"] = (
+            f"PLive connected · {snap.get('mlb_events') or 0} MLB events · waiting for prices"
+        )
+    else:
+        snap["message"] = f"PLive disconnected ({snap.get('last_error') or 'not connected'})"
+    return snap
+
+
+def _plive_board_rows() -> List[Dict[str, Any]]:
+    """PLive Odds-tab rows: ML plus Spread and Totals (Over/Under with the line)."""
+    feed = peek_shared_plive_feed()
+    if feed is None:
+        return []
+    rows: List[Dict[str, Any]] = []
+    for s in feed.priced_mlb_summaries():
+        eid = s.get("id")
+        home = str(s.get("home") or "")
+        away = str(s.get("away") or "")
+        teams = f"{away} @ {home}".strip(" @")
+        mkts: List[Dict[str, Any]] = []
+        try:
+            mkts = list(feed.store.markets_for_event(eid) or [])
+        except Exception:
+            mkts = []
+        if not mkts:
+            if s.get("home_am") is not None or s.get("away_am") is not None:
+                mkts.append(
+                    {
+                        "name": "ML",
+                        "odds": [{"home": s.get("home_dec"), "away": s.get("away_dec")}],
+                    }
+                )
+            if s.get("tot_line") is not None:
+                mkts.append(
+                    {
+                        "name": "Totals",
+                        "odds": [
+                            {
+                                "hdp": s.get("tot_line"),
+                                "max": s.get("tot_line"),
+                                "line": s.get("tot_line"),
+                                "over": s.get("tot_over"),
+                                "under": s.get("tot_under"),
+                            }
+                        ],
+                    }
+                )
+        extra = live_odds_board_rows_from_bookmakers(
+            event_id=eid,
+            home=home,
+            away=away,
+            teams=teams,
+            league="MLB",
+            sport_slug="baseball",
+            live=True,
+            status="live",
+            start_display="",
+            clock="",
+            clock_running=None,
+            status_detail="",
+            bks={"PLive": mkts},
+            books=["PLive"],
+            plive_only=True,
+        )
+        rows.extend(extra)
+    return rows
 
 
 def _sport_slug_event(ev: Dict[str, Any]) -> str:
@@ -576,6 +722,18 @@ def _event_matches_league_focus(ev: Dict[str, Any], focus: str) -> bool:
         if "ncaa" in slug or "NCAA" in name or "COLLEGE" in name:
             return False
         return "nfl" in slug or "NFL" in name or "NATIONAL FOOTBALL" in name
+    if f in ("ncaaf", "cfb"):
+        if sk != "americanfootball":
+            return False
+        return (
+            "ncaa" in slug
+            or "ncaaf" in slug
+            or "cfb" in slug
+            or "NCAA" in name
+            or "COLLEGE" in name
+            or "NCAAF" in name
+            or "CFB" in name
+        )
     return True
 
 
@@ -605,6 +763,70 @@ def _live_first_row(market: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return {}
 
 
+def _live_row_is_spread_paintable(row: Dict[str, Any]) -> bool:
+    if is_team_total_market_id(row.get("plive_market")):
+        return False
+    if row.get("plive_market") is not None:
+        return is_run_line_spread_row(row)
+    if row.get("over") is not None and row.get("home") is None:
+        return False
+    return True
+
+
+def _live_row_line(row: Dict[str, Any], kind: str) -> Optional[float]:
+    keys = ("hdp", "max", "line") if kind == "total" else ("hdp",)
+    for key in keys:
+        try:
+            if row.get(key) is not None:
+                return float(row[key])
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _live_row_for_kind(
+    market: Optional[Dict[str, Any]], kind: str, line: Optional[float] = None
+) -> Dict[str, Any]:
+    """Same-line only. Never take book A's first alt / team-total as book B's run line."""
+    if not market:
+        return {}
+    rows = [r for r in (market.get("odds") or []) if isinstance(r, dict)]
+    if kind == "spread":
+        rows = [r for r in rows if _live_row_is_spread_paintable(r)]
+    if kind == "ml" or line is None:
+        return rows[0] if rows else {}
+    for r in rows:
+        got = _live_row_line(r, kind)
+        if got is not None and _numeric_close(got, line):
+            return r
+    return {}
+
+
+def _live_collect_lines(
+    bks: Dict[str, Any], books: List[str], mname: str, kind: str
+) -> List[Optional[float]]:
+    if kind == "ml":
+        return [None]
+    seen: List[float] = []
+    prefs = ["Kalshi", "PLive", "FanDuel", "DraftKings"] + list(books)
+    for bk in prefs:
+        mk = _live_find_market(_live_mkts_for_book(bks, bk), mname)
+        for r in (mk or {}).get("odds") or []:
+            if not isinstance(r, dict):
+                continue
+            if kind == "spread" and not _live_row_is_spread_paintable(r):
+                continue
+            ln = _live_row_line(r, kind)
+            if ln is None:
+                continue
+            if any(_numeric_close(ln, x) for x in seen):
+                continue
+            seen.append(ln)
+            if len(seen) >= 8:
+                return seen
+    return seen or [None]
+
+
 def _live_float_dec(x: Any) -> Optional[float]:
     try:
         if x is None:
@@ -615,35 +837,422 @@ def _live_float_dec(x: Any) -> Optional[float]:
         return None
 
 
-def _live_pick_ml_name(bks: Dict[str, Any]) -> str:
-    """Odds-API.io docs use market name ``ML`` for match winner; fall back to Moneyline synonyms."""
-    for pref in ("Kalshi", "FanDuel", "DraftKings"):
+def _live_market_kind_of_name(name: str) -> Optional[str]:
+    u = str(name or "").upper()
+    if "PLAYER" in u:
+        return None
+    if "TEAM" in u and "TOTAL" in u:
+        return None
+    if "TOTAL" in u or u in ("OU", "O/U") or ("OVER" in u and "UNDER" in u):
+        return "total"
+    if "SPREAD" in u or "HANDICAP" in u or "PUCK" in u:
+        return "spread"
+    if u == "ML" or "MONEY" in u or "WINNER" in u:
+        return "ml"
+    return None
+
+
+def _live_pick_kind_name(bks: Dict[str, Any], kind: str) -> Optional[str]:
+    """First book market name for ML, Spread, or Totals. GAMELINES includes all three."""
+    want = str(kind or "").lower()
+    prefs = ("Kalshi", "FanDuel", "DraftKings", "PLive")
+    for pref in prefs:
         for m in _live_mkts_for_book(bks, pref):
             n = str(m.get("name") or "").strip()
-            u = n.upper()
-            if "PLAYER" in u:
-                continue
-            if u == "ML":
-                return n
-    for pref in ("Kalshi", "FanDuel", "DraftKings"):
-        for m in _live_mkts_for_book(bks, pref):
-            n = str(m.get("name") or "").strip()
-            u = n.upper()
-            if "PLAYER" in u:
-                continue
-            if "MONEY" in u or u in ("MONEYLINE",) or "WINNER" in u:
+            if _live_market_kind_of_name(n) == want:
                 return n
     for _bk, mkts in (bks or {}).items():
         if not isinstance(mkts, list):
             continue
         for m in mkts:
             n = str(m.get("name") or "").strip()
-            u = n.upper()
-            if "PLAYER" in u:
-                continue
-            if u == "ML" or "MONEY" in u or "WINNER" in u:
+            if _live_market_kind_of_name(n) == want:
                 return n
-    return "ML"
+    return None
+
+
+def _live_pick_ml_name(bks: Dict[str, Any]) -> str:
+    """Odds-API.io docs use market name ``ML`` for match winner; fall back to Moneyline synonyms."""
+    return _live_pick_kind_name(bks, "ml") or "ML"
+
+
+def _live_prices_for_kind(
+    bks: Dict[str, Any],
+    books: List[str],
+    mname: str,
+    kind: str,
+    line: Optional[float] = None,
+) -> Dict[str, Dict[str, Any]]:
+    prices: Dict[str, Dict[str, Any]] = {}
+    for bk in books:
+        mk = _live_find_market(_live_mkts_for_book(bks, bk), mname)
+        row = _live_row_for_kind(mk, kind, line)
+        if kind == "total":
+            d_over = _live_float_dec(row.get("over"))
+            d_under = _live_float_dec(row.get("under"))
+            prices[bk] = {
+                "away_dec": d_over,
+                "home_dec": d_under,
+                "away_am": int(decimal_to_american(d_over)) if d_over else None,
+                "home_am": int(decimal_to_american(d_under)) if d_under else None,
+            }
+        else:
+            dh = _live_float_dec(row.get("home"))
+            da = _live_float_dec(row.get("away"))
+            prices[bk] = {
+                "home_dec": dh,
+                "away_dec": da,
+                "home_am": int(decimal_to_american(dh)) if dh else None,
+                "away_am": int(decimal_to_american(da)) if da else None,
+            }
+    return prices
+
+
+def _live_market_has_any_price(prices: Dict[str, Dict[str, Any]]) -> bool:
+    for row in prices.values():
+        if row.get("home_am") is not None or row.get("away_am") is not None:
+            return True
+    return False
+
+
+def _live_pick_family_name(bks: Dict[str, Any], family: str) -> Optional[str]:
+    """First priced market name in this family (ml / spread / totals). Team totals are other."""
+    prefs = ("Kalshi", "FanDuel", "DraftKings", "PLive")
+
+    def _from_book(book: str) -> Optional[str]:
+        for m in _live_mkts_for_book(bks, book):
+            n = str(m.get("name") or "").strip()
+            if _ws_market_family(n) == family:
+                return n
+        return None
+
+    for pref in prefs:
+        n = _from_book(pref)
+        if n:
+            return n
+    for _bk, mkts in (bks or {}).items():
+        if not isinstance(mkts, list):
+            continue
+        for m in mkts:
+            n = str(m.get("name") or "").strip()
+            if _ws_market_family(n) == family:
+                return n
+    return None
+
+
+def _live_am_from_dec(d: Optional[float]) -> Optional[int]:
+    return int(decimal_to_american(d)) if d else None
+
+
+def _live_odds_ml_prices(bks: Dict[str, Any], books: List[str], ml_name: str) -> Dict[str, Dict[str, Any]]:
+    prices: Dict[str, Dict[str, Any]] = {}
+    for bk in books:
+        mk = _live_find_market(_live_mkts_for_book(bks, bk), ml_name)
+        row = _live_first_row(mk)
+        dh = _live_float_dec(row.get("home"))
+        da = _live_float_dec(row.get("away"))
+        prices[bk] = {
+            "home_dec": dh,
+            "away_dec": da,
+            "home_am": _live_am_from_dec(dh),
+            "away_am": _live_am_from_dec(da),
+        }
+    apply_betmgm_ml_grid_consensus_fix(prices, books)
+    return prices
+
+
+def _live_odds_line_prices(
+    bks: Dict[str, Any],
+    books: List[str],
+    mname: str,
+    ref_row: Dict[str, Any],
+    family: str,
+) -> Dict[str, Dict[str, Any]]:
+    prices: Dict[str, Dict[str, Any]] = {}
+    line = total_line_value(ref_row) if family == "totals" else None
+    for bk in books:
+        mk = _live_find_market(_live_mkts_for_book(bks, bk), mname)
+        picked = _pick_matching_odds_row(mk or {}, mname, ref_row) if mk else {}
+        if family == "totals":
+            over = _live_float_dec(picked.get("over"))
+            under = _live_float_dec(picked.get("under"))
+            # First board row is Over (away_* slot); second is Under (home_* slot).
+            prices[bk] = {
+                "home_dec": under,
+                "away_dec": over,
+                "home_am": _live_am_from_dec(under),
+                "away_am": _live_am_from_dec(over),
+                "over_dec": over,
+                "under_dec": under,
+                "over_am": _live_am_from_dec(over),
+                "under_am": _live_am_from_dec(under),
+                "line": line,
+            }
+        else:
+            if picked and not _live_row_is_spread_paintable(picked):
+                picked = {}
+            dh = _live_float_dec(picked.get("home"))
+            da = _live_float_dec(picked.get("away"))
+            prices[bk] = {
+                "home_dec": dh,
+                "away_dec": da,
+                "home_am": _live_am_from_dec(dh),
+                "away_am": _live_am_from_dec(da),
+                "hdp": picked.get("hdp") if picked else ref_row.get("hdp"),
+            }
+    return prices
+
+
+def _live_odds_finish_row(
+    *,
+    event_id: Any,
+    teams: str,
+    league: str,
+    sport_slug: str,
+    live: bool,
+    status: str,
+    start_display: str,
+    clock: Any,
+    clock_running: Any,
+    status_detail: Any,
+    market: str,
+    prices: Dict[str, Dict[str, Any]],
+    score: Any = "",
+    game_status: Any = "",
+    side_a: Optional[str] = None,
+    side_b: Optional[str] = None,
+    line: Any = None,
+    plive_only: bool = False,
+) -> Dict[str, Any]:
+    bh, ham = _live_best_side(prices, "home_dec")
+    ba, aam = _live_best_side(prices, "away_dec")
+    row: Dict[str, Any] = {
+        "event_id": event_id,
+        "teams": teams,
+        "league": league,
+        "sport_slug": sport_slug,
+        "live": live,
+        "status": status,
+        "clock": clock,
+        "clock_running": clock_running,
+        "statusDetail": status_detail,
+        "score": score,
+        "game_status": game_status,
+        "start_display": start_display,
+        "market": market,
+        "market_kind": {"ml": "ml", "spread": "spread", "totals": "total"}.get(
+            _ws_market_family(market)
+        ),
+        "books": prices,
+        "best": {
+            "home_book": bh,
+            "home_am": ham,
+            "away_book": ba,
+            "away_am": aam,
+        },
+    }
+    if side_a:
+        row["side_a"] = side_a
+    if side_b:
+        row["side_b"] = side_b
+    if line is not None:
+        row["line"] = line
+    if plive_only:
+        row["plive_only"] = True
+    return row
+
+
+def live_odds_board_rows_from_bookmakers(
+    *,
+    event_id: Any,
+    home: str,
+    away: str,
+    teams: str,
+    league: str,
+    sport_slug: str,
+    live: bool,
+    status: str,
+    start_display: str,
+    bks: Dict[str, Any],
+    books: List[str],
+    clock: Any = "",
+    clock_running: Any = None,
+    status_detail: Any = "",
+    score: Any = "",
+    game_status: Any = "",
+    plive_only: bool = False,
+) -> List[Dict[str, Any]]:
+    """One ML row plus Spread and Totals (Over/Under with the line). Team totals omitted."""
+    common = dict(
+        event_id=event_id,
+        teams=teams,
+        league=league,
+        sport_slug=sport_slug,
+        live=live,
+        status=status,
+        start_display=start_display,
+        clock=clock,
+        clock_running=clock_running,
+        status_detail=status_detail,
+        score=score,
+        game_status=game_status,
+        plive_only=plive_only,
+    )
+    out: List[Dict[str, Any]] = []
+    ml_name = _live_pick_ml_name(bks) if _live_pick_family_name(bks, "ml") else None
+    if ml_name:
+        prices = _live_odds_ml_prices(bks, books, ml_name)
+        if any(
+            (p.get("home_am") is not None) or (p.get("away_am") is not None)
+            for p in prices.values()
+        ):
+            out.append(
+                _live_odds_finish_row(
+                    **common,
+                    market=ml_name,
+                    prices=prices,
+                    side_a=away or "Away",
+                    side_b=home or "Home",
+                )
+            )
+
+    sp_name = _live_pick_family_name(bks, "spread")
+    if sp_name:
+        sp_mk = None
+        for pref in ("Kalshi", "FanDuel", "DraftKings", "PLive"):
+            sp_mk = _live_find_market(_live_mkts_for_book(bks, pref), sp_name)
+            if sp_mk:
+                break
+        if not sp_mk:
+            for _bk, mkts in (bks or {}).items():
+                if isinstance(mkts, list):
+                    sp_mk = _live_find_market(mkts, sp_name)
+                    if sp_mk:
+                        break
+        for ref in ((sp_mk or {}).get("odds") or [])[:8]:
+            if not isinstance(ref, dict):
+                continue
+            if not _live_row_is_spread_paintable(ref):
+                continue
+            if ref.get("over") is not None and ref.get("home") is None:
+                continue
+            if ref.get("hdp") is None:
+                continue
+            prices = _live_odds_line_prices(bks, books, sp_name, ref, "spread")
+            if not any(
+                (p.get("home_am") is not None) or (p.get("away_am") is not None)
+                for p in prices.values()
+            ):
+                continue
+            a_pick, a_qual, _ = _pick_qualifier_line_for_side(home, away, sp_name, "away", ref)
+            h_pick, h_qual, _ = _pick_qualifier_line_for_side(home, away, sp_name, "home", ref)
+            side_a = f"{a_pick} {a_qual}".strip() if a_qual else (a_pick or away)
+            side_b = f"{h_pick} {h_qual}".strip() if h_qual else (h_pick or home)
+            out.append(
+                _live_odds_finish_row(
+                    **common,
+                    market=sp_name,
+                    prices=prices,
+                    side_a=side_a,
+                    side_b=side_b,
+                    line=ref.get("hdp"),
+                )
+            )
+
+    tot_name = _live_pick_family_name(bks, "totals")
+    if tot_name:
+        tot_mk = None
+        for pref in ("Kalshi", "FanDuel", "DraftKings", "PLive"):
+            tot_mk = _live_find_market(_live_mkts_for_book(bks, pref), tot_name)
+            if tot_mk:
+                break
+        if not tot_mk:
+            for _bk, mkts in (bks or {}).items():
+                if isinstance(mkts, list):
+                    tot_mk = _live_find_market(mkts, tot_name)
+                    if tot_mk:
+                        break
+        for ref in ((tot_mk or {}).get("odds") or [])[:8]:
+            if not isinstance(ref, dict):
+                continue
+            line = total_line_value(ref)
+            if line is None:
+                continue
+            if ref.get("over") is None or ref.get("under") is None:
+                continue
+            prices = _live_odds_line_prices(bks, books, tot_name, ref, "totals")
+            if not any(
+                (p.get("away_am") is not None) or (p.get("home_am") is not None)
+                for p in prices.values()
+            ):
+                continue
+            line_s = f"{line:g}" if float(line).is_integer() else f"{line:.1f}"
+            try:
+                line_s = f"{float(line):.1f}"
+            except (TypeError, ValueError):
+                line_s = str(line)
+            out.append(
+                _live_odds_finish_row(
+                    **common,
+                    market=tot_name,
+                    prices=prices,
+                    side_a=f"Over {line_s}",
+                    side_b=f"Under {line_s}",
+                    line=line,
+                )
+            )
+    return out
+
+
+def _live_odds_row_merge_key(row: Dict[str, Any]) -> Tuple[str, str, str]:
+    eid = str(row.get("event_id") or "")
+    teams = str(row.get("teams") or "").lower()
+    fam = _ws_market_family(row.get("market"))
+    line = row.get("line")
+    line_s = "" if fam == "ml" or line is None else str(line)
+    return (eid or teams, fam, line_s)
+
+
+def _merge_plive_into_live_odds_rows(
+    rows_out: List[Dict[str, Any]], extras: List[Dict[str, Any]]
+) -> None:
+    """Add PLive Totals/Spread even when the event already has an ML row. Merge same line."""
+    index = {_live_odds_row_merge_key(r): r for r in rows_out}
+    for extra in extras:
+        key = _live_odds_row_merge_key(extra)
+        existing = index.get(key)
+        if existing is None and extra.get("event_id") is not None:
+            want_eid = str(extra.get("event_id"))
+            want_fam = _ws_market_family(extra.get("market"))
+            want_line = extra.get("line")
+            for r in rows_out:
+                if str(r.get("event_id")) != want_eid:
+                    continue
+                if _ws_market_family(r.get("market")) != want_fam:
+                    continue
+                if want_fam != "ml" and r.get("line") != want_line:
+                    continue
+                existing = r
+                break
+        if existing is None:
+            rows_out.append(extra)
+            index[key] = extra
+            continue
+        books = existing.setdefault("books", {})
+        for bk, blob in (extra.get("books") or {}).items():
+            books[bk] = blob
+        if extra.get("side_a") and not existing.get("side_a"):
+            existing["side_a"] = extra["side_a"]
+        if extra.get("side_b") and not existing.get("side_b"):
+            existing["side_b"] = extra["side_b"]
+        bh, ham = _live_best_side(books, "home_dec")
+        ba, aam = _live_best_side(books, "away_dec")
+        existing["best"] = {
+            "home_book": bh,
+            "home_am": ham,
+            "away_book": ba,
+            "away_am": aam,
+        }
 
 
 def _live_find_market(book_odds: List[Dict[str, Any]], name: str) -> Optional[Dict[str, Any]]:
@@ -783,12 +1392,14 @@ async def _live_odds_build_snapshot_with_client(
     league_focus: str = "all",
 ) -> Dict[str, Any]:
     if not getattr(client, "api_key", ""):
+        plive_rows = _plive_board_rows()
         return {
-            "ok": False,
-            "error": "ODDS_API_KEY missing",
+            "ok": bool(plive_rows),
+            "error": None if plive_rows else "ODDS_API_KEY missing",
             "updated": time.time(),
             "books": books,
-            "events": [],
+            "events": plive_rows,
+            "plive": _plive_status_payload(),
         }
     if not books:
         return {
@@ -885,13 +1496,15 @@ async def _live_odds_build_snapshot_with_client(
     odds_by_id: Dict[int, Dict[str, Any]] = {}
     if ids:
         try:
-            for doc in await client.get_odds_multi(ids, books):
+            docs, _src = await resolve_odds_docs(client, ids, books)
+            merge_plive_into_docs(docs)
+            for doc in docs:
                 if isinstance(doc, dict) and doc.get("id") is not None:
                     odds_by_id[int(doc["id"])] = doc
         except Exception as e:
             return {
                 "ok": False,
-                "error": f"get_odds_multi failed: {e}",
+                "error": f"odds resolve failed: {e}",
                 "updated": time.time(),
                 "books": books,
                 "timing": timing_l,
@@ -912,29 +1525,13 @@ async def _live_odds_build_snapshot_with_client(
                 books_with_lines.append(canon)
     books_with_lines.sort(key=lambda s: s.lower())
     rows_out: List[Dict[str, Any]] = []
-    max_rows = 45 if timing_l in ("pregame", "both") else 40
-    for e in ev_list[:max_rows]:
+    max_events = 30 if timing_l in ("pregame", "both") else 28
+    for e in ev_list[:max_events]:
         eid = int(e["id"])
         doc = odds_by_id.get(eid) or {}
         bks = doc.get("bookmakers") or {}
         home = str(e.get("home") or "")
         away = str(e.get("away") or "")
-        ml_name = _live_pick_ml_name(bks)
-        prices: Dict[str, Dict[str, Any]] = {}
-        for bk in books:
-            mk = _live_find_market(_live_mkts_for_book(bks, bk), ml_name)
-            row = _live_first_row(mk)
-            dh = _live_float_dec(row.get("home"))
-            da = _live_float_dec(row.get("away"))
-            prices[bk] = {
-                "home_dec": dh,
-                "away_dec": da,
-                "home_am": int(decimal_to_american(dh)) if dh else None,
-                "away_am": int(decimal_to_american(da)) if da else None,
-            }
-        apply_betmgm_ml_grid_consensus_fix(prices, books)
-        bh, ham = _live_best_side(prices, "home_dec")
-        ba, aam = _live_best_side(prices, "away_dec")
         league = e.get("league")
         if isinstance(league, dict):
             league_s = str(league.get("name") or league.get("slug") or "")
@@ -944,30 +1541,46 @@ async def _live_odds_build_snapshot_with_client(
         dt = _parse_event_start(e)
         if dt is not None:
             start_s = dt.astimezone().strftime("%Y-%m-%d %H:%M %Z")
-        rows_out.append(
-            {
-                "event_id": eid,
-                "teams": f"{away} @ {home}" if away and home else str(e.get("name") or ""),
-                "league": league_s,
-                "sport_slug": _sport_slug_event(e),
-                "live": _event_is_live(e),
-                "status": str(e.get("status") or e.get("state") or ""),
-                "start_display": start_s,
-                "market": ml_name,
-                "books": prices,
-                "best": {
-                    "home_book": bh,
-                    "home_am": ham,
-                    "away_book": ba,
-                    "away_am": aam,
-                },
-            }
+        ws_meta = None
+        _ws = peek_shared_odds_ws_feed()
+        if _ws is not None:
+            ws_meta = _ws.store.event_meta.get(eid)
+        clock_fields = clock_fields_for_live_odds(e, doc, ws_meta)
+        rows_out.extend(
+            live_odds_board_rows_from_bookmakers(
+                event_id=eid,
+                home=home,
+                away=away,
+                teams=f"{away} @ {home}" if away and home else str(e.get("name") or ""),
+                league=league_s,
+                sport_slug=_sport_slug_event(e),
+                live=_event_is_live(e),
+                status=str(
+                    e.get("status")
+                    or e.get("state")
+                    or (doc or {}).get("status")
+                    or (ws_meta or {}).get("status")
+                    or ""
+                ),
+                start_display=start_s,
+                clock=clock_fields["clock"],
+                clock_running=clock_fields["clock_running"],
+                status_detail=clock_fields["statusDetail"],
+                score=clock_fields.get("score") or "",
+                game_status=clock_fields.get("game_status") or "",
+                bks=bks,
+                books=books,
+            )
         )
     _log_live_odds_book_flow_and_pipeline(books, rows_out, timing_l, sport_l)
+    sport_wants_plive = sport_l in ("all", "baseball") or lf in ("all", "mlb")
+    if sport_wants_plive:
+        _merge_plive_into_live_odds_rows(rows_out, _plive_board_rows())
     return {
         "ok": True,
         "updated": time.time(),
         "books": books,
+        "plive": _plive_status_payload(),
         "timing": timing_l,
         "sport": sport_l,
         "sport_api": sport_slug_query_for_api(sport_l) if sport_l != "all" else None,
@@ -1071,14 +1684,9 @@ def init_google_sheets():
         try:
             worksheet = spreadsheet.worksheet(GOOGLE_SHEETS_WORKSHEET_NAME)
         except gspread.exceptions.WorksheetNotFound:
-            worksheet = spreadsheet.add_worksheet(title=GOOGLE_SHEETS_WORKSHEET_NAME, rows=1000, cols=20)
-            # Write header
-            headers = [
-                'Timestamp', 'Order ID', 'Ticker', 'Side', 'Teams', 'Market Type', 'Pick', 'Qualifier',
-                'EV %', 'Expected Price (¢)', 'Executed Price (¢)', 'American Odds',
-                'Contracts', 'Cost ($)', 'Payout ($)', 'Win Amount ($)', 'Sport', 'Status', 'Result', 'PNL ($)', 'Settled', 'Filter Name', 'Devig Books'
-            ]
-            worksheet.append_row(headers)
+            worksheet = spreadsheet.add_worksheet(title=GOOGLE_SHEETS_WORKSHEET_NAME, rows=1000, cols=32)
+            # First 23 columns stay in grade_bets order. Extra fields are appended.
+            worksheet.append_row(list(AUTO_BET_SHEET_HEADERS))
         
         print(f"[GOOGLE SHEETS] OK: Connected to spreadsheet: {spreadsheet.title}")
         return worksheet
@@ -1102,35 +1710,15 @@ def write_auto_bet_to_sheets(bet_data: Dict):
             import gspread
             spreadsheet = google_sheets_client.open_by_key(GOOGLE_SHEETS_SPREADSHEET_ID)
             worksheet = spreadsheet.worksheet(GOOGLE_SHEETS_WORKSHEET_NAME)
-            
-            # Convert bet_data dict to row (matching header order)
-            # Removed 'Kalshi Odds' (duplicate of 'American Odds'), moved 'Devig Books' to end
-            row = [
-                bet_data.get('timestamp', ''),
-                bet_data.get('order_id', ''),
-                bet_data.get('ticker', ''),
-                bet_data.get('side', ''),
-                bet_data.get('teams', ''),
-                bet_data.get('market_type', ''),
-                bet_data.get('pick', ''),
-                bet_data.get('qualifier', ''),
-                bet_data.get('ev_percent', ''),
-                bet_data.get('expected_price_cents', ''),
-                bet_data.get('executed_price_cents', ''),
-                bet_data.get('american_odds', ''),
-                bet_data.get('contracts', ''),
-                bet_data.get('cost', ''),
-                bet_data.get('payout', ''),
-                bet_data.get('win_amount', ''),
-                bet_data.get('sport', ''),
-                bet_data.get('status', ''),
-                bet_data.get('result', ''),
-                bet_data.get('pnl', ''),
-                bet_data.get('settled', ''),
-                bet_data.get('filter_name', ''),  # Filter name
-                bet_data.get('devig_books', '')  # Devig books with odds (moved to end)
-            ]
-            
+            try:
+                current_header = worksheet.row_values(1)
+                wanted = ensure_sheet_extra_headers(current_header)
+                if wanted != list(current_header or []):
+                    worksheet.update("A1", [wanted])
+            except Exception:
+                pass
+            # First 23 columns stay locked. New fields are appended only.
+            row = auto_bet_sheet_row(bet_data)
             worksheet.append_row(row)
             print(f"[GOOGLE SHEETS] OK: Wrote bet to sheet: {bet_data.get('ticker')} - {bet_data.get('pick')}")
             return
@@ -1146,22 +1734,16 @@ def write_auto_bet_to_csv(bet_data: Dict):
     """Write auto-bet record to CSV file (appends if file exists)"""
     file_exists = os.path.exists(AUTO_BET_CSV_FILE)
     
-    # CSV columns (matching Google Sheets structure: removed 'kalshi_odds', moved 'devig_books' to end)
-    fieldnames = [
-        'timestamp', 'order_id', 'ticker', 'side', 'teams', 'market_type', 'pick', 'qualifier',
-        'ev_percent', 'expected_price_cents', 'executed_price_cents', 'american_odds',
-        'contracts', 'cost', 'payout', 'win_amount', 'sport', 'status', 'result', 'pnl', 'settled', 'filter_name', 'devig_books'
-    ]
-    
+    fieldnames = list(AUTO_BET_CSV_FIELDNAMES)
+
     try:
         with open(AUTO_BET_CSV_FILE, 'a', newline='', encoding='utf-8') as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction="ignore")
+
             # Write header if file is new
             if not file_exists:
                 writer.writeheader()
-            
-            # Write bet record
+
             writer.writerow(bet_data)
             print(f"[AUTO-BET CSV] OK: Wrote bet to {AUTO_BET_CSV_FILE}: {bet_data.get('ticker')} - {bet_data.get('pick')}")
     except Exception as e:
@@ -1259,6 +1841,9 @@ def get_auto_bet_stats():
             for row in rows:
                 if len(row) < 22:  # Skip incomplete rows (was 21, now 22 after removing Kalshi Odds and moving Devig Books)
                     continue
+                status = str(row[17] or "").strip().upper()
+                if status == "SKIPPED":
+                    continue
                 
                 try:
                     cost = float(row[13] or 0)  # Cost column (was 14, now 13 after removing Kalshi Odds)
@@ -1288,6 +1873,8 @@ def get_auto_bet_stats():
                 reader = csv.DictReader(csvfile)
                 for row in reader:
                     try:
+                        if str(row.get("status") or "").strip().upper() == "SKIPPED":
+                            continue
                         cost = float(row.get('cost', 0) or 0)
                         pnl_str = row.get('pnl', '0.00') or '0.00'
                         pnl = float(pnl_str.replace('$', '').replace(',', '') or 0)
@@ -1641,9 +2228,11 @@ def create_alert_id(alert: EvAlert) -> str:
     # Also include filter_name if available to distinguish same alert from different filters
     filter_name = getattr(alert, 'filter_name', '') or ''
     ev_source = getattr(alert, "ev_source", "") or "odds_api_value_bets"
+    take_book = getattr(alert, "take_book", "") or "Kalshi"
     # Same edge from API feed vs local scan must not collide; keep legacy IDs for default feed.
     src_part = f"|{ev_source}" if ev_source != "odds_api_value_bets" else ""
-    key = f"{alert.ticker}|{alert.pick}|{alert.qualifier}|{alert.market_type}|{filter_name}{src_part}"
+    take_part = f"|{take_book}" if str(take_book).lower() != "kalshi" else ""
+    key = f"{alert.ticker}|{alert.pick}|{alert.qualifier}|{alert.market_type}|{filter_name}{src_part}{take_part}"
     # Use MD5 hash and take first 10 digits for consistent ID
     hash_obj = hashlib.md5(key.encode('utf-8'))
     hash_hex = hash_obj.hexdigest()
@@ -1652,11 +2241,116 @@ def create_alert_id(alert: EvAlert) -> str:
     return str(hash_int % (10 ** 10))  # Return as string for consistency
 
 
+def _is_plive_take_alert(alert: EvAlert) -> bool:
+    """PLive-take cards list without a Kalshi ticker. Href-less O/U must not go through match_failed."""
+    if str(getattr(alert, "take_book", "") or "").strip().lower() == "plive":
+        return True
+    if str(getattr(alert, "ev_source", "") or "").strip().lower() == "plive_take":
+        return True
+    ticker = str(getattr(alert, "ticker", "") or "")
+    if ticker.upper().startswith("PLIVE|"):
+        return True
+    return False
+
+
+def _row_is_plive_take(row: Dict) -> bool:
+    if not isinstance(row, dict):
+        return False
+    if str(row.get("take_book") or "").strip().lower() == "plive":
+        return True
+    if str(row.get("ev_source") or "").strip().lower() == "plive_take":
+        return True
+    ticker = str(row.get("ticker") or "")
+    if ticker.upper().startswith("PLIVE|"):
+        return True
+    return False
+
+
+async def handle_plive_take_display_alert(alert: EvAlert) -> None:
+    """PLive take card: same keep/kill as Kalshi. No Kalshi ticker match. No auto-bet."""
+    global active_alerts, dashboard_min_ev, selected_dashboard_filters
+    filter_name = getattr(alert, "filter_name", "") or ""
+    if filter_name and filter_name not in selected_dashboard_filters:
+        print(f"[ALERT] SKIP: PLive take from filter '{filter_name}' not in selected dashboard filters")
+        return
+    if not is_plus_print_ev(alert.ev_percent, dashboard_min_ev):
+        print(
+            f"❌ Filtered PLive take (EV {alert.ev_percent:.2f}% not plus / min {dashboard_min_ev:.2f}%): "
+            f"{alert.teams} - {alert.pick}"
+        )
+        return
+    alert_id = create_alert_id(alert)
+    price_cents = getattr(alert, "price_cents", None)
+    if price_cents is None:
+        price_cents = market_matcher.parse_odds_to_price_cents(alert.odds)
+    american_odds = price_to_american_odds(price_cents) if price_cents else "N/A"
+    sharp_books = []
+    if filter_name and filter_name in saved_filters:
+        payload = saved_filters[filter_name]
+        sharp_books = list((payload.get("devigFilter") or {}).get("sharps") or [])
+    sharp_books = [b for b in sharp_books if str(b).strip().lower() != "plive"]
+    if not any(str(b).strip().lower() == "kalshi" for b in sharp_books):
+        sharp_books = ["Kalshi", *sharp_books]
+    ticker = getattr(alert, "ticker", None) or f"PLIVE|{alert.teams}|{alert.pick}|{alert.qualifier}"
+    alert_data = {
+        "id": alert_id,
+        "timestamp": alert.timestamp.isoformat(),
+        "market_type": alert.market_type,
+        "teams": alert.teams,
+        "pick": alert.pick,
+        "qualifier": alert.qualifier,
+        "ev_percent": alert.ev_percent,
+        "expected_profit": alert.expected_profit,
+        "odds": alert.odds,
+        "liquidity": alert.liquidity,
+        "book_price": american_odds,
+        "fair_odds": alert.fair_odds,
+        "ticker": ticker,
+        "event_ticker": None,
+        "side": None,
+        "price_cents": price_cents,
+        "american_odds": american_odds,
+        "match_confidence": 1.0,
+        "market_url": alert.market_url,
+        "display_books": getattr(alert, "display_books", {}),
+        "devig_books": [b for b in (getattr(alert, "devig_books", []) or []) if str(b).strip().lower() != "plive"],
+        "sharp_books": sharp_books,
+        "market_data": None,
+        "filter_name": filter_name,
+        "expiry": (datetime.now() + timedelta(seconds=30)).timestamp(),
+        "last_seen": time.time(),
+        "match_failed": False,
+        "strict_pass": getattr(alert, "strict_pass", True),
+        "autobet_allow": False,
+        "ev_source": getattr(alert, "ev_source", "plive_take"),
+        "take_book": "PLive",
+        "line": getattr(alert, "line", None),
+        "live": getattr(alert, "live", None),
+        "clock": getattr(alert, "clock", None),
+        "clock_running": getattr(alert, "clock_running", None),
+        "status_detail": getattr(alert, "status_detail", None) or "",
+        "statusDetail": getattr(alert, "status_detail", None) or getattr(alert, "statusDetail", None) or "",
+        "score": getattr(alert, "score", None) or "",
+        "scores": getattr(alert, "scores", None),
+        "game_status": getattr(alert, "game_status", None) or "",
+        "book_updated_at": getattr(alert, "book_updated_at", None) or {},
+        "kalshi_last_trade_ts": getattr(alert, "kalshi_last_trade_ts", None),
+    }
+    active_alerts[alert_id] = alert_data
+    print(
+        f"[ALERT] ✅ Emitting PLive take card: EV {alert.ev_percent:.2f}% | {alert.teams} - {alert.pick}"
+    )
+    socketio.emit("new_alert", alert_data)
+
+
 async def handle_new_alert(alert: EvAlert):
     """Handle a new alert from the Odds-API.io monitor — optimized for speed (async)."""
     global active_alerts, dashboard_min_ev, selected_dashboard_filters, selected_auto_bettor_filters, auto_bet_settings_by_filter, auto_bet_ev_min
     filter_name = getattr(alert, 'filter_name', '') or ''
     print(f"[HANDLE ALERT] 📥 Received alert | filter={filter_name} | {alert.teams} - {alert.pick} ({alert.ev_percent:.2f}% EV)")
+    if _is_plive_take_alert(alert):
+        await handle_plive_take_display_alert(alert)
+        return
     
     # CRITICAL: Check if this is a high-EV alert that should trigger auto-bet
     # Do this FIRST before any filtering, so we can track ALL high-EV alerts
@@ -1692,6 +2386,9 @@ async def handle_new_alert(alert: EvAlert):
             elif ticker_upper.startswith('KXEPL'):
                 print(f"[HANDLE ALERT] ⚽ EPL ALERT DETECTED: {event_ticker} - {alert.teams} - {alert.pick}")
         
+        if event_ticker and str(event_ticker).upper().startswith("KXSCAN"):
+            print(f"[HANDLE ALERT] Dropping synthetic KXSCAN ticker (not a Kalshi market): {event_ticker}")
+            return
         if not event_ticker:
             filter_name = getattr(alert, 'filter_name', '') or ''
             if 'CBB' in filter_name or 'NCAAB' in filter_name:
@@ -1816,20 +2513,17 @@ async def handle_new_alert(alert: EvAlert):
                     except Exception as e:
                         print(f"      Error extracting team codes: {e}")
             
-            print(f"   Alert will still be shown on dashboard for manual betting, but auto-betting is disabled")
+            print(f"   Unmatched card omitted from the alert list (failed_auto_bet / alert_match_failed only)")
             
-            # Build basic alert_data even when matching fails (for manual betting)
             alert_id = create_alert_id(alert)
             filter_name = getattr(alert, 'filter_name', '')
             
-            # Extract sharp books from filter (for frontend display)
             sharp_books = []
             if filter_name and filter_name in saved_filters:
                 filter_payload = saved_filters[filter_name]
                 if 'devigFilter' in filter_payload and 'sharps' in filter_payload['devigFilter']:
                     sharp_books = filter_payload['devigFilter']['sharps']
             
-            # Build basic alert data (without market matching)
             price_cents = getattr(alert, 'price_cents', None)
             if price_cents is None:
                 price_cents = market_matcher.parse_odds_to_price_cents(alert.odds)
@@ -1868,26 +2562,11 @@ async def handle_new_alert(alert: EvAlert):
                 'ev_source': getattr(alert, 'ev_source', 'odds_api_value_bets'),
             }
             
-            # Store in active_alerts (for dashboard display)
-            active_alerts[alert_id] = alert_data
-            
-            # Emit to dashboard (for manual betting) - skip auto-betting
+            # Do not store unmatched rows on the live list and do not emit new_alert.
             alert_filter_name = getattr(alert, 'filter_name', None) or alert_data.get('filter_name')
-            
-            if alert_filter_name and alert_filter_name not in selected_dashboard_filters:
-                print(f"[ALERT] SKIP: Alert from filter '{alert_filter_name}' not in selected dashboard filters")
-                return
-            
-            show_unmatched = alert.ev_percent >= dashboard_min_ev or not getattr(alert, 'strict_pass', True)
-            if show_unmatched:
-                print(
-                    f"[ALERT] ✅ Emitting unmatched alert to dashboard: EV {alert.ev_percent:.2f}% "
-                    f"(min {dashboard_min_ev:.2f}% or diagnostic strict_pass=False)"
-                )
+            if unmatched_alert_should_emit_new_alert(alert_data):
                 socketio.emit('new_alert', alert_data)
-                print(f"New alert (unmatched): {alert.teams} - {alert.pick} ({alert.ev_percent:.2f}% EV)")
-            else:
-                print(f"❌ Filtered unmatched alert (EV {alert.ev_percent:.2f}% < min {dashboard_min_ev:.2f}%)")
+            fanout_unmatched_alert(socketio.emit, alert_data)
             
             # Skip auto-betting since matching failed
             # CRITICAL: Log ALL high-EV alerts (>= 10%) that fail matching, regardless of filter selection
@@ -2219,7 +2898,24 @@ async def handle_new_alert(alert: EvAlert):
             'expiry': (datetime.now() + timedelta(seconds=30)).timestamp(),  # TTL: 30 seconds
             'last_seen': time.time(),  # Track when alert was last seen for stale detection
             'strict_pass': getattr(alert, 'strict_pass', True),
+            'autobet_allow': bool(getattr(alert, 'autobet_allow', False)),
             'ev_source': getattr(alert, 'ev_source', 'odds_api_value_bets'),
+            'take_book': getattr(alert, 'take_book', 'Kalshi') or 'Kalshi',
+            'line': getattr(alert, 'line', None),
+            'live': getattr(alert, 'live', None),
+            'clock': getattr(alert, 'clock', None),
+            'clock_running': getattr(alert, 'clock_running', None),
+            'status_detail': getattr(alert, 'status_detail', None) or getattr(alert, 'statusDetail', None) or '',
+            'statusDetail': getattr(alert, 'status_detail', None) or getattr(alert, 'statusDetail', None) or '',
+            'score': getattr(alert, 'score', None) or '',
+            'scores': getattr(alert, 'scores', None),
+            'game_status': getattr(alert, 'game_status', None) or '',
+            'book_updated_at': getattr(alert, 'book_updated_at', None) or {},
+            'kalshi_last_trade_ts': getattr(alert, 'kalshi_last_trade_ts', None) or (
+                (match_result.get('market') or {}).get('last_trade_ts')
+                or (match_result.get('market') or {}).get('last_trade_time')
+                or (match_result.get('market') or {}).get('updated_time')
+            ),
         }
         
         # CRITICAL: Check if this alert_id is already being processed (prevent duplicate processing)
@@ -2263,6 +2959,26 @@ async def handle_new_alert(alert: EvAlert):
             if getattr(alert, "ev_source", None) and alert.ev_source != existing_alert.get("ev_source"):
                 existing_alert["ev_source"] = alert.ev_source
                 updated = True
+            if getattr(alert, "take_book", None):
+                existing_alert["take_book"] = alert.take_book
+                updated = True
+            if getattr(alert, "line", None) is not None:
+                existing_alert["line"] = alert.line
+                updated = True
+            for _lk in (
+                "live",
+                "clock",
+                "clock_running",
+                "status_detail",
+                "score",
+                "scores",
+                "game_status",
+            ):
+                if getattr(alert, _lk, None) is not None:
+                    existing_alert[_lk] = getattr(alert, _lk)
+                    updated = True
+            if existing_alert.get("status_detail"):
+                existing_alert["statusDetail"] = existing_alert["status_detail"]
             
             # CRITICAL: Preserve filter_name - use existing if new alert doesn't have it, otherwise update
             if hasattr(alert, 'filter_name') and alert.filter_name:
@@ -2365,12 +3081,12 @@ async def handle_new_alert(alert: EvAlert):
             return
         
         print(f"[ALERT] Processing alert: {alert.teams} - {alert.pick} ({alert.ev_percent:.2f}% EV, dashboard_min_ev={dashboard_min_ev:.2f}%)")
-        show_matched = alert.ev_percent >= dashboard_min_ev or not getattr(alert, 'strict_pass', True)
+        show_matched = is_plus_print_ev(alert.ev_percent, dashboard_min_ev)
         if show_matched:
             # Emit to all connected clients IMMEDIATELY (don't wait for orderbook)
             print(
                 f"[ALERT] ✅ Emitting to frontend: EV {alert.ev_percent:.2f}% "
-                f"(min {dashboard_min_ev:.2f}% or diagnostic strict_pass=False)"
+                f"(min {dashboard_min_ev:.2f}%)"
             )
             socketio.emit('new_alert', alert_data)
             print(f"New alert: {alert.teams} - {alert.pick} ({alert.ev_percent:.2f}% EV)")
@@ -3564,6 +4280,20 @@ def run_monitor_loop():
                 alert_data['devig_books'] = getattr(alert, 'devig_books', [])
                 if hasattr(alert, 'strict_pass'):
                     alert_data['strict_pass'] = alert.strict_pass
+                alert_data['autobet_allow'] = bool(getattr(alert, 'autobet_allow', False))
+                for _lk in (
+                    "live",
+                    "clock",
+                    "clock_running",
+                    "status_detail",
+                    "score",
+                    "scores",
+                    "game_status",
+                ):
+                    if getattr(alert, _lk, None) is not None:
+                        alert_data[_lk] = getattr(alert, _lk)
+                if alert_data.get("status_detail"):
+                    alert_data["statusDetail"] = alert_data["status_detail"]
                 # Update last_seen timestamp for stale alert detection
                 alert_data['last_seen'] = time.time()
                 # CRITICAL: Preserve filter_name - use existing if new alert doesn't have it, otherwise update
@@ -3580,7 +4310,7 @@ def run_monitor_loop():
                 
                 # Filter by dashboard min EV before emitting update
                 global dashboard_min_ev
-                show_update = alert.ev_percent >= dashboard_min_ev or not getattr(alert, 'strict_pass', True)
+                show_update = is_plus_print_ev(alert.ev_percent, dashboard_min_ev)
                 if show_update:
                     # Check if values actually changed (avoid logging every refresh)
                     old_ev = alert_data.get('ev_percent', 0)
@@ -3603,13 +4333,25 @@ def run_monitor_loop():
                         'sharp_books': alert_data.get('sharp_books', []),  # Preserve sharp books from filter
                         'devig_books': alert_data.get('devig_books', getattr(alert, 'devig_books', [])),
                         'strict_pass': alert_data.get('strict_pass', getattr(alert, 'strict_pass', True)),
+                        'book_updated_at': alert_data.get('book_updated_at', getattr(alert, 'book_updated_at', {}) or {}),
+                        'kalshi_last_trade_ts': alert_data.get(
+                            'kalshi_last_trade_ts', getattr(alert, 'kalshi_last_trade_ts', None)
+                        ),
+                        'live': alert_data.get('live', getattr(alert, 'live', None)),
+                        'clock': alert_data.get('clock', getattr(alert, 'clock', None)),
+                        'clock_running': alert_data.get('clock_running', getattr(alert, 'clock_running', None)),
+                        'status_detail': alert_data.get('status_detail', getattr(alert, 'status_detail', None) or ''),
+                        'statusDetail': alert_data.get('statusDetail', alert_data.get('status_detail', '')),
+                        'score': alert_data.get('score', getattr(alert, 'score', None) or ''),
+                        'scores': alert_data.get('scores', getattr(alert, 'scores', None)),
+                        'game_status': alert_data.get('game_status', getattr(alert, 'game_status', None) or ''),
                     })
                     # Only log if EV or liquidity actually changed (not just reappearing)
                     if ev_changed or liq_changed:
                         print(f"Updated alert: {alert.teams} - {alert.pick} (EV: {alert.ev_percent:.2f}%)")
                 else:
-                    # EV dropped below threshold — remove unless diagnostic display candidate
-                    if getattr(alert, 'strict_pass', True) and alert_id in active_alerts:
+                    # EV dropped below the dashboard floor — hide the whole card.
+                    if alert_id in active_alerts:
                         del active_alerts[alert_id]
                         socketio.emit('remove_alert', {'id': alert_id})
                         print(f"Removed alert (EV {alert.ev_percent:.2f}% < min {dashboard_min_ev:.2f}%): {alert.teams} - {alert.pick}")
@@ -3887,7 +4629,7 @@ def live_odds_page():
 @app.route('/api/live_odds')
 @requires_auth
 def api_live_odds():
-    """JSON snapshot: events × books moneyline (auto-refresh from the browser).
+    """JSON snapshot: events × books ML / Spread / Totals (auto-refresh from the browser).
 
     Odds-API.io's shared async client is bound to the monitor event loop; scheduling
     snapshot work on api_loop caused broken/empty responses. We use monitor_loop
@@ -3933,7 +4675,15 @@ def api_live_odds():
                 "hint": "If this persists, confirm the monitor thread started (Odds-API polling).",
             }
         ), 500
+    if isinstance(data, dict) and "plive" not in data:
+        data["plive"] = _plive_status_payload()
     return jsonify(data)
+
+
+@app.route("/api/plive_status")
+def api_plive_status():
+    """PLive Pandora handshake proof: connected + MLB events with prices."""
+    return jsonify(_plive_status_payload())
 
 
 @app.route('/logos/<path:filename>')
@@ -3943,12 +4693,64 @@ def serve_logo(filename):
     return send_from_directory(logos_dir, filename)
 
 
+def is_unlisted_match_failed(row: Dict) -> bool:
+    """Unmatched Kalshi cards must not appear on GET /api/alerts or the live list.
+
+    PLive-take cards list even with no Kalshi ticker. Do not hide them as match_failed.
+    """
+    if not isinstance(row, dict):
+        return True
+    if _row_is_plive_take(row):
+        return False
+    if row.get("match_failed") is True:
+        return True
+    ticker = row.get("ticker")
+    if ticker and str(ticker).upper().startswith("KXSCAN"):
+        return True
+    if ticker in (None, "") and row.get("match_failure_reason"):
+        return True
+    return False
+
+
+def listed_active_alerts(source=None):
+    src = active_alerts if source is None else source
+    if isinstance(src, dict):
+        rows = list(src.values())
+    else:
+        rows = list(src or [])
+    out = [r for r in rows if not is_unlisted_match_failed(r)]
+    floor = float(dashboard_min_ev or 0.0)
+    # Zero is not a KEEP. PLive O/U still list only with honest EV>0.
+    return [r for r in out if is_plus_print_ev(r.get("ev_percent"), floor)]
+
+
+def unmatched_alert_should_emit_new_alert(_alert_data=None) -> bool:
+    """Unmatched cards stay off the live list. alert_match_failed + failed_auto_bet only."""
+    return False
+
+
+def fanout_unmatched_alert(emit_fn, alert_data: Dict) -> Dict[str, Any]:
+    """Emit alert_match_failed only. Never new_alert. Never store on the list."""
+    payload = {
+        "teams": alert_data.get("teams"),
+        "pick": alert_data.get("pick"),
+        "market_type": alert_data.get("market_type"),
+        "reason": alert_data.get("match_failure_reason") or "Could not find matching submarket",
+        "ev_percent": alert_data.get("ev_percent"),
+        "alert_id": alert_data.get("id"),
+    }
+    if emit_fn is not None:
+        emit_fn("alert_match_failed", payload)
+    return {"stored": False, "emitted": ["alert_match_failed"], "emit_new_alert": False}
+
+
 @app.route('/api/alerts', methods=['GET'])
 def get_alerts():
-    """Get all active alerts"""
+    """Get active alerts. match_failed / unmatched rows are omitted."""
+    visible = listed_active_alerts()
     return jsonify({
-        'alerts': list(active_alerts.values()),
-        'count': len(active_alerts)
+        'alerts': visible,
+        'count': len(visible)
     })
 
 
@@ -3994,6 +4796,14 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
     elif isinstance(alert_data, dict):
         strict_ok = alert_data.get('strict_pass', True)
     if strict_ok is False:
+        return
+    autobet_ok = False
+    if alert is not None:
+        autobet_ok = bool(getattr(alert, "autobet_allow", False))
+    elif isinstance(alert_data, dict):
+        autobet_ok = bool(alert_data.get("autobet_allow", False))
+    if not autobet_ok:
+        # Product lock: only Royals-like Kalshi-best / ≥5 same-sign / two-way few-percent.
         return
     
     # CRITICAL: Check EV threshold FIRST before any processing/logging to avoid wasting time on low-EV alerts
@@ -4136,6 +4946,10 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
     try:
         if not auto_bet_enabled:
             print(f"[AUTO-BET] SKIP: Alert {alert_id} - Auto-bet disabled")
+            await cleanup_submarket()
+            return
+        if str(alert_data.get("take_book") or getattr(alert, "take_book", "") or "").lower() == "plive":
+            print(f"[AUTO-BET] SKIP: Alert {alert_id} - PLive take does not auto-bet on Kalshi")
             await cleanup_submarket()
             return
         
@@ -5316,7 +6130,8 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
             # This multiplies the market-type specific amount
             if not is_nhl_over:
                 devig_books = getattr(alert, 'devig_books', []) or alert_data.get('devig_books', [])
-                if devig_books and 'ProphetX' in devig_books and 'Novig' in devig_books:
+                _devig_l = {str(b).strip().lower() for b in (devig_books or [])}
+                if 'prophetx' in _devig_l and 'novig' in _devig_l:
                     base_amount = bet_amount  # Store before multiplier
                     bet_amount = bet_amount * px_novig_multiplier
                     print(f"[AUTO-BET] ProphetX + Novig detected - applying {px_novig_multiplier}x multiplier: ${base_amount:.2f} -> ${bet_amount:.2f}")
@@ -6283,58 +7098,46 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
                 taker_fees_cents = result.get('taker_fees_cents', 0)
                 total_fees_cents = result.get('total_fees_cents', 0)
                 
-                # Get devig books and their odds from alert
+                # POWER pack names + tile odds. Named Devig Books list is built in build_auto_bet_sheet_record.
                 devig_books = getattr(alert, 'devig_books', []) or alert_data.get('devig_books', [])
                 display_books = getattr(alert, 'display_books', {}) or alert_data.get('display_books', {})
-                
-                # Build devig books string with odds (e.g., "Pinnacle:-206, SportTrade:-207, ProphetX:-212, BookMaker:-212")
-                devig_books_str = ''
-                if devig_books and display_books:
-                    our_selection = alert.pick
-                    our_books = display_books.get(our_selection, [])
-                    
-                    # Create a map of book name to odds for quick lookup
-                    book_odds_map = {book.get('book', ''): book.get('odds', 0) for book in our_books}
-                    
-                    # Build list of devig books with their odds
-                    devig_books_list = []
-                    for book_name in devig_books:
-                        if book_name in book_odds_map:
-                            odds = book_odds_map[book_name]
-                            devig_books_list.append(f"{book_name}:{odds}")
-                    
-                    devig_books_str = ', '.join(devig_books_list)
-                
-                bet_record = {
-                    'timestamp': datetime.now().isoformat(),
-                    'order_id': order_id,
-                    'ticker': ticker,
-                    'side': side,
-                    'teams': alert.teams,
-                    'market_type': alert.market_type or alert_data.get('market_type', ''),
-                    'pick': alert.pick,
-                    'qualifier': qualifier,
-                    'ev_percent': f"{ev_percent:.2f}",
-                    'expected_price_cents': str(expected_price_cents),
-                    'executed_price_cents': str(executed_price_cents),
-                    'american_odds': effective_american_odds,
-                    'contracts': str(fill_count),
-                    'cost': f"{cost:.2f}",
-                    'payout': f"{payout:.2f}",
-                    'win_amount': f"{win_amount:.2f}",
-                    'fee_type': fee_type,  # 'maker' or 'taker'
-                    'taker_fees_cents': str(taker_fees_cents),  # Taker fees in cents (for Telegram alert)
-                    'taker_fees': f"{taker_fees_cents/100:.2f}",  # Taker fees in dollars
-                    'total_fees': f"{total_fees_cents/100:.2f}",  # Total fees in dollars
-                    'sport': sport,
-                    'status': 'executed',
-                    'result': 'OPEN',  # Will be updated when market settles
-                    'pnl': '0.00',
-                    'settled': 'FALSE',
-                    'devig_books': devig_books_str,  # Books used for devigging with their odds
-                    'kalshi_odds': effective_american_odds,  # Kalshi odds we bet at (net of fees)
-                    'filter_name': getattr(alert, 'filter_name', '') or alert_data.get('filter_name', '')  # Filter name that triggered this bet (with fallback to alert_data)
-                }
+
+                bet_record = build_auto_bet_sheet_record(
+                    alert=alert,
+                    alert_data=alert_data if isinstance(alert_data, dict) else {},
+                    fill={
+                        "timestamp": datetime.now().isoformat(),
+                        "order_id": order_id,
+                        "ticker": ticker,
+                        "side": side,
+                        "teams": alert.teams,
+                        "market_type": alert.market_type or alert_data.get("market_type", ""),
+                        "pick": alert.pick,
+                        "qualifier": qualifier,
+                        "ev_percent": f"{ev_percent:.2f}",
+                        "expected_price_cents": str(expected_price_cents),
+                        "executed_price_cents": str(executed_price_cents),
+                        "american_odds": effective_american_odds,
+                        "contracts": str(fill_count),
+                        "cost": f"{cost:.2f}",
+                        "payout": f"{payout:.2f}",
+                        "win_amount": f"{win_amount:.2f}",
+                        "fee_type": fee_type,
+                        "taker_fees_cents": str(taker_fees_cents),
+                        "taker_fees": f"{taker_fees_cents/100:.2f}",
+                        "total_fees": f"{total_fees_cents/100:.2f}",
+                        "sport": sport,
+                        "status": "executed",
+                        "result": "OPEN",
+                        "pnl": "0.00",
+                        "settled": "FALSE",
+                        "kalshi_odds": effective_american_odds,
+                        "filter_name": getattr(alert, "filter_name", "") or alert_data.get("filter_name", ""),
+                        "devig_books_names": devig_books,
+                        "display_books": display_books,
+                        "skip_reason": "",
+                    },
+                )
                 
                 # Update decision path with bet execution info
                 decision_path_so_far['final_decision'] = 'BET_PLACED'
@@ -7200,6 +8003,21 @@ def set_max_bet():
 def get_max_bet():
     """Get user's max bet amount"""
     return jsonify({'max_bet_amount': user_max_bet_amount})
+
+
+@app.route("/api/stoppages_only", methods=["GET", "POST"])
+def stoppages_only():
+    """Odds-API clock/statusDetail stoppage filter. Off by default. Never BookieBeats."""
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        EvMonitorImpl.stoppages_only = bool(data.get("enabled", False))
+        print(f"[DASHBOARD] Stoppages Only={EvMonitorImpl.stoppages_only} (Odds-API clock only)")
+    return jsonify(
+        {
+            "enabled": bool(getattr(EvMonitorImpl, "stoppages_only", False)),
+            "baseball_supported": False,
+        }
+    )
 
 
 @app.route("/api/broad_scan_pregame", methods=["GET", "POST"])
@@ -8694,7 +9512,7 @@ def handle_connect():
     """Handle client connection"""
     print(f"Client connected: {request.sid}")
     # Send current alerts to new client
-    emit('alerts_update', {'alerts': list(active_alerts.values())})
+    emit('alerts_update', {'alerts': listed_active_alerts()})
 
 
 @socketio.on('disconnect')

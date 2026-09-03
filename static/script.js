@@ -48,10 +48,10 @@ function priceToAmericanOdds(priceCents) {
     }
 }
 
-/** Odds-API limit / stake on Kalshi row (USD); show — when unknown. */
+/** Odds-API limit / stake on the take row (USD); ASCII '-' when unknown. Never an emdash. */
 function formatLiquidityUsd(n) {
     const x = Number(n);
-    if (!x || x <= 0 || Number.isNaN(x)) return '—';
+    if (!x || x <= 0 || Number.isNaN(x)) return '-';
     if (x < 10000) return `$${Math.round(x)}`;
     return `$${(x / 1000).toFixed(1)}k`;
 }
@@ -99,6 +99,7 @@ socket.on('connect', () => {
     loadAutoBetSettings();
     loadAlertFeedPrefs();
     loadBroadScanPregame();
+    loadStoppagesOnly();
 });
 
 socket.on('disconnect', () => {
@@ -244,6 +245,11 @@ socket.on('alert_update', (data) => {
         if (data.display_books !== undefined) alert.display_books = data.display_books;
         if (data.devig_books !== undefined) alert.devig_books = data.devig_books;
         if (data.sharp_books !== undefined) alert.sharp_books = data.sharp_books;
+        if (data.book_updated_at !== undefined) alert.book_updated_at = data.book_updated_at;
+        if (data.kalshi_last_trade_ts !== undefined) alert.kalshi_last_trade_ts = data.kalshi_last_trade_ts;
+        for (const k of ['live', 'clock', 'clock_running', 'status_detail', 'statusDetail', 'score', 'scores', 'game_status']) {
+            if (data[k] !== undefined) alert[k] = data[k];
+        }
         
         // Update the card in place instead of re-rendering everything
         const alertCard = document.querySelector(`[data-alert-id="${alertId}"]`);
@@ -348,56 +354,27 @@ socket.on('alert_update', (data) => {
                                 hasChanges = true;
                             }
                             
-                            // Update graying status if limit changed (might affect graying)
-                            const minSharpLimits = {
-                                'BookMaker': 250, 'Circa': 250, 'Novig': 200, 'Pinnacle': 250,
-                                'ProphetX': 200, 'SportTrade': 200, 'DraftKings': 250, 'FanDuel': 250
-                            };
-                            const devigBooks = alert.devig_books || [];
-                            const shouldBeGrayed = bookName !== 'Kalshi' && (
-                                !devigBooks.includes(bookName) || 
-                                (minSharpLimits[bookName] && bookLimit < minSharpLimits[bookName])
-                            );
-                            const isCurrentlyGrayed = bookCell.classList.contains('grayed-out');
-                            
-                            if (shouldBeGrayed !== isCurrentlyGrayed) {
-                                if (shouldBeGrayed) {
-                                    bookCell.classList.add('grayed-out');
-                                } else {
-                                    bookCell.classList.remove('grayed-out');
-                                }
+                            const takeAm = takeAmericanFromAlert(alert, ourBooks);
+                            const paint = tilePaintState(bookName, bookOdds, alert, takeAm);
+                            if (paint.skip) {
+                                bookCell.remove();
+                                hasChanges = true;
+                                return;
+                            }
+                            const wantTake = paint.take;
+                            const wantBetter = paint.better;
+                            const hasTakeCls = bookCell.classList.contains('take-book') || bookCell.classList.contains('kalshi-book');
+                            if (wantTake !== hasTakeCls) {
+                                bookCell.classList.toggle('kalshi-book', wantTake);
+                                bookCell.classList.toggle('take-book', wantTake);
                                 hasChanges = true;
                             }
-                            
-                            // Update "better than Kalshi" indicator (red outline)
-                            const kalshiPrice = alert.book_price || alert.american_odds || (alert.price_cents ? priceToAmericanOdds(alert.price_cents) : 'N/A');
-                            let kalshiOddsNum = null;
-                            if (kalshiPrice && kalshiPrice !== 'N/A') {
-                                const kalshiStr = String(kalshiPrice).replace(/[+]/g, '');
-                                kalshiOddsNum = parseInt(kalshiStr, 10);
-                                if (isNaN(kalshiOddsNum)) {
-                                    kalshiOddsNum = null;
-                                }
-                            }
-                            
-                            let hasBetterOdds = false;
-                            if (shouldBeGrayed && kalshiOddsNum !== null && bookOdds !== 0) {
-                                if (bookOdds > 0 && kalshiOddsNum > 0) {
-                                    hasBetterOdds = bookOdds > kalshiOddsNum;
-                                } else if (bookOdds < 0 && kalshiOddsNum < 0) {
-                                    hasBetterOdds = bookOdds > kalshiOddsNum; // Less negative is better
-                                } else if (bookOdds > 0 && kalshiOddsNum < 0) {
-                                    hasBetterOdds = true;
-                                }
-                            }
-                            
+                            bookCell.classList.remove('grayed-out');
+                            bookCell.classList.remove('junk-tile');
+                            bookCell.classList.remove('worse-than-kalshi');
                             const currentlyHasBetter = bookCell.classList.contains('better-than-kalshi');
-                            if (hasBetterOdds !== currentlyHasBetter) {
-                                if (hasBetterOdds) {
-                                    bookCell.classList.add('better-than-kalshi');
-                                } else {
-                                    bookCell.classList.remove('better-than-kalshi');
-                                }
+                            if (wantBetter !== currentlyHasBetter) {
+                                bookCell.classList.toggle('better-than-kalshi', wantBetter);
                                 hasChanges = true;
                             }
                         }
@@ -405,6 +382,23 @@ socket.on('alert_update', (data) => {
                 }
             }
             
+            const statusLine = formatAlertGameStatus(alert);
+            const statusEl = alertCard.querySelector('.alert-game-status');
+            if (statusLine) {
+                if (statusEl) {
+                    if (statusEl.textContent !== statusLine) {
+                        statusEl.textContent = statusLine;
+                        hasChanges = true;
+                    }
+                } else {
+                    needsRerender = true;
+                    hasChanges = true;
+                }
+            } else if (statusEl) {
+                statusEl.remove();
+                hasChanges = true;
+            }
+
             // Check if EV changed - ALWAYS update if value is provided (even small changes)
             if (data.ev_percent !== undefined) {
                 const newEv = data.ev_percent;
@@ -470,9 +464,11 @@ socket.on('alert_update', (data) => {
                         betMaxBtn.textContent = `BET MAX ($${maxBet.toFixed(0)})`;
                     }
                     // Update liquidity display if it exists
-                    const liquidityEl = alertCard.querySelector('.liquidity, .kalshi-liquidity');
+                    const liquidityEl = alertCard.querySelector('.liquidity, .kalshi-liquidity, .alert-liq-usd');
                     if (liquidityEl) {
-                        liquidityEl.textContent = formatLiquidityUsd(newLiq);
+                        liquidityEl.textContent = liquidityEl.classList.contains('alert-liq-usd')
+                            ? (`Liq ${formatLiquidityUsd(newLiq)}`)
+                            : formatLiquidityUsd(newLiq);
                     }
                 }
             }
@@ -509,37 +505,307 @@ async function fetchPortfolio() {
     }
 }
 
-// Render alerts - auto-sorted by EV (highest first)
+function dashboardMinEvFloor() {
+    const raw = minEvInput ? parseFloat(minEvInput.value) : 0;
+    return Number.isFinite(raw) ? raw : 0;
+}
+
+function alertPassesMinEv(alert) {
+    return (Number(alert && alert.ev_percent) || 0) >= dashboardMinEvFloor();
+}
+
+// Render alerts - auto-sorted by EV (highest first).
+// Min EV hides the whole card. It never grays individual tiles.
 function renderAlerts() {
-    if (alerts.size === 0) {
+    const visible = Array.from(alerts.values()).filter(alertPassesMinEv);
+    if (visible.length === 0) {
         alertsList.innerHTML = '<div class="empty-state"><p>No alerts yet. Waiting for new opportunities...</p></div>';
         return;
     }
     
     alertsList.innerHTML = '';
     
-    // Sort alerts by EV (highest first)
-    const sortedAlerts = Array.from(alerts.values()).sort((a, b) => (b.ev_percent || 0) - (a.ev_percent || 0));
-    
-    sortedAlerts.forEach(alert => {
+    visible.sort((a, b) => (b.ev_percent || 0) - (a.ev_percent || 0));
+    visible.forEach(alert => {
         const alertCard = createAlertCard(alert);
         alertsList.appendChild(alertCard);
     });
 }
 
-// Book logo mapping (for display) - maps book names to logo file paths
+function normalizeBookKey(name) {
+    return String(name || '').toLowerCase().replace(/[\s._-]+/g, '');
+}
+
+/** Display-name → file. BetMGM never uses BM.png (that is BookMaker). */
 const bookLogos = {
     'Kalshi': '/logos/Kalshi.png',
     'Pinnacle': '/logos/Pinnacle.png',
     'SportTrade': '/logos/Sporttrade.png',
+    'NoVig': '/logos/NV.png',
     'Novig': '/logos/NV.png',
     'ProphetX': '/logos/PX.png',
     'BookMaker': '/logos/BM.png',
     'FanDuel': '/logos/FD.png',
     'DraftKings': '/logos/DK.png',
     'Circa': '/logos/Circa.png',
-    'Polymarket': '/logos/poly.png'  // For future use
+    'Circa Sports': '/logos/Circa.png',
+    'Polymarket': '/logos/poly.png',
+    'Bet365': '/logos/Bet365.png',
+    'Betfair Exchange': '/logos/Betfair.png',
+    'Betfair': '/logos/Betfair.png',
+    'BetMGM': '/logos/BetMGM.png',
+    'MGM': '/logos/MGM.png',
+    'Caesars': '/logos/Caesars.png',
+    'PLive': '/logos/PL.png'
 };
+
+/**
+ * Missing-image text. Hoisted next to bookLogos so createAlertCard can use it.
+ * Nested abbrevBook in the odds IIFE is out of scope for cards.
+ * Never first-two-letter fallback — Bet365 and Betfair Exchange are never both BE.
+ */
+function uniqueBookAbbrev(name) {
+    const key = normalizeBookKey(name);
+    if (key.includes('bet365')) return 'B365';
+    if (key.includes('betfair')) return 'BFX';
+    if (key.includes('betmgm') || key === 'mgm') return 'MGM';
+    if (key.includes('caesar')) return 'CZ';
+    if (key.includes('novig')) return 'NV';
+    if (key === 'plive' || key.includes('plive')) return 'PLV';
+    const map = {
+        kalshi: 'KS',
+        fanduel: 'FD',
+        draftkings: 'DK',
+        circa: 'CI',
+        circasports: 'CI',
+        bookmaker: 'BM',
+        bookmakereu: 'BM',
+        prophetx: 'PX',
+        sporttrade: 'ST',
+        polymarket: 'PM',
+        pinnacle: 'PN'
+    };
+    if (map[key]) return map[key];
+    const alnum = key.replace(/[^a-z0-9]/g, '');
+    if (!alnum) return 'BK';
+    if (alnum.length <= 3) return alnum.toUpperCase();
+    return alnum.slice(0, 4).toUpperCase();
+}
+
+function abbrevBookTile(name) {
+    return uniqueBookAbbrev(name);
+}
+
+/** Ordered image candidates. BetMGM never uses BM.png (BookMaker). */
+function resolveBookLogoPaths(name) {
+    const raw = String(name || '');
+    if (Object.prototype.hasOwnProperty.call(bookLogos, raw)) {
+        const first = bookLogos[raw];
+        if (normalizeBookKey(raw) === 'betmgm' || normalizeBookKey(raw) === 'mgm') {
+            return first === '/logos/BetMGM.png'
+                ? ['/logos/BetMGM.png', '/logos/MGM.png']
+                : [first, '/logos/BetMGM.png'].filter((p, i, a) => a.indexOf(p) === i);
+        }
+        return [first];
+    }
+    const key = normalizeBookKey(name);
+    const table = {};
+    Object.keys(bookLogos).forEach((label) => {
+        table[normalizeBookKey(label)] = [bookLogos[label]];
+    });
+    table.betmgm = ['/logos/BetMGM.png', '/logos/MGM.png'];
+    table.mgm = ['/logos/BetMGM.png', '/logos/MGM.png'];
+    if (table[key]) return table[key];
+    if (key.includes('bet365')) return ['/logos/Bet365.png'];
+    if (key.includes('betfair')) return ['/logos/Betfair.png'];
+    if (key.includes('betmgm')) return ['/logos/BetMGM.png', '/logos/MGM.png'];
+    if (key.includes('caesar')) return ['/logos/Caesars.png'];
+    if (key.includes('novig')) return ['/logos/NV.png'];
+    if (key.startsWith('circa')) return ['/logos/Circa.png'];
+    return [];
+}
+
+function impliedProbFromAmerican(am) {
+    const n = Number(am);
+    if (!Number.isFinite(n) || n === 0) return null;
+    if (n > 0) return 100 / (n + 100);
+    return Math.abs(n) / (Math.abs(n) + 100);
+}
+
+/** Same 10c-from-take / real-sign-flip test as ev_calculator.is_junk_vs_kalshi. Pick'em +113/−110 is not junk. */
+function isJunkVsKalshi(bookAmerican, kalshiAmerican) {
+    const b = Number(bookAmerican);
+    const k = Number(kalshiAmerican);
+    if (!Number.isFinite(b) || !Number.isFinite(k) || b === 0 || k === 0) return false;
+    const bp = impliedProbFromAmerican(b);
+    const kp = impliedProbFromAmerican(k);
+    if (bp == null || kp == null) return true;
+    const sidedFlip = (b > 0) !== (k > 0) && Math.abs(bp - 0.5) >= 0.04 && Math.abs(kp - 0.5) >= 0.04;
+    if (sidedFlip) return true;
+    return Math.abs(bp - kp) > 0.10 + 1e-12;
+}
+
+function isPolymarketBook(name) {
+    const key = normalizeBookKey(name);
+    return key.includes('polymarket') || key === 'poly' || key === 'pm';
+}
+
+/** Take book for THIS card. Empty when take_book is missing -- do not default Kalshi. */
+function cardTakeKey(alert) {
+    const raw = alert && alert.take_book;
+    if (raw == null || String(raw).trim() === '') return '';
+    return normalizeBookKey(raw);
+}
+
+function isCardTakeBook(bookName, alert) {
+    const tk = cardTakeKey(alert);
+    if (!tk) return false;
+    return normalizeBookKey(bookName) === tk;
+}
+
+function parseAmericanOddsValue(value) {
+    if (value == null || value === '' || value === 'N/A') return null;
+    const n = parseInt(String(value).replace(/[+]/g, '').replace(/[−–—]/g, '-'), 10);
+    if (!Number.isFinite(n) || n === 0) return null;
+    return n;
+}
+
+/** American odds this card is betting. Never Kalshi-by-name unless Kalshi is the take. */
+function takeAmericanFromAlert(alert, books) {
+    const tk = cardTakeKey(alert);
+    if (tk && Array.isArray(books)) {
+        const row = books.find((b) => normalizeBookKey(b && b.book) === tk);
+        if (row && bookTileHasLine(row.odds)) {
+            const am = Number(row.odds);
+            if (Number.isFinite(am) && am !== 0) return am;
+        }
+    }
+    const fromAlert = parseAmericanOddsValue(alert && (alert.book_price || alert.american_odds));
+    if (fromAlert != null) return fromAlert;
+    if (alert && alert.price_cents && typeof priceToAmericanOdds === 'function') {
+        return parseAmericanOddsValue(priceToAmericanOdds(alert.price_cents));
+    }
+    return null;
+}
+
+function isOppositeSideVsTake(bookAm, takeAm) {
+    const b = Number(bookAm);
+    const t = Number(takeAm);
+    if (!Number.isFinite(b) || !Number.isFinite(t) || b === 0 || t === 0) return false;
+    if ((b > 0) === (t > 0)) return false;
+    const bp = impliedProbFromAmerican(b);
+    const tp = impliedProbFromAmerican(t);
+    if (bp == null || tp == null) return true;
+    return Math.abs(bp - 0.5) >= 0.04 && Math.abs(tp - 0.5) >= 0.04;
+}
+
+function bookAmericanIsBetter(bookAmerican, kalshiAmerican) {
+    const b = Number(bookAmerican);
+    const k = Number(kalshiAmerican);
+    if (!Number.isFinite(b) || !Number.isFinite(k)) return false;
+    const dec = (am) => (am > 0 ? 1 + am / 100 : 1 + 100 / Math.abs(am));
+    return dec(b) > dec(k);
+}
+
+function bookTileHasLine(odds) {
+    if (odds === null || odds === undefined || odds === '') return false;
+    if (odds === 0 || odds === '0') return false;
+    const s = String(odds).replace(/\s/g, '');
+    if (!s || s === '—' || s === '-' || s === 'N/A' || s === 'n/a') return false;
+    return true;
+}
+
+/** Betting book first (left). Does not drop worse recs. */
+function orderBooksTakeFirst(books, alert) {
+    const list = Array.isArray(books) ? books.slice() : [];
+    const tk = cardTakeKey(alert);
+    if (!tk) return list;
+    return list.sort((a, b) => {
+        const aTake = normalizeBookKey(a && a.book) === tk ? 0 : 1;
+        const bTake = normalizeBookKey(b && b.book) === tk ? 0 : 1;
+        return aTake - bTake;
+    });
+}
+
+/**
+ * Tile paint lock: take=green (left), on-pack strictly better=red, worse=unshaded.
+ * Skip (omit, do not gray) when isJunkVsKalshi: |implied-take|>10c OR real sign-flip.
+ * Any book (Poly, NV, BF, …). Pick'em +113 vs −110 is not junk and still paints.
+ * Green is the betting book (Kalshi or PLive), not the best price.
+ */
+function tilePaintState(bookName, bookOdds, alert, takeAm) {
+    if (!bookTileHasLine(bookOdds)) {
+        return { skip: true, take: false, better: false };
+    }
+    const take = isCardTakeBook(bookName, alert);
+    const bookAm = parseAmericanOddsValue(bookOdds);
+    const takeN = parseAmericanOddsValue(takeAm != null ? takeAm : (alert && (alert.book_price || alert.american_odds)));
+    if (!take && takeN != null && bookAm != null && isJunkVsKalshi(bookAm, takeN)) {
+        return { skip: true, take: false, better: false };
+    }
+    const strictlyBetter = !take && takeN != null && bookAm != null && bookAmericanIsBetter(bookAm, takeN);
+    return { skip: false, take: take, better: strictlyBetter };
+}
+
+function parseFreshnessTs(value) {
+    if (value == null || value === '') return null;
+    if (typeof value === 'number' && Number.isFinite(value)) {
+        return value > 1e12 ? value : value * 1000;
+    }
+    const n = Number(value);
+    if (Number.isFinite(n) && String(value).trim() !== '') {
+        return n > 1e12 ? n : n * 1000;
+    }
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) ? parsed : null;
+}
+
+function formatFreshnessAge(value, nowMs) {
+    const ms = parseFreshnessTs(value);
+    if (ms == null) return '';
+    const sec = Math.max(0, Math.round(((nowMs || Date.now()) - ms) / 1000));
+    if (sec < 60) return sec + 's';
+    if (sec < 3600) return Math.round(sec / 60) + 'm';
+    return Math.round(sec / 3600) + 'h';
+}
+
+function isCircaBook(name) {
+    return normalizeBookKey(name).startsWith('circa');
+}
+
+function handleBookLogoError(img) {
+    let next = [];
+    try {
+        next = JSON.parse(img.getAttribute('data-logo-fallbacks') || '[]');
+    } catch (e) {
+        next = [];
+    }
+    if (next.length) {
+        img.setAttribute('data-logo-fallbacks', JSON.stringify(next.slice(1)));
+        img.src = next[0];
+        return;
+    }
+    const name = img.getAttribute('alt') || '';
+    const div = document.createElement('div');
+    div.className = 'book-logo-text';
+    div.textContent = uniqueBookAbbrev(name);
+    div.title = name;
+    img.replaceWith(div);
+}
+
+function bookLogoHtml(bookName) {
+    const paths = resolveBookLogoPaths(bookName);
+    const safe = escapeHtml(bookName);
+    const abbrev = abbrevBookTile(bookName);
+    if (!paths.length) {
+        return `<div class="book-logo-text" title="${safe}">${abbrev}</div>`;
+    }
+    const rest = JSON.stringify(paths.slice(1)).replace(/'/g, '&#39;');
+    return (
+        `<img src="${paths[0]}" alt="${safe}" title="${safe}" class="book-logo-img" ` +
+        `data-logo-fallbacks='${rest}' onerror="handleBookLogoError(this)" />`
+    );
+}
 
 /** Loose match so API keys like "Circa Sports" align with devig list "Circa". */
 function bookMatchesDevigOrSharp(bookName, devigList, sharpList) {
@@ -550,6 +816,57 @@ function bookMatchesDevigOrSharp(bookName, devigList, sharpList) {
         if (!uu) return false;
         return n.includes(uu) || uu.includes(n) || n === uu;
     });
+}
+
+function formatAlertGameStatus(alert) {
+    if (!alert) return '';
+    const ready = String(alert.game_status || '').trim();
+    if (ready) return ready;
+    const clock = (alert.clock && typeof alert.clock === 'object') ? alert.clock : {};
+    const statusDetail = String(alert.status_detail || alert.statusDetail || clock.statusDetail || '').trim();
+    let homeAway = String(alert.score || '').trim().replace('–', '-');
+    if (!homeAway && alert.scores && typeof alert.scores === 'object'
+        && alert.scores.home != null && alert.scores.away != null) {
+        homeAway = `${alert.scores.home}-${alert.scores.away}`;
+    }
+    const inningHit = statusDetail.toLowerCase().includes('inning');
+    const parts = [];
+    if (homeAway) parts.push(homeAway);
+    if (inningHit) {
+        const m = statusDetail.toLowerCase().match(/(\d+)(?:st|nd|rd|th)?\s+inning/);
+        if (m) {
+            const n = parseInt(m[1], 10);
+            const suf = (n % 100 >= 11 && n % 100 <= 13) ? 'th' : ({ 1: 'st', 2: 'nd', 3: 'rd' }[n % 10] || 'th');
+            parts.push(`${n}${suf}`);
+        }
+        return parts.join(' · ');
+    }
+    const period = clock.period;
+    const played = clock.playedSeconds != null ? Number(clock.playedSeconds)
+        : (clock.played_seconds != null ? Number(clock.played_seconds) : NaN);
+    const minute = clock.minute != null ? Number(clock.minute) : NaN;
+    let periodLab = '';
+    if (period != null && String(period).trim() !== '') {
+        periodLab = /^\d+$/.test(String(period)) ? `Q${period}` : String(period);
+    }
+    let timeLab = '';
+    if (typeof clock.time === 'string' && clock.time.includes(':')) {
+        timeLab = clock.time.trim();
+    } else if (Number.isFinite(played) && played >= 0) {
+        timeLab = `${Math.floor(played / 60)}:${String(played % 60).padStart(2, '0')}`;
+    } else if (Number.isFinite(minute) && minute >= 0) {
+        timeLab = `${minute}'`;
+    }
+    const clockChunk = [periodLab, timeLab].filter(Boolean).join(' ');
+    if (clockChunk) parts.push(clockChunk);
+    else if (statusDetail && !['in progress', 'live'].includes(statusDetail.toLowerCase())) {
+        parts.push(statusDetail);
+    }
+    const timedClock = period != null || Number.isFinite(played) || Number.isFinite(minute);
+    if (timedClock && (clock.running === false || alert.clock_running === false)) {
+        parts.push('STOPPED');
+    }
+    return parts.join(' · ');
 }
 
 // Create alert card element (live multi-book layout)
@@ -577,96 +894,65 @@ function createAlertCard(alert) {
     
     // Build book prices table if display_books data is available
     let booksTableHtml = '';
-    let kalshiOddsNum = null; // Will be set from display_books if available
     
     if (alert.display_books && Object.keys(alert.display_books).length > 0) {
         // Get the selection we're betting on
         const ourSelection = alert.pick;
         const ourBooks = alert.display_books[ourSelection] || [];
         
-        // Find Kalshi book first to get actual Kalshi odds for comparison
-        const kalshiBook = ourBooks.find(book => (book.book || 'Unknown') === 'Kalshi');
-        if (kalshiBook && kalshiBook.odds) {
-            kalshiOddsNum = kalshiBook.odds;
-        } else {
-            // Fallback to alert.book_price if Kalshi not in display_books
-            const kalshiPrice = alert.book_price || alert.american_odds || (alert.price_cents ? priceToAmericanOdds(alert.price_cents) : 'N/A');
-            if (kalshiPrice && kalshiPrice !== 'N/A') {
-                const kalshiStr = String(kalshiPrice).replace(/[+]/g, '');
-                kalshiOddsNum = parseInt(kalshiStr, 10);
-                if (isNaN(kalshiOddsNum)) {
-                    kalshiOddsNum = null;
-                }
-            }
-        }
+        // Take is the book THIS card is betting (PLive or Kalshi). Never default Kalshi-green.
+        const takeKey = cardTakeKey(alert);
+        const takeAm = takeAmericanFromAlert(alert, ourBooks);
         
         // Kalshi + every book that participated in devig (devig_books) or is configured sharp
-        const booksToShow = ourBooks;
+        const booksToShow = orderBooksTakeFirst(ourBooks, alert);
         
         if (booksToShow.length > 0) {
             booksTableHtml = '<div class="books-table"><div class="books-header">';
             booksToShow.forEach(book => {
                 const bookName = book.book || 'Unknown';
                 const bookOdds = book.odds || 0;
+                // Empty Circa / no line: do not paint.
+                if (!bookTileHasLine(book.odds)) {
+                    return;
+                }
+                const paint = tilePaintState(bookName, bookOdds, alert, takeAm);
+                // Junk vs take: omit the tile (not gray). Poly −455 vs +163 is both 10c and sign-flip.
+                // PLive excluded from fair is NOT gray — +118 vs +163 paints like the recs.
+                if (paint.skip) {
+                    return;
+                }
                 const bookLimit = book.limit || 0;
                 const bookLimitDisplay = bookLimit ? formatLiquidityUsd(bookLimit) : '';
-                const bookLogoPath = bookLogos[bookName];
-                const bookLogoText = bookName.substring(0, 2).toUpperCase();  // Fallback text if no logo
-                const isKalshi = bookName === 'Kalshi';
-                const usedForLine =
-                    isKalshi || bookMatchesDevigOrSharp(bookName, alert.devig_books, alert.sharp_books);
-                let isGrayedOut = !usedForLine;
+                const isTakeBook = paint.take;
+                const hasBetterOdds = paint.better;
                 
-                // Check if this book has BETTER odds than Kalshi (for red outline)
-                // Red box = book is BETTER than Kalshi (we're missing out on a better price)
-                let hasBetterOdds = false;
-                if (!isKalshi && kalshiOddsNum !== null && bookOdds !== 0) {
-                    // Compare odds: better = higher for positive, less negative for negative
-                    if (bookOdds > 0 && kalshiOddsNum > 0) {
-                        // Both positive: higher is better
-                        hasBetterOdds = bookOdds > kalshiOddsNum;
-                    } else if (bookOdds < 0 && kalshiOddsNum < 0) {
-                        // Both negative: less negative is better (closer to 0)
-                        hasBetterOdds = bookOdds > kalshiOddsNum; // e.g., -105 > -112
-                    } else if (bookOdds > 0 && kalshiOddsNum < 0) {
-                        // Book is positive, Kalshi is negative: book is better
-                        hasBetterOdds = true;
-                    } else if (bookOdds < 0 && kalshiOddsNum > 0) {
-                        // Book is negative, Kalshi is positive: Kalshi is better (but we bet Kalshi, so don't mark)
-                        hasBetterOdds = false;
-                    }
+                const logoHtml = bookLogoHtml(bookName);
+                const bookKey = book.book_key || normalizeBookKey(bookName);
+                const isKalshiTile = normalizeBookKey(bookName) === 'kalshi';
+                const kTrade = alert.kalshi_last_trade_ts;
+                const bookTs = book.book_updated_at || (isKalshiTile ? kTrade : null)
+                    || ((alert.book_updated_at || {})[bookName]);
+                const bookAge = formatFreshnessAge(bookTs);
+                const kAge = formatFreshnessAge(kTrade);
+                const titleBits = [bookName];
+                if (bookAge) titleBits.push('updated ' + bookAge + ' ago');
+                if (!isKalshiTile && takeKey === 'kalshi' && kAge) {
+                    titleBits.push('Kalshi last trade ' + kAge + ' ago');
                 }
                 
-                // Use image if logo path exists, otherwise use text
-                const logoHtml = bookLogoPath 
-                    ? `<img src="${bookLogoPath}" alt="${bookName}" class="book-logo-img" />`
-                    : `<div class="book-logo-text">${bookLogoText}</div>`;
-                
                 booksTableHtml += `
-                    <div class="book-cell ${isKalshi ? 'kalshi-book' : ''} ${isGrayedOut ? 'grayed-out' : ''} ${hasBetterOdds ? 'better-than-kalshi' : ''}" data-book-name="${escapeHtml(bookName)}">
+                    <div class="book-cell ${isTakeBook ? 'kalshi-book take-book' : ''} ${hasBetterOdds ? 'better-than-kalshi' : ''}" data-book-name="${escapeHtml(bookName)}" data-book-key="${escapeHtml(bookKey)}" title="${escapeHtml(titleBits.join(' · '))}">
                         <div class="book-logo">${logoHtml}</div>
                         <div class="book-odds" data-book-odds="${bookOdds}">${bookOdds > 0 ? '+' : ''}${bookOdds}</div>
                         ${bookLimitDisplay ? `<div class="book-limit" data-book-limit="${bookLimit}">${bookLimitDisplay}</div>` : ''}
+                        ${bookAge ? `<div class="book-fresh">${escapeHtml(bookAge)}</div>` : ''}
                     </div>
                 `;
             });
             booksTableHtml += '</div></div>';
         }
     }
-    
-    // Determine which books meet filter criteria (for graying out)
-    // Books are grayed out if they don't meet minSharpLimits or other filter criteria
-    const devigBooks = alert.devig_books || [];  // Books used for devigging (from API)
-    const minSharpLimits = {
-        'BookMaker': 250,
-        'Circa': 250,
-        'Novig': 200,
-        'Pinnacle': 250,
-        'ProphetX': 200,
-        'SportTrade': 200,
-        'DraftKings': 250,
-        'FanDuel': 250
-    };
     
     // Get filter name (if available)
     const filterName = alert.filter_name || '';
@@ -689,16 +975,22 @@ function createAlertCard(alert) {
     }
     const mt = (alert.market_type || '').trim();
     const marketTitle = mt ? toTitleCaseWords(mt) : 'Market';
+    const kTradeAge = formatFreshnessAge(alert.kalshi_last_trade_ts);
+    const kTradeBadge = kTradeAge
+        ? `<span class="alert-liq-badge" title="Kalshi last trade age vs per-book last update">K last ${escapeHtml(kTradeAge)}</span>`
+        : '';
 
     card.innerHTML = `
         <div class="alert-header-bb alert-header-bb--grid">
             <div class="alert-header-main-col">
                 <div class="market-row-bb">
                     <span class="market-type-bb">${escapeHtml(marketTitle)}</span>
-                    <span class="alert-liq-badge" title="Kalshi line limit / stake from Odds-API (if provided)">Liq ${escapeHtml(liqBadge)}</span>
+                    <span class="alert-liq-badge alert-liq-usd" title="Kalshi line limit / stake from Odds-API (if provided)">Liq ${escapeHtml(liqBadge)}</span>
+                    ${kTradeBadge}
                     <span class="ev-source-sub" title="${escapeHtml(evSourceTitle)}">${escapeHtml(evSourceLabel)}</span>
                 </div>
                 <div class="teams-bb">${escapeHtml(alert.teams)}</div>
+                ${formatAlertGameStatus(alert) ? `<div class="alert-game-status">${escapeHtml(formatAlertGameStatus(alert))}</div>` : ''}
                 <div class="ev-display-left">
                     <div class="ev-value ${alert.ev_percent >= 0 ? 'positive' : 'negative'}">${evDisplay}</div>
                     <div class="ev-team">${escapeHtml(submarketName)}</div>
@@ -1216,6 +1508,7 @@ async function setFilters() {
         const data = await response.json();
         if (data.success) {
             showToast('success', `Dashboard Min EV updated: ${minEv}%`, null);
+            renderAlerts();
         } else {
             showToast('error', data.error || 'Failed to update filters', null);
         }
@@ -1548,6 +1841,94 @@ if (broadScanPregameCb) {
     });
 }
 
+function isBaseballSportSelection() {
+    const sel = document.getElementById('odds-sport-sel');
+    const raw = sel && sel.value ? String(sel.value) : '';
+    const sport = raw.split('|')[0].trim().toLowerCase();
+    return sport === 'baseball' || sport === 'mlb';
+}
+
+function isTimedBoardSportSelection() {
+    const sel = document.getElementById('odds-sport-sel');
+    const raw = sel && sel.value ? String(sel.value) : '';
+    const parts = raw.split('|');
+    const sport = (parts[0] || '').trim().toLowerCase();
+    const league = (parts[1] || 'all').trim().toLowerCase();
+    if (sport === 'baseball' || sport === 'mlb') return false;
+    if (sport === 'basketball' || sport === 'nba') return true;
+    if (sport === 'americanfootball' || sport === 'nfl' || sport === 'ncaaf' || sport === 'cfb') {
+        return league === 'all' || league === 'nfl' || league === 'ncaaf' || league === 'cfb';
+    }
+    if (sport === 'football' || sport === 'soccer') return true;
+    return false;
+}
+
+function syncStoppagesOnlyForSport() {
+    const el = document.getElementById('stoppages-only');
+    const label = document.getElementById('stoppages-only-label');
+    if (!el) return;
+    const baseball = isBaseballSportSelection();
+    const timed = isTimedBoardSportSelection();
+    el.disabled = !timed;
+    const liveTitle =
+        'Live takes only when Odds-API clock exists and clock.running is false, or statusDetail is Halftime/Break. Omitted clock fails closed. Baseball unsupported.';
+    const mlbTitle =
+        'MLB has no Odds-API clock. statusDetail is inning-only (1st inning…9th inning). Do not invent mid-inning or between-innings.';
+    const idleTitle =
+        'Stoppages Only applies to NBA, NFL, soccer, and CFB. Select one of those sports on the odds board to enable.';
+    el.title = baseball ? mlbTitle : (timed ? liveTitle : idleTitle);
+    if (label) {
+        label.title = el.title;
+        label.classList.toggle('is-disabled', !timed);
+    }
+}
+
+async function loadStoppagesOnly() {
+    const el = document.getElementById('stoppages-only');
+    if (!el) return;
+    try {
+        const response = await fetch('/api/stoppages_only');
+        const data = await response.json();
+        if (data.enabled !== undefined) {
+            el.checked = !!data.enabled;
+        }
+    } catch (error) {
+        console.error('Error loading Stoppages Only toggle:', error);
+    }
+    syncStoppagesOnlyForSport();
+}
+
+async function saveStoppagesOnly(enabled) {
+    try {
+        const response = await fetch('/api/stoppages_only', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled: !!enabled }),
+        });
+        const data = await response.json();
+        if (data.enabled !== undefined) {
+            showToast(
+                'success',
+                enabled
+                    ? 'Stoppages Only: live takes require a stopped Odds-API clock or Halftime/Break'
+                    : 'Stoppages Only off',
+                null
+            );
+        }
+    } catch (error) {
+        console.error('Error saving Stoppages Only toggle:', error);
+        showToast('error', 'Failed to update Stoppages Only', null);
+    }
+}
+
+const stoppagesOnlyCb = document.getElementById('stoppages-only');
+if (stoppagesOnlyCb) {
+    stoppagesOnlyCb.addEventListener('change', () => {
+        if (stoppagesOnlyCb.disabled) return;
+        saveStoppagesOnly(stoppagesOnlyCb.checked);
+    });
+}
+
 // --- Dashboard | Odds board tabs (header; uses /api/live_odds) ---
 (function () {
     const tabAlerts = document.getElementById('tab-btn-dashboard');
@@ -1615,9 +1996,9 @@ if (broadScanPregameCb) {
     }
 
     function fmtAm(v) {
-        if (v === null || v === undefined) return '—';
+        if (v === null || v === undefined) return '-';
         const n = Number(v);
-        if (!Number.isFinite(n)) return '—';
+        if (!Number.isFinite(n)) return '-';
         return (n > 0 ? '+' : '') + n;
     }
 
@@ -1630,30 +2011,7 @@ if (broadScanPregameCb) {
     }
 
     function abbrevBook(name) {
-        const n = String(name || '');
-        const map = {
-            Kalshi: 'KS',
-            FanDuel: 'FD',
-            DraftKings: 'DK',
-            Circa: 'CI',
-            BookMaker: 'BM',
-            'BookMaker.eu': 'BM',
-            Novig: 'NV',
-            NoVig: 'NV',
-            ProphetX: 'PX',
-            SportTrade: 'ST',
-            Polymarket: 'PM',
-            Betfair: 'BF',
-            'Betfair Exchange': 'BFX',
-            BetMGM: 'MGM',
-            Caesars: 'CZ',
-            PointsBet: 'PB',
-            Pinnacle: 'PN',
-            EspnBet: 'ES',
-            Fanatics: 'FN',
-        };
-        if (map[n]) return map[n];
-        return n.length <= 4 ? n.toUpperCase() : n.slice(0, 3).toUpperCase();
+        return uniqueBookAbbrev(name);
     }
 
     function renderOddsTable(data) {
@@ -1674,8 +2032,14 @@ if (broadScanPregameCb) {
             bwl.length > 0
                 ? ` · API books with any line this refresh: ${bwl.length}/${breq} (${bwl.join(', ')})`
                 : '';
+        const pl = data.plive || {};
+        const pliveMeta = pl.message
+            ? ` · ${pl.message}`
+            : (pl.connected
+                ? ` · PLive connected · ${pl.mlb_with_prices || 0} MLB priced`
+                : '');
         meta.textContent =
-            `Updated ${t.toLocaleString()} · ${evs.length} game(s) (${pairRows} lines) · ${data.timing || ''} · sport=${data.sport || ''} · api=${data.sport_api || '-'} · league=${data.league_focus || 'all'} · league_api=${data.league_api || '-'} · date=${data.date_filter || ''}${bmeta}`;
+            `Updated ${t.toLocaleString()} · ${evs.length} game(s) (${pairRows} lines) · ${data.timing || ''} · sport=${data.sport || ''} · api=${data.sport_api || '-'} · league=${data.league_focus || 'all'} · league_api=${data.league_api || '-'} · date=${data.date_filter || ''}${bmeta}${pliveMeta}`;
 
         const hdr = document.createElement('tr');
         let h = '<th class="pto-col-match">Game</th><th class="pto-col-side">Team</th>';
@@ -1692,15 +2056,19 @@ if (broadScanPregameCb) {
         evs.forEach((row) => {
             const pr = row.books || {};
             const parts = (row.teams || '').split(/\s+@\s+/).map((s) => s.trim());
-            const away = parts[0] || 'Away';
-            const home = parts[1] || 'Home';
-            const meta = `${escapeHtml(row.league || '')} · ${escapeHtml(row.market || '')}`;
+            const kind = String(row.market_kind || '').toLowerCase();
+            const mkt = String(row.market || '');
+            const isTotal = kind === 'total' || /total/i.test(mkt);
+            const lineBit = (row.line != null && row.line !== '') ? ` ${row.line}` : '';
+            const away = row.side_a || (isTotal ? `Over${lineBit}` : (parts[0] || 'Away'));
+            const home = row.side_b || (isTotal ? `Under${lineBit}` : (parts[1] || 'Home'));
+            const meta = `${escapeHtml(row.league || '')} · ${escapeHtml(row.market || '')}${isTotal ? '' : escapeHtml(lineBit)}`;
             const best = row.best || {};
 
             const trA = document.createElement('tr');
             let cA = `<td rowspan="2" class="pto-side-label"><div>${escapeHtml(row.teams || '')}</div><div class="pto-event-meta">${meta}</div></td>`;
             cA += `<td class="pto-side-label">${escapeHtml(away)}</td>`;
-            cA += `<td rowspan="2" class="pto-odds-cell">${escapeHtml(row.start_display || '—')}</td>`;
+            cA += `<td rowspan="2" class="pto-odds-cell">${escapeHtml(row.start_display || '-')}</td>`;
             cA += `<td rowspan="2" class="pto-odds-cell">${row.live ? '●' : '○'}</td>`;
             books.forEach((b) => {
                 const p = pr[b] || {};
@@ -1758,6 +2126,8 @@ if (broadScanPregameCb) {
     [sportSel, timingSel, dateSel].forEach((el) => {
         if (el) el.addEventListener('change', () => { loadOddsOnce(); bumpOddsTimer(); });
     });
+    if (sportSel) sportSel.addEventListener('change', syncStoppagesOnlyForSport);
+    syncStoppagesOnlyForSport();
     if (autoRef) autoRef.addEventListener('change', bumpOddsTimer);
 
     bumpOddsTimer();

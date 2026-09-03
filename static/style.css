@@ -958,6 +958,10 @@ details.auto-bet-setting[open] summary::before {
     .teams-bb {
         font-size: 13px;
     }
+
+    .alert-game-status {
+        font-size: 11px;
+    }
     
     .ev-value {
         font-size: 14px;
@@ -1180,6 +1184,10 @@ body.dark .filter-name-badge-block {
 }
 
 .scan-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 12px 18px;
     flex: 1 1 220px;
     padding: 10px 14px;
     border: 1px solid var(--border);
@@ -1199,6 +1207,12 @@ body.dark .filter-name-badge-block {
     user-select: none;
 }
 
+.scan-toggle-label.is-disabled,
+.scan-toggle-label:has(input:disabled) {
+    opacity: 0.55;
+    cursor: not-allowed;
+}
+
 .controls-wrapper--flex {
     flex: 2 1 320px;
     min-width: 0;
@@ -1210,6 +1224,15 @@ body.dark .filter-name-badge-block {
     color: var(--text-primary);
     line-height: 1.4;
     margin-bottom: 8px;
+}
+
+.alert-game-status {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--muted-text, #64748b);
+    letter-spacing: 0.01em;
+    margin: -4px 0 8px;
+    font-variant-numeric: tabular-nums;
 }
 
 .ev-display-left {
@@ -1262,12 +1285,20 @@ body.dark .filter-name-badge-block {
     border-radius: 6px;
     border: 1px solid var(--border);
     min-width: 60px;
+    opacity: 1;
     transition: all 0.3s ease;
 }
 
 .book-cell:hover {
     transform: translateY(-2px);
     box-shadow: 0 4px 8px var(--shadow);
+}
+
+.book-fresh {
+    font-size: 10px;
+    line-height: 1.2;
+    color: var(--text-tertiary);
+    margin-top: 2px;
 }
 
 .book-cell.kalshi-book {
@@ -1279,7 +1310,8 @@ body.dark .book-cell.kalshi-book {
     background: rgba(31, 213, 154, 0.15);
 }
 
-.book-cell.grayed-out {
+.book-cell.grayed-out,
+.book-cell.junk-tile {
     opacity: 0.4;
     background: var(--bg-tertiary);
     border-color: var(--border);
@@ -1305,11 +1337,12 @@ body.dark .book-cell.kalshi-book {
     box-shadow: 0 0 0 1px rgba(255, 68, 68, 0.3);
 }
 
+/* Leftover class: worse recs stay unshaded full color, never red/faded. */
 .book-cell.worse-than-kalshi {
-    border: 2px solid #ff4444;
-    border-color: #ff4444;
-    box-shadow: 0 0 0 1px rgba(255, 68, 68, 0.3);
-    background: rgba(255, 68, 68, 0.05);
+    opacity: 1;
+    border: 1px solid var(--border);
+    box-shadow: none;
+    background: var(--bg-secondary);
 }
 
 .book-logo {
