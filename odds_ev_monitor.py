@@ -2485,24 +2485,11 @@ class OddsEVMonitor:
                                 "_canonical_kalshi_row": canon,
                             }
                         )
-            # Strike (hdp/max/line) is required. Kalshi Over 7 must not
-            # skip PLive Over 10.5 as a duplicate Over.
-            seen_sides = {
-                (
-                    str(r.get("eventId")),
-                    str(r.get("_scan_mname") or "").upper(),
-                    str(r.get("betSide") or "").lower(),
-                    _scan_strike_key(
-                        r.get("_canonical_kalshi_row") or r.get("market") or {},
-                        str(r.get("_scan_mname") or ""),
-                    ),
-                )
-                for r in scan_rows
-                if r.get("eventId") == eid
-                and extract_kalshi_ticker_from_href(
-                    ((r.get("bookmakerOdds") or {}) if isinstance(r.get("bookmakerOdds"), dict) else {}).get("href")
-                )
-            }
+            # Independent takes: a Kalshi ticker on this strike must not
+            # hide the live PLive coeff (Astros -3.5 PLive -164 / Kalshi -179).
+            # Strike is still on the key so Kalshi Over 7 never collapses
+            # PLive Over 10.5, and PLive does not emit the same row twice.
+            seen_sides: set = set()
             for mname, pl_mk in _kalshi_scan_gameline_markets(bks, "PLive"):
                 odds_rows = pl_mk.get("odds") or []
                 mu = mname.upper()

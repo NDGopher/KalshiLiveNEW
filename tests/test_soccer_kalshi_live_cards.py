@@ -597,6 +597,96 @@ def test_kortrijk_under_175_prints_175_not_18():
     assert built["autobet_allow"] is False
 
 
+def test_soccer_store_scan_matches_baseball_bar_live_coeff_exact_line():
+    """Same bar as Astros -3.5 PLive -164: live Pandora coeff, exact strike, independent takes."""
+    store = PliveStore()
+    eid = 2201001
+    store.apply_meta(
+        str(eid),
+        {
+            "sportId": 5,
+            "home": "RSC Anderlecht",
+            "away": "KV Kortrijk",
+            "leagueName": "Belgium Jupiler League",
+            "ip": True,
+        },
+    )
+    under175 = american_to_decimal(186)
+    kalshi_under = american_to_decimal(140)
+    store.apply_message(
+        {
+            "isDiff": False,
+            "payload": {
+                "c": {
+                    "m": {
+                        "5": {
+                            "o": {
+                                "over_1.75": {0: 1.55, 1: 1.61},
+                                "under_1.75": {0: under175, 1: 2.10},
+                                "over_1.8": {0: 1.70, 1: 1.85},
+                                "under_1.8": {0: 2.20, 1: 2.40},
+                            }
+                        }
+                    }
+                }
+            },
+        },
+        event_name=f"live.main.{PLIVE_LINE_SET}.eventCoefficients.{eid}",
+    )
+    mon = _soccer_mon()
+    doc = {
+        "id": eid,
+        "home": "RSC Anderlecht",
+        "away": "KV Kortrijk",
+        "sport": {"slug": "football"},
+        "league": {"name": "Belgium Jupiler League"},
+        "live": True,
+        "bookmakers": {
+            "PLive": store.markets_for_event(str(eid)),
+            "Kalshi": [
+                {
+                    "name": "Totals",
+                    "odds": [{"max": 1.75, "over": 1.55, "under": kalshi_under, "href": ""}],
+                }
+            ],
+            "Betfair Exchange": [
+                {"name": "Totals", "odds": [{"max": 1.75, "over": 1.55, "under": 2.40}]}
+            ],
+            "Bet365": [{"name": "Totals", "odds": [{"max": 1.75, "over": 1.56, "under": 2.38}]}],
+            "DraftKings": [{"name": "Totals", "odds": [{"max": 1.75, "over": 1.54, "under": 2.42}]}],
+            "Polymarket": [{"name": "Totals", "odds": [{"max": 1.75, "over": 1.57, "under": 2.36}]}],
+            "FanDuel": [{"name": "Totals", "odds": [{"max": 1.8, "over": 1.70, "under": 2.20}]}],
+        },
+    }
+    rows = mon.live_scan_value_bets_from_docs({eid: doc})
+    plive_u = [
+        r
+        for r in rows
+        if r.get("_take_only") == "PLive"
+        and r.get("betSide") == "under"
+        and abs(float((r.get("_canonical_kalshi_row") or {}).get("hdp") or 0) - 1.75) < 1e-9
+    ]
+    kalshi_u = [
+        r
+        for r in rows
+        if r.get("_take_only") == "Kalshi"
+        and r.get("betSide") == "under"
+        and abs(float((r.get("market") or {}).get("max") or 0) - 1.75) < 1e-9
+    ]
+    assert plive_u
+    assert kalshi_u
+    plive = mon._value_bet_to_normalized_bet(plive_u[0], doc, take_book="PLive")
+    assert plive is not None
+    assert plive["take_book"] == "PLive"
+    assert plive["qualifier"] == "1.75"
+    assert plive["qualifier"] != "1.8"
+    assert int(plive["odds"]) == 186
+    assert int(plive["odds"]) != 140
+    assert plive["autobet_allow"] is False
+    assert (plive["displayBooks"][plive["selection"]] or [])[0]["book"] == "PLive"
+    assert mon._value_bet_to_normalized_bet(plive_u[0], doc, take_book="Kalshi") is None
+
+
 def test_paper_kalshi_ticker_is_not_kxscan_and_not_executable():
     tok = paper_kalshi_ticker("Lille OSC @ Toulouse", "Draw", None)
     assert is_paper_kalshi_ticker(tok)
