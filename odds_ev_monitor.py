@@ -45,6 +45,7 @@ from ev_calculator import (
     decimal_to_american,
     ev_percent_three_methods_multi_sharp,
     ev_percent_three_methods_three_way,
+    exclude_plive_from_fair,
     fair_books_for_panel,
     filter_sharp_panel,
     format_ev_percent_display,
@@ -2426,11 +2427,14 @@ class OddsEVMonitor:
                 surviving_books = filter_sharp_panel(
                     panel_books, kalshi_american=decimal_to_american(k_dec)
                 )
+                fair_eligible = exclude_plive_from_fair(surviving_books)
                 # minSharp is the filter floor — do not lower it for live scan.
-                if len(surviving_books) >= min_sharp:
-                    fair_src = fair_books_for_panel(surviving_books, decimal_to_american(k_dec))
+                # PLive is a tile/take book and does not count toward minSharp or fair.
+                if len(fair_eligible) >= min_sharp:
+                    fair_src = fair_books_for_panel(fair_eligible, decimal_to_american(k_dec))
+                    fair_for_avg = fair_src or fair_eligible
                     if (method or "POWER").upper() == "POWER" and comb_type != "WORST_CASE":
-                        fair_prob = power_average_fair_prob(fair_src or surviving_books, self._calc)
+                        fair_prob = power_average_fair_prob(fair_for_avg, self._calc)
                     else:
                         pick_probs = [
                             _panel_relaxed_pick_fair_two_way(
@@ -2439,20 +2443,20 @@ class OddsEVMonitor:
                                 float(b["decimal_opp"]),
                                 method,
                             )
-                            for b in (fair_src or surviving_books)
+                            for b in fair_for_avg
                         ]
                         fair_prob = (
                             min(pick_probs) if comb_type == "WORST_CASE" else sum(pick_probs) / len(pick_probs)
                         )
-                    sharp_books_used = len(surviving_books)
-                    devig_book_labels = [str(b.get("name") or "") for b in surviving_books]
-                    d0 = float(surviving_books[0]["decimal_pick"])
-                    opp0 = float(surviving_books[0]["decimal_opp"])
+                    sharp_books_used = len(fair_eligible)
+                    devig_book_labels = [str(b.get("name") or "") for b in fair_eligible]
+                    d0 = float(fair_eligible[0]["decimal_pick"])
+                    opp0 = float(fair_eligible[0]["decimal_opp"])
                     sharp_decimals = [d0, opp0]
                     fd_dec_for_side = d0
                     panels = [
                         (float(b["decimal_pick"]), float(b["decimal_opp"]), str(b.get("name") or ""))
-                        for b in surviving_books
+                        for b in fair_eligible
                     ]
 
         multi_panel_mode = bool(bks and sharp_names and min_sharp > 1)
@@ -2528,7 +2532,7 @@ class OddsEVMonitor:
             gated = apply_ev_hard_gates(
                 ev_percent,
                 kalshi_am,
-                surviving_books,
+                exclude_plive_from_fair(surviving_books),
                 used_fallback=used_fallback_fair,
                 min_sharp_books=min_sharp,
             )

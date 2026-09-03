@@ -25,8 +25,8 @@ from typing import Any, Dict, List, Optional, Tuple
 _POWER_FAIR_CLIP_HI = 0.99
 _POWER_FAIR_CLIP_LO = 0.01
 
-# Sharp-panel screen (Kalshi All Sports POWER+AVERAGE). Applied to every non-Kalshi
-# book dict, including a future PLive row — name is not special-cased.
+# Sharp-panel screen (Kalshi All Sports POWER+AVERAGE). Junk uses the quote, not
+# the book name. PLive is display/take only — never POWER/AVERAGE fair.
 SHARP_ABS_AMERICAN_CAP = 1000
 SHARP_OUTLIER_IMPLIED_FLOOR = 0.08
 SHARP_OUTLIER_MAD_MULT = 2.5
@@ -266,6 +266,16 @@ def _eligible_sharp_books(books: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return eligible
 
 
+def is_plive_book(name: Any) -> bool:
+    """PLive is a tile / take book. It is never a fair (POWER/AVERAGE) rec."""
+    key = "".join(ch.lower() for ch in str(name or "") if ch.isalnum())
+    return key == "plive" or key.startswith("plive")
+
+
+def exclude_plive_from_fair(books: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [b for b in (books or []) if not is_plive_book(b.get("name"))]
+
+
 def filter_sharp_panel(
     books: List[Dict[str, Any]],
     kalshi_american: Optional[int] = None,
@@ -273,8 +283,8 @@ def filter_sharp_panel(
     """Drop unmatched, incomplete, spiked, off-market, and sign-flipped quotes.
 
     Each book is ``{name, american, decimal_pick, decimal_opp, match_failed?}``.
-    Name is ignored (PLive / NV / DK use the same screen). Surviving rows keep
-    their original keys so the caller can still read decimals / american.
+    Junk screening is name-agnostic so a PLive tile can still render (gray if
+    junk, red if better and inside 10c). PLive is stripped later from fair.
 
     When ``kalshi_american`` is set, egregious quotes use ``is_junk_vs_kalshi``
     (10c from Kalshi or sign flip) — not a global median.
@@ -324,7 +334,7 @@ def fair_books_for_panel(survivors: List[Dict[str, Any]], kalshi_american: int) 
     """
     rows = [
         b
-        for b in (survivors or [])
+        for b in exclude_plive_from_fair(survivors)
         if not is_junk_vs_kalshi(int(b.get("american") or 0), int(kalshi_american))
     ]
     if not rows:
@@ -358,7 +368,11 @@ def power_average_fair_prob(survivors: List[Dict[str, Any]], calc: Optional[EVCa
     two-way onto AVERAGE and erase a real best-price edge vs close recs
     (KEEP ~+2% vs -139/-141/-142).
     """
-    rows = [b for b in (survivors or []) if float(b.get("decimal_pick") or 0) > 1.0 and float(b.get("decimal_opp") or 0) > 1.0]
+    rows = [
+        b
+        for b in exclude_plive_from_fair(survivors)
+        if float(b.get("decimal_pick") or 0) > 1.0 and float(b.get("decimal_opp") or 0) > 1.0
+    ]
     if not rows:
         return None
     c = calc or EVCalculator({})
@@ -458,6 +472,7 @@ def evaluate_sharp_panel_ev(
     Does not mention teams or tickers — callers pass anonymous boards.
     """
     surviving = filter_sharp_panel(books, kalshi_american=kalshi_american)
+    fair_eligible = exclude_plive_from_fair(surviving)
     calc = EVCalculator({})
     k_dec = american_to_decimal(int(kalshi_american))
     price_cents = int(max(1, min(99, round(100.0 / k_dec)))) if k_dec > 1.0 else 0
@@ -465,14 +480,14 @@ def evaluate_sharp_panel_ev(
     ev = 0.0
     if used_fallback:
         gated = apply_ev_hard_gates(
-            0.0, kalshi_american, surviving, used_fallback=True, min_sharp_books=min_sharp_books
+            0.0, kalshi_american, fair_eligible, used_fallback=True, min_sharp_books=min_sharp_books
         )
-    elif len(surviving) < int(min_sharp_books):
+    elif len(fair_eligible) < int(min_sharp_books):
         gated = apply_ev_hard_gates(
-            0.0, kalshi_american, surviving, used_fallback=False, min_sharp_books=min_sharp_books
+            0.0, kalshi_american, fair_eligible, used_fallback=False, min_sharp_books=min_sharp_books
         )
     else:
-        fair_src = fair_books_for_panel(surviving, kalshi_american)
+        fair_src = fair_books_for_panel(fair_eligible, kalshi_american)
         if (method or "POWER").upper() == "POWER":
             fair = power_average_fair_prob(fair_src, calc)
         else:
@@ -483,11 +498,12 @@ def evaluate_sharp_panel_ev(
             fair = sum(fairs) / float(len(fairs)) if fairs else None
         ev = calc.ev_percent_vs_kalshi(fair, price_cents) if fair is not None else -999.0
         gated = apply_ev_hard_gates(
-            ev, kalshi_american, surviving, used_fallback=False, min_sharp_books=min_sharp_books
+            ev, kalshi_american, fair_eligible, used_fallback=False, min_sharp_books=min_sharp_books
         )
     out = {
         "surviving": surviving,
         "surviving_names": [str(b.get("name") or "") for b in surviving],
+        "fair_names": [str(b.get("name") or "") for b in fair_eligible],
         "fair_prob": fair,
         "raw_ev_percent": ev,
         "ev_percent": gated["ev_percent"],

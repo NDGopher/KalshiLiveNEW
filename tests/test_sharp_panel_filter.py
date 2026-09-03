@@ -21,8 +21,11 @@ from ev_calculator import (
     apply_ev_hard_gates,
     decimal_to_american,
     evaluate_sharp_panel_ev,
+    exclude_plive_from_fair,
+    fair_books_for_panel,
     filter_sharp_panel,
     is_junk_vs_kalshi,
+    is_plive_book,
 )
 
 
@@ -133,6 +136,8 @@ def test_filter_accepts_plive_named_row():
     books = [_book("PLive", -139), _book("A", -149), _book("B", -155)]
     names = {b["name"] for b in filter_sharp_panel(books)}
     assert "PLive" in names
+    assert is_plive_book("PLive") is True
+    assert "PLive" not in {b["name"] for b in exclude_plive_from_fair(books)}
 
 
 def test_hard_rejects_never_survive():
@@ -332,6 +337,32 @@ def test_drop_sf_pit_giants_plus15_novig_signflip():
     assert out["ev_percent"] < 8.0
     assert out["ev_percent"] < 13.0
     assert out["raw_ev_percent"] < 13.0
+
+
+def test_keep_plive_does_not_change_fair_or_ev():
+    """PLive is a tile only. Same KEEP board with/without PLive must match fair + EV."""
+    kalshi, books = _fixture_keep_cws_hou_astros_ml()
+    without = evaluate_sharp_panel_ev(books, kalshi, min_sharp_books=3)
+    with_plive_books = books + [_book("PLive", -139)]
+    with_plive = evaluate_sharp_panel_ev(with_plive_books, kalshi, min_sharp_books=3)
+    assert "PLive" in with_plive["surviving_names"]
+    fair_names = {b["name"] for b in fair_books_for_panel(with_plive["surviving"], kalshi)}
+    assert "PLive" not in fair_names
+    assert {"FD", "CA", "NV"}.issubset(fair_names)
+    assert with_plive["fair_prob"] == without["fair_prob"]
+    assert with_plive["ev_percent"] == without["ev_percent"]
+    assert with_plive["raw_ev_percent"] == without["raw_ev_percent"]
+    assert with_plive["plus_alert"] is without["plus_alert"]
+    assert without["plus_alert"] is True
+
+
+def test_plive_does_not_satisfy_min_sharp_alone():
+    """Two recs + PLive is not three fair books."""
+    books = [_book("A", -139), _book("B", -141), _book("PLive", -140)]
+    out = evaluate_sharp_panel_ev(books, -133, min_sharp_books=3)
+    assert "PLive" in out["surviving_names"]
+    assert out["plus_alert"] is False
+    assert "min_sharp" in out["reasons"]
 
 
 def test_keep_cws_hou_astros_ml_still_small_plus():
