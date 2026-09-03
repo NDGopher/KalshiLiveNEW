@@ -56,7 +56,9 @@ ufw reload
 
 **Check:**
 - `ODDS_API_KEY` is set in `.env` and the dashboard was restarted after changes.
-- `ODDS_POLL_INTERVAL_SECONDS` matches your plan (avoid rate limits). With parallel per-book ``/odds/multi``, rough cost is ``(3600/poll) × ceil(n_live_ids/10) × n_books`` — use ``ODDS_LIVE_SCAN_MAX_EVENTS`` and ``ODDS_HTTP_BUDGET_LOG=true`` to inspect.
+- MLB tonight: `ODDS_API_WS=true`, `ODDS_API_SPORTS=baseball`, `ODDS_API_LEAGUE_MLB=usa-mlb`. Primary path is WebSocket; REST `/odds/multi` is resync/fallback only (a 10-book poller will 429).
+- Select the 10 catalog books in the Odds-API.io dashboard (Betfair **Exchange**, not Sportsbook; not BookMaker.eu).
+- `ODDS_POLL_INTERVAL_SECONDS` is the REST-fallback interval. With WS healthy, EV evaluates on ticks (`ODDS_API_WS_EVAL_INTERVAL_SEC`). With parallel per-book ``/odds/multi`` fallback, rough cost is ``(3600/poll) × ceil(n_live_ids/10) × n_books`` — use ``ODDS_LIVE_SCAN_MAX_EVENTS`` and ``ODDS_HTTP_BUDGET_LOG=true`` to inspect.
 - **Slate vs lines:** `ODDS_API_LIVE_EVENTS_TTL_SEC` (default long, ~20m) controls how often **which games are live** is re-fetched; `ODDS_API_LIVE_ODDS_TTL_SEC` (default **0**) controls caching of the **merged odds** snapshot for monitors. Lower the slate TTL temporarily (e.g. 90) when testing games **just** going live.
 - `ODDS_API_MAX_REQUESTS_PER_HOUR` defaults **5000** (Growth-style); set lower (e.g. 100) on strict free tiers.
 - Logs for HTTP 401/429 from Odds-API.io — fix key or slow polling.

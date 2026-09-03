@@ -4,7 +4,8 @@ Drop-in replacement for BookieBeatsAPIMonitor using Odds-API.io.
 FREE TIER SAFE -- poll interval defaults to 45s, shared client + TTL caches; optional
   ODDS_API_MLB_NBA_ONLY=true restricts alerts to NBA/MLB leagues.
   Live **slate** (/events/live) and live **lines** (/odds/multi) use different TTLs in ``odds_api_client`` (see env README / BOOKIEBEATS roadmap).
-UPGRADE PATH: add WebSocket here (Odds-API.io WS) and push deltas instead of polling.
+Primary live lines: Odds-API.io WebSocket (MLB / usa-mlb, prematch+live) plus optional PLive.
+REST is for slate (``/events``, ``/events/live``) and resync only. Auto-bet stays OFF at startup.
 
 Public interface matches BookieBeatsAPIMonitor (same __init__ signature, callbacks, loop).
 """
@@ -47,10 +48,24 @@ from ev_calculator import (
 )
 from odds_api_client import (
     get_shared_odds_client,
+    major_league_slug_for_events,
     odds_api_master_bookmakers,
     odds_api_sports_list,
     reset_shared_odds_client,
     _norm_book,
+)
+from odds_api_ws import (
+    get_shared_odds_ws_feed,
+    mlb_ws_slice_active,
+    odds_api_ws_wanted,
+    peek_shared_odds_ws_feed,
+    resolve_odds_docs,
+)
+from plive_pandora import (
+    extra_local_bookmakers,
+    get_shared_plive_feed,
+    merge_plive_into_docs,
+    plive_wanted,
 )
 
 _DOTENV_BOOTSTRAP_DONE = False
@@ -92,6 +107,9 @@ def print_env_debug(*, standalone: bool = False) -> None:
     print(f"  ODDS_DEBUG_MODE: {os.getenv('ODDS_DEBUG_MODE', '(unset)')}")
     print(f"  ODDS_DEBUG_MAX_EVENTS: {os.getenv('ODDS_DEBUG_MAX_EVENTS', '(unset)')}")
     print(f"  ODDS_TEST_MINUTES: {os.getenv('ODDS_TEST_MINUTES', '(unset)')}")
+    print(f"  ODDS_API_WS: {os.getenv('ODDS_API_WS', '(unset)')}  wanted={odds_api_ws_wanted()} mlb_slice={mlb_ws_slice_active()}")
+    print(f"  ODDS_API_WS_STATUS: {os.getenv('ODDS_API_WS_STATUS', '(unset — prematch+live)')}")
+    print(f"  PLIVE_ENABLED: {os.getenv('PLIVE_ENABLED', '(unset)')}  wanted={plive_wanted()}")
     print("  Note: load_dotenv(override=True) applies .env over existing shell variables.")
     print("=" * 60)
 
@@ -1677,7 +1695,23 @@ class OddsEVMonitor:
         pre_cap = int(os.getenv("ODDS_PREGAME_EVENTS_PER_SPORT", "35"))
         log_each_max = int(os.getenv("ODDS_LEAGUE_DEBUG_MAX_LINES", "400"))
 
-        if OddsEVMonitor.broad_scan_include_pregame:
+        mlb_slice = mlb_ws_slice_active()
+        if mlb_slice:
+            # Baseball / usa-mlb only — REST slate, not a 5-sport /odds/multi storm.
+            mlb_lg = major_league_slug_for_events("baseball", "mlb") or (
+                os.getenv("ODDS_API_LEAGUE_MLB") or "usa-mlb"
+            ).strip()
+            liv = await client.list_live_events("baseball")
+            try:
+                pre_all = await client.list_events_for_sport("baseball", league=mlb_lg)
+            except Exception as ex:
+                print(f"[MONITOR] [WARN] MLB pregame /events failed: {ex}")
+                pre_all = []
+            print(
+                f"[MONITOR] MLB slice slate: live={len(liv or [])} pregame={len(pre_all or [])} "
+                f"league={mlb_lg} (WS prematch+live; REST slate only)"
+            )
+        elif OddsEVMonitor.broad_scan_include_pregame:
             liv, pre_all = await asyncio.gather(
                 client.list_live_events(None),
                 _diag_fetch_pregame_by_sports(client, pre_cap),
@@ -1687,6 +1721,9 @@ class OddsEVMonitor:
             pre_all = []
         liv = list(liv or [])
         pre_all = list(pre_all or [])
+        _ws_feed = peek_shared_odds_ws_feed()
+        if _ws_feed is not None:
+            _ws_feed.store.apply_slate(liv + pre_all)
 
         leagues_filter = list(self.filter_payload.get("leagues") or [])
 
@@ -1832,7 +1869,8 @@ class OddsEVMonitor:
                     f"order_of_mag_upper≈{rough} multi/hour if {n_mon} filters align (tune ODDS_LIVE_SCAN_MAX_EVENTS, poll, books)"
                 )
             try:
-                multi = await client.get_odds_multi(
+                multi, src = await resolve_odds_docs(
+                    client,
                     event_ids,
                     multi_books,
                     odds_cache_ttl=client._live_odds_multi_ttl,
@@ -1841,8 +1879,13 @@ class OddsEVMonitor:
                     eid = doc.get("id")
                     if eid is not None:
                         odds_by_id[int(eid)] = doc
+                n_plive = merge_plive_into_docs(list(odds_by_id.values()))
+                print(
+                    f"[MONITOR] odds source={src} events={len(odds_by_id)} "
+                    f"plive_matched={n_plive} (WS-first; REST only if WS down)"
+                )
             except Exception as ex:
-                print(f"[MONITOR] [WARN] live broad scan odds/multi failed: {ex}")
+                print(f"[MONITOR] [WARN] live scan odds resolve failed: {ex}")
 
         _n_before_k = len(odds_by_id)
         odds_by_id = {
@@ -2096,7 +2139,8 @@ class OddsEVMonitor:
                 if not multi_books:
                     multi_books = ["Kalshi", self._reference_book]
                 self._pipeline_disp_book_count = len(multi_books)
-                multi = await client.get_odds_multi(
+                multi, src = await resolve_odds_docs(
+                    client,
                     event_ids,
                     multi_books,
                     odds_cache_ttl=client._live_odds_multi_ttl,
@@ -2105,8 +2149,10 @@ class OddsEVMonitor:
                     eid = doc.get("id")
                     if eid is not None:
                         odds_by_id[int(eid)] = doc
+                n_plive = merge_plive_into_docs(list(odds_by_id.values()))
+                print(f"[MONITOR] value-bets odds source={src} plive_matched={n_plive}")
             except Exception as e:
-                print(f"[MONITOR] [WARN] odds/multi failed (using value-bet payload only): {e}")
+                print(f"[MONITOR] [WARN] odds resolve failed (using value-bet payload only): {e}")
 
         _mb_log = odds_api_master_bookmakers()
         if not _mb_log:
@@ -2442,6 +2488,9 @@ class OddsEVMonitor:
         devig_books = devig_book_labels[:12] if devig_book_labels else [self._reference_book]
 
         disp_names = [str(x) for x in (odds_api_master_bookmakers() or [])]
+        for extra in extra_local_bookmakers():
+            if not any(_norm_book(extra).lower() == _norm_book(y).lower() for y in disp_names):
+                disp_names.append(extra)
         for x in self.filter_payload.get("displayBooks") or []:
             xs = str(x)
             if not any(_norm_book(xs).lower() == _norm_book(y).lower() for y in disp_names):
@@ -2617,17 +2666,32 @@ class OddsEVMonitor:
 
     async def monitor_loop(self) -> None:
         print("[MONITOR] Starting Odds-API.io monitoring loop...")
-        print(
-            f"   Polling every {self.poll_interval}s — live /odds/multi uses parallel per-book merge; "
-            f"live slate TTL is separate (see ODDS_API_LIVE_EVENTS_TTL_SEC)"
-        )
+        ws_on = odds_api_ws_wanted()
+        if ws_on:
+            print(
+                "   WS-first: live lines from Odds-API.io WebSocket "
+                "(baseball / usa-mlb, prematch+live, ML/Spread/Totals). "
+                "REST used for /events slate + resync only — not the hot /odds/multi loop."
+            )
+        else:
+            print(
+                f"   REST fallback polling every {self.poll_interval}s "
+                f"(set ODDS_API_WS=true and ODDS_API_KEY to use WebSocket)"
+            )
+        if plive_wanted():
+            print("   PLive Pandora: local sharp/display book (no BetBCK, no BookieBeats DOM)")
         # Desync filters so two dashboard monitors do not hit Odds-API on the same tick.
         h = int(hashlib.md5(self.monitor_label.encode("utf-8")).hexdigest()[:8], 16)
         await asyncio.sleep((h % 36) * 0.08)
+        eval_interval = float(os.getenv("ODDS_API_WS_EVAL_INTERVAL_SEC", "1.0"))
         while self.running:
             try:
                 await self.check_for_new_alerts()
-                await asyncio.sleep(self.poll_interval)
+                feed = peek_shared_odds_ws_feed()
+                if ws_on and feed is not None and feed.healthy:
+                    await feed.wait_dirty_or_timeout(eval_interval)
+                else:
+                    await asyncio.sleep(self.poll_interval)
             except Exception as e:
                 print(f"[ERR] Error in Odds-API monitor loop: {e}")
                 await asyncio.sleep(5)
@@ -2635,7 +2699,11 @@ class OddsEVMonitor:
     async def start(self) -> bool:
         self.running = True
         self.session = aiohttp.ClientSession()
-        print("[OK] Odds-API.io EV monitor started")
+        if odds_api_ws_wanted():
+            await get_shared_odds_ws_feed()
+        if plive_wanted():
+            await get_shared_plive_feed()
+        print("[OK] Odds-API.io EV monitor started (auto-bet is a dashboard flag; default OFF)")
         return True
 
     def update_token(self, new_token: str) -> None:

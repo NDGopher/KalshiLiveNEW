@@ -110,14 +110,14 @@ Change **one** setting, observe logs / rate-limit headers, then the next. **Live
 2. ~~**Live slate vs live lines**~~ — ``ODDS_API_LIVE_EVENTS_TTL_SEC`` defaults **~20m** (slow slate). ``ODDS_API_LIVE_ODDS_TTL_SEC`` defaults **0** (fresh merged books each poll). Broad scan serialized across filters with a lock.  
 3. ~~**“Kalshi line required”**~~ — Done in broad-scan path: after `/odds/multi` merge, events with no Kalshi gameline decimals are dropped from the EV scan (batch HTTP unchanged); `[PIPELINE]` logs drop count.  
 4. ~~**Liquidity default sport list**~~ — Done: ``odds_api_sports_list()`` / ``LIQUIDITY_DEFAULT_ODDS_API_SPORTS`` in ``odds_api_client.py``; monitor pregame slugs aligned; pregame broad scan **off** by default.  
-5. **Optional:** add `.env.example` (or README) line pointing at this doc’s **Tuning order** section.  
-6. **After stable 10–20s + clean logs:** prototype **WS client** module (isolated from Flask thread), subscribe live sports only, feed same EV pipeline.
+5. ~~**Optional:** `.env.example`~~ — Done (no secrets).  
+6. ~~**WS client**~~ — `odds_api_ws.py` is the primary live path (MLB / `usa-mlb`, prematch+live, ML/Spread/Totals). REST is slate + `includeSeq` resync + `/odds/updated` fallback. PLive (`plive_pandora.py`) is a local sharp/display book.
 
-### WebSocket handoff (next implementation)
+### WebSocket handoff (implemented)
 
-- **Push path:** WS delivers price deltas → build the same **merged ``bookmakers`` dict** shape as today’s ``get_odds_multi`` merge, then call the existing EV row builder (no duplicate devig math).  
-- **REST path:** keep **occasional** ``/events/live`` (long TTL) for slate repair + **snapshot** ``/odds/multi`` after reconnect.  
-- **Hook:** isolate a small ``OddsFeedAdapter`` (REST now, WS later) used only by ``OddsEVMonitor._fetch_alerts_live_broad_scan`` so the monitor loop stays unchanged.
+- **Push path:** WS replaces markets per event+bookie (never merge) into the same ``bookmakers`` dict as ``get_odds_multi``, then the existing EV row builder.  
+- **REST path:** ``/events`` + ``/events/live`` for slate; ``/odds/multi?includeSeq=true`` after connect / ``resync_required``.  
+- **Hook:** ``resolve_odds_docs`` in ``OddsEVMonitor._fetch_alerts_live_broad_scan`` (WS-first).
 
 ---
 

@@ -65,6 +65,8 @@ from odds_api_client import (
     odds_api_sports_list,
     sport_slug_query_for_api,
 )
+from odds_api_ws import resolve_odds_docs
+from plive_pandora import extra_local_bookmakers, merge_plive_into_docs
 from ev_calculator import decimal_to_american
 
 
@@ -409,6 +411,9 @@ saved_filters[CBB_FILTER_NAME] = CBB_FILTER_PAYLOAD
 # request /odds/multi for that full list; a filter may list fewer displayBooks only for alert-card columns.
 DEFAULT_FILTER_PAYLOAD["bettingBooks"] = ["Kalshi"]
 display_books_list = odds_api_master_bookmakers()
+for _extra_bk in extra_local_bookmakers():
+    if not any(str(_extra_bk).strip().lower() == str(x).strip().lower() for x in display_books_list):
+        display_books_list = list(display_books_list) + [_extra_bk]
 DEFAULT_FILTER_PAYLOAD["displayBooks"] = display_books_list
 CBB_FILTER_PAYLOAD["displayBooks"] = list(display_books_list)
 
@@ -429,6 +434,9 @@ else:
     sharps_list = [b for b in display_books_list if _dnorm(b) != "kalshi"]
 if not sharps_list:
     sharps_list = ["FanDuel", "DraftKings", "Circa"]
+for _extra_bk in extra_local_bookmakers():
+    if not any(_dnorm(_extra_bk) == _dnorm(b) for b in sharps_list):
+        sharps_list.append(_extra_bk)
 
 DEFAULT_FILTER_PAYLOAD["devigFilter"]["sharps"] = sharps_list
 # CBB: same sharp panel as main filter but keep WORST_CASE + minSharpBooks 2 in payload above.
@@ -514,8 +522,12 @@ _load_filters_state()
 
 
 def _live_odds_display_books() -> List[str]:
-    """Odds tab + /api/live_odds: always full ODDS_API_BOOKMAKERS master list (e.g. all 10)."""
-    return list(odds_api_master_bookmakers())
+    """Odds tab + /api/live_odds: Odds-API master list plus local books (PLive)."""
+    books = list(odds_api_master_bookmakers())
+    for extra in extra_local_bookmakers():
+        if not any(str(extra).strip().lower() == str(x).strip().lower() for x in books):
+            books.append(extra)
+    return books
 
 
 def _sport_slug_event(ev: Dict[str, Any]) -> str:
@@ -885,13 +897,15 @@ async def _live_odds_build_snapshot_with_client(
     odds_by_id: Dict[int, Dict[str, Any]] = {}
     if ids:
         try:
-            for doc in await client.get_odds_multi(ids, books):
+            docs, _src = await resolve_odds_docs(client, ids, books)
+            merge_plive_into_docs(docs)
+            for doc in docs:
                 if isinstance(doc, dict) and doc.get("id") is not None:
                     odds_by_id[int(doc["id"])] = doc
         except Exception as e:
             return {
                 "ok": False,
-                "error": f"get_odds_multi failed: {e}",
+                "error": f"odds resolve failed: {e}",
                 "updated": time.time(),
                 "books": books,
                 "timing": timing_l,

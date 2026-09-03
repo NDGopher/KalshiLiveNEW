@@ -1,13 +1,17 @@
 """
-Async client for Odds-API.io (https://odds-api.io).
+Async REST client for Odds-API.io (https://odds-api.io).
 
-FREE TIER SAFE — default sports are liquidity-focused majors when ``ODDS_API_SPORTS`` is unset; override with a comma list.
-UPGRADE PATH: add WebSocket here (see https://docs.odds-api.io/guides/websockets) instead of polling.
+Primary live odds path is the WebSocket module ``odds_api_ws.py``
+(https://docs.odds-api.io/guides/websockets). This client is for slate
+(``/events``, ``/events/live``), REST→WS handoff snapshots (``includeSeq=true``),
+resync after ``resync_required``, and REST fallback (prefer ``/odds/updated``).
 
 Env:
-  ODDS_API_KEY          — required for authenticated endpoints
+  ODDS_API_KEY          — required for authenticated endpoints (read from env; never commit)
   ODDS_API_BASE         — default https://api.odds-api.io/v3
-  ODDS_API_BOOKMAKERS   — comma list, e.g. Kalshi,FanDuel (display names for API)
+  ODDS_API_BOOKMAKERS   — comma catalog names (default: Growth 10-book set; BookMaker.eu is catalog-inactive)
+  ODDS_API_BETFAIR_REQUEST_NAME — override only; default wire name is ``Betfair Exchange``
+  ODDS_API_SELECT_BOOKS — if true, PUT /bookmakers/selected/select for ODDS_API_BOOKMAKERS on WS startup
   ODDS_API_SPORTS       — comma sport slugs; unset / empty / ``all`` → MLB/NBA/NHL/NFL+CBB+CFB/soccer only (see LIQUIDITY_DEFAULT_ODDS_API_SPORTS)
   ODDS_API_LEAGUE_MLB   — optional /events league slug for MLB (default usa-mlb)
   ODDS_API_LEAGUE_NBA   — optional (default usa-nba)
@@ -113,7 +117,21 @@ _BOOKMAKER_API_ALIASES = {
     "bookmaker": "BookMaker.eu",
     "bookmaker.eu": "BookMaker.eu",
     "betfair": "Betfair Exchange",
+    "plive": "PLive",
 }
+
+# Local books that must never be sent on Odds-API.io REST / WS select.
+_LOCAL_ONLY_BOOKS = frozenset({"plive"})
+
+
+def is_local_only_bookmaker(name: str) -> bool:
+    return _canonical_odds_api_bookmaker(name).lower() in _LOCAL_ONLY_BOOKS
+
+
+def api_wire_bookmakers(names: Optional[List[str]] = None) -> List[str]:
+    """ODDS_API_BOOKMAKERS minus local-only books (PLive is not an Odds-API catalog name)."""
+    src = names if names is not None else parse_odds_api_bookmakers()
+    return [b for b in src if not is_local_only_bookmaker(b)]
 
 
 def _canonical_odds_api_bookmaker(name: str) -> str:
@@ -121,18 +139,45 @@ def _canonical_odds_api_bookmaker(name: str) -> str:
     return _BOOKMAKER_API_ALIASES.get(n.lower(), n)
 
 
+# Growth 10-book catalog names. BookMaker.eu is catalog-inactive — do not add it.
+DEFAULT_ODDS_API_BOOKMAKERS = (
+    "DraftKings,FanDuel,BetMGM,Betfair Exchange,Circa,Polymarket,Bet365,Caesars,Kalshi,NoVig"
+)
+
+
 def _bookmaker_for_odds_request(name: str) -> str:
     """
-    Name to send on /odds and /odds/multi ``bookmakers=`` (account "selected" list may differ).
-    Betfair is often ``Betfair Sportsbook`` on the wire even when you think of it as Exchange.
+    Name to send on /odds, /odds/multi, and related ``bookmakers=`` params.
+
+    Send ``Betfair Exchange`` on the wire (this plan uses the Exchange catalog name).
+    ``ODDS_API_BETFAIR_REQUEST_NAME`` is an override only — set it if your account
+    lists a different Betfair label (e.g. ``Betfair Sportsbook``).
     """
     c = _canonical_odds_api_bookmaker(name)
     if c.lower() == "betfair exchange":
         override = (os.getenv("ODDS_API_BETFAIR_REQUEST_NAME") or "").strip()
         if override:
             return override
-        return "Betfair Sportsbook"
+        return "Betfair Exchange"
     return c
+
+
+def parse_odds_api_seq_header(headers: Any) -> Optional[int]:
+    """Read ``X-OddsAPI-Seq`` from a REST response (REST→WS handoff / resync)."""
+    if headers is None:
+        return None
+    getter = getattr(headers, "get", None)
+    raw = None
+    if callable(getter):
+        raw = getter("X-OddsAPI-Seq") or getter("x-oddsapi-seq")
+    elif isinstance(headers, dict):
+        raw = headers.get("X-OddsAPI-Seq") or headers.get("x-oddsapi-seq")
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
 
 
 def _rekey_bookmakers_to_configured_name(
@@ -271,8 +316,9 @@ def parse_odds_api_bookmakers() -> List[str]:
     """
     Comma- or semicolon-separated bookmaker display names for Odds-API.io.
     Strips BOM/whitespace/quotes; de-dupes case-insensitively while preserving order.
+    Default is the Growth 10-book catalog list (``DEFAULT_ODDS_API_BOOKMAKERS``).
     """
-    default = "Kalshi,FanDuel"
+    default = DEFAULT_ODDS_API_BOOKMAKERS
     raw = os.getenv("ODDS_API_BOOKMAKERS")
     if raw is None or not str(raw).strip():
         raw = default
@@ -389,6 +435,7 @@ class OddsAPIClient:
         self._rl_lock = asyncio.Lock()
         self._req_times: List[float] = []
         self.http_request_count = 0  # actual HTTP GETs (not cache hits); for standalone test summary
+        self.last_seq: Optional[int] = None  # latest X-OddsAPI-Seq from includeSeq snapshots
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -441,21 +488,41 @@ class OddsAPIClient:
                 await asyncio.sleep(2.0 + _429_attempt)
                 return await self._get_json(path, params, cache, cache_key, ttl, _429_attempt + 1)
             resp.raise_for_status()
+            self._note_seq_header(resp.headers)
             data = await resp.json()
         if cache and cache_key and ttl > 0:
             await cache.set(cache_key, data, ttl)
         return data
 
-    async def _odds_multi_http(self, ids: str, bms: str, _429_attempt: int = 0) -> Tuple[int, Any]:
+    def _note_seq_header(self, headers: Any) -> Optional[int]:
+        seq = parse_odds_api_seq_header(headers)
+        if seq is not None:
+            prev = self.last_seq
+            self.last_seq = seq if prev is None else max(prev, seq)
+        return seq
+
+    async def _odds_multi_http(
+        self,
+        ids: str,
+        bms: str,
+        _429_attempt: int = 0,
+        *,
+        include_seq: bool = False,
+    ) -> Tuple[int, Any]:
         await self._rate_limit()
         sess = await self._ensure_session()
         q: Dict[str, Any] = {"eventIds": ids, "bookmakers": bms, "apiKey": self.api_key}
+        if include_seq:
+            q["includeSeq"] = "true"
         url = f"{self.base_url}/odds/multi?{urlencode(q)}"
         self.http_request_count += 1
         async with sess.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
             if resp.status == 429 and _429_attempt < 4:
                 await asyncio.sleep(2.0 + _429_attempt)
-                return await self._odds_multi_http(ids, bms, _429_attempt + 1)
+                return await self._odds_multi_http(
+                    ids, bms, _429_attempt + 1, include_seq=include_seq
+                )
+            self._note_seq_header(resp.headers)
             text = await resp.text()
             st = resp.status
             if st != 200:
@@ -478,20 +545,34 @@ class OddsAPIClient:
         )
         return data if isinstance(data, list) else []
 
-    async def get_odds_for_event(self, event_id: int, bookmakers: Optional[List[str]] = None) -> Dict[str, Any]:
-        """GET /odds — full odds payload for one event."""
+    async def get_odds_for_event(
+        self,
+        event_id: int,
+        bookmakers: Optional[List[str]] = None,
+        *,
+        include_seq: bool = False,
+    ) -> Dict[str, Any]:
+        """GET /odds — full odds payload for one event.
+
+        ``include_seq=true`` adds ``includeSeq=true`` and records ``X-OddsAPI-Seq``
+        on ``self.last_seq`` for WebSocket ``lastSeq`` handoff. Skips TTL cache.
+        """
         books = bookmakers or self.bookmakers
         bms = ",".join(_bookmaker_for_odds_request(b) for b in books)
         key = f"odds:{event_id}:{bms}"
-        cached = await self._cache_odds.get_valid(key)
-        if cached is not None:
-            return cached
+        if not include_seq:
+            cached = await self._cache_odds.get_valid(key)
+            if cached is not None:
+                return cached
+        params: Dict[str, Any] = {"eventId": event_id, "bookmakers": bms}
+        if include_seq:
+            params["includeSeq"] = "true"
         data = await self._get_json(
             "/odds",
-            {"eventId": event_id, "bookmakers": bms},
-            cache=self._cache_odds,
-            cache_key=key,
-            ttl=self._odds_ttl,
+            params,
+            cache=None if include_seq else self._cache_odds,
+            cache_key=None if include_seq else key,
+            ttl=0.0 if include_seq else self._odds_ttl,
         )
         return data if isinstance(data, dict) else {}
 
@@ -501,11 +582,12 @@ class OddsAPIClient:
         books_slice: List[str],
         *,
         cache_ttl: Optional[float] = None,
+        include_seq: bool = False,
     ) -> List[Dict[str, Any]]:
         """Single /odds/multi HTTP for one event-id batch and one bookmaker slice (cached per slice)."""
         if not books_slice:
             return []
-        eff_ttl = self._odds_ttl if cache_ttl is None else float(cache_ttl)
+        eff_ttl = 0.0 if include_seq else (self._odds_ttl if cache_ttl is None else float(cache_ttl))
         books_canon = [_canonical_odds_api_bookmaker(b) for b in books_slice]
         books_http = [_bookmaker_for_odds_request(b) for b in books_canon]
         bms = ",".join(books_http)
@@ -517,7 +599,7 @@ class OddsAPIClient:
                 if len(books_canon) == 1:
                     _rekey_bookmakers_to_configured_name(docs, books_canon[0])
                 return docs
-        status, data = await self._odds_multi_http(ids, bms)
+        status, data = await self._odds_multi_http(ids, bms, include_seq=include_seq)
         if status == 403 and isinstance(data, str):
             allowed = _books_from_odds_api_403_error(data)
             if allowed:
@@ -527,7 +609,7 @@ class OddsAPIClient:
                     if bms2 != bms:
                         bms = bms2
                         key = f"multi:{ids}:{bms}"
-                        status, data = await self._odds_multi_http(ids, bms)
+                        status, data = await self._odds_multi_http(ids, bms, include_seq=include_seq)
                 else:
                     # Requested book(s) not in account's allowed list (e.g. Polymarket not selected).
                     return []
@@ -551,6 +633,7 @@ class OddsAPIClient:
         bookmakers: Optional[List[str]] = None,
         *,
         odds_cache_ttl: Optional[float] = None,
+        include_seq: bool = False,
     ) -> List[Dict[str, Any]]:
         """GET /odds/multi — up to 10 event ids per HTTP call.
 
@@ -562,11 +645,14 @@ class OddsAPIClient:
 
         ``odds_cache_ttl``: per-request cache TTL for these slices. ``None`` uses ``ODDS_API_ODDS_TTL_SEC``.
         Monitors pass ``_live_odds_multi_ttl`` (default 0) so consecutive polls do not reuse stale merged books.
+        ``include_seq``: REST→WS handoff / resync — send ``includeSeq=true`` and read ``X-OddsAPI-Seq``.
         """
         if not event_ids:
             return []
-        eff_multi_ttl = self._odds_ttl if odds_cache_ttl is None else float(odds_cache_ttl)
-        books = [_canonical_odds_api_bookmaker(b) for b in (bookmakers or self.bookmakers)]
+        eff_multi_ttl = 0.0 if include_seq else (self._odds_ttl if odds_cache_ttl is None else float(odds_cache_ttl))
+        books = api_wire_bookmakers(
+            [_canonical_odds_api_bookmaker(b) for b in (bookmakers or self.bookmakers)]
+        )
         parallel_books = os.getenv("ODDS_API_MULTI_PARALLEL_BOOKS", "true").lower() in (
             "1",
             "true",
@@ -584,14 +670,20 @@ class OddsAPIClient:
             part = [int(x) for x in event_ids[i : i + 10]]
             ids = ",".join(str(x) for x in part)
             if not parallel_books or len(books) <= 1:
-                out.extend(await self._get_odds_multi_one_slice(ids, books, cache_ttl=eff_multi_ttl))
+                out.extend(
+                    await self._get_odds_multi_one_slice(
+                        ids, books, cache_ttl=eff_multi_ttl, include_seq=include_seq
+                    )
+                )
                 continue
             sem = asyncio.Semaphore(par_lim)
 
             async def _one_book(b: str) -> List[Dict[str, Any]]:
                 async with sem:
                     try:
-                        return await self._get_odds_multi_one_slice(ids, [b], cache_ttl=eff_multi_ttl)
+                        return await self._get_odds_multi_one_slice(
+                            ids, [b], cache_ttl=eff_multi_ttl, include_seq=include_seq
+                        )
                     except RuntimeError:
                         return []
 
@@ -694,6 +786,67 @@ class OddsAPIClient:
             ttl=self._live_events_ttl,
         )
         return data if isinstance(data, list) else []
+
+    async def get_odds_updated(
+        self,
+        since: int,
+        bookmaker: str,
+        sport: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """GET /odds/updated — odds changed since UNIX ``since`` (must be ≤90s old).
+
+        One bookmaker per call. Prefer this over full ``/odds/multi`` when the
+        WebSocket is down and you already have a snapshot to patch.
+        """
+        bm = _bookmaker_for_odds_request(_canonical_odds_api_bookmaker(bookmaker))
+        params: Dict[str, Any] = {"since": int(since), "bookmaker": bm}
+        if sport and str(sport).strip():
+            params["sport"] = str(sport).strip()
+        data = await self._get_json("/odds/updated", params)
+        docs = _as_odds_multi_list(data)
+        if docs:
+            _rekey_bookmakers_to_configured_name(docs, _canonical_odds_api_bookmaker(bookmaker))
+            return docs
+        if isinstance(data, list):
+            return [x for x in data if isinstance(x, dict)]
+        if isinstance(data, dict) and data.get("id") is not None:
+            wrapped = [data]
+            _rekey_bookmakers_to_configured_name(wrapped, _canonical_odds_api_bookmaker(bookmaker))
+            return wrapped
+        return []
+
+    async def get_selected_bookmakers(self) -> List[str]:
+        """GET /bookmakers/selected — account dashboard / selected list."""
+        data = await self._get_json("/bookmakers/selected", {})
+        if isinstance(data, list):
+            return [_canonical_odds_api_bookmaker(str(x)) for x in data if str(x).strip()]
+        if isinstance(data, dict):
+            for key in ("bookmakers", "selected", "data", "names"):
+                v = data.get(key)
+                if isinstance(v, list):
+                    return [_canonical_odds_api_bookmaker(str(x)) for x in v if str(x).strip()]
+        return []
+
+    async def select_bookmakers(self, names: Optional[List[str]] = None) -> Any:
+        """PUT /bookmakers/selected/select — set the account selected list (WS uses this)."""
+        if not self.api_key:
+            raise RuntimeError("ODDS_API_KEY is not set")
+        books = api_wire_bookmakers(names or self.bookmakers)
+        bms = ",".join(_bookmaker_for_odds_request(b) for b in books)
+        await self._rate_limit()
+        sess = await self._ensure_session()
+        q = {"bookmakers": bms, "apiKey": self.api_key}
+        url = f"{self.base_url}/bookmakers/selected/select?{urlencode(q)}"
+        self.http_request_count += 1
+        async with sess.put(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status == 429:
+                await asyncio.sleep(2.0)
+                return await self.select_bookmakers(names)
+            resp.raise_for_status()
+            try:
+                return await resp.json()
+            except Exception:
+                return await resp.text()
 
 
 _shared_client: Optional[OddsAPIClient] = None
