@@ -321,7 +321,7 @@ def test_twins_plus144_keep_emits():
 def test_on_pack_poly_in_devig_and_display():
     mon = _gameline_monitor()
     take = american_to_decimal(317)
-    opp = american_to_decimal(-400)
+    opp = american_to_decimal(-413)
     vb = _ml_vb(take, opp)
     odds_doc = {
         "id": 4,
@@ -329,10 +329,10 @@ def test_on_pack_poly_in_devig_and_display():
         "away": "Milwaukee Brewers",
         "bookmakers": {
             "Kalshi": [{"name": "ML", "odds": [{"home": take, "away": opp}]}],
-            "FanDuel": [{"name": "ML", "odds": [{"home": american_to_decimal(270), "away": opp}]}],
-            "DraftKings": [{"name": "ML", "odds": [{"home": american_to_decimal(252), "away": opp}]}],
-            "NoVig": [{"name": "ML", "odds": [{"home": american_to_decimal(260), "away": opp}]}],
-            "Polymarket": [{"name": "ML", "odds": [{"home": american_to_decimal(265), "away": opp}]}],
+            "FanDuel": [{"name": "ML", "odds": [{"home": american_to_decimal(270), "away": american_to_decimal(-344)}]}],
+            "DraftKings": [{"name": "ML", "odds": [{"home": american_to_decimal(252), "away": american_to_decimal(-318)}]}],
+            "NoVig": [{"name": "ML", "odds": [{"home": american_to_decimal(260), "away": american_to_decimal(-330)}]}],
+            "Polymarket": [{"name": "ML", "odds": [{"home": american_to_decimal(265), "away": american_to_decimal(-337)}]}],
         },
     }
     bet = mon._value_bet_to_normalized_bet(vb, odds_doc, take_book="Kalshi")
@@ -345,7 +345,7 @@ def test_on_pack_poly_in_devig_and_display():
 def test_junk_poly_minus455_vs_plus163_no_tile_no_power():
     mon = _gameline_monitor()
     take = american_to_decimal(317)
-    opp = american_to_decimal(-400)
+    opp = american_to_decimal(-413)
     vb = _ml_vb(take, opp)
     odds_doc = {
         "id": 5,
@@ -353,10 +353,10 @@ def test_junk_poly_minus455_vs_plus163_no_tile_no_power():
         "away": "Miami Marlins",
         "bookmakers": {
             "Kalshi": [{"name": "ML", "odds": [{"home": take, "away": opp}]}],
-            "FanDuel": [{"name": "ML", "odds": [{"home": american_to_decimal(270), "away": opp}]}],
-            "DraftKings": [{"name": "ML", "odds": [{"home": american_to_decimal(252), "away": opp}]}],
-            "NoVig": [{"name": "ML", "odds": [{"home": american_to_decimal(260), "away": opp}]}],
-            "Polymarket": [{"name": "ML", "odds": [{"home": american_to_decimal(-455), "away": opp}]}],
+            "FanDuel": [{"name": "ML", "odds": [{"home": american_to_decimal(270), "away": american_to_decimal(-344)}]}],
+            "DraftKings": [{"name": "ML", "odds": [{"home": american_to_decimal(252), "away": american_to_decimal(-318)}]}],
+            "NoVig": [{"name": "ML", "odds": [{"home": american_to_decimal(260), "away": american_to_decimal(-330)}]}],
+            "Polymarket": [{"name": "ML", "odds": [{"home": american_to_decimal(-455), "away": american_to_decimal(350)}]}],
         },
     }
     bet = mon._value_bet_to_normalized_bet(vb, odds_doc, take_book="Kalshi")

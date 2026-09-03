@@ -567,38 +567,62 @@ def _plive_status_payload() -> Dict[str, Any]:
 
 
 def _plive_board_rows() -> List[Dict[str, Any]]:
+    """PLive-only extras: one row per ML / Spread / Totals when prices exist."""
     feed = peek_shared_plive_feed()
     if feed is None:
         return []
+    store = getattr(feed, "store", None)
     rows: List[Dict[str, Any]] = []
     for s in feed.priced_mlb_summaries():
-        rows.append(
-            {
-                "event_id": s.get("id"),
-                "teams": f"{s.get('away') or ''} @ {s.get('home') or ''}".strip(" @"),
-                "league": "MLB",
-                "sport_slug": "baseball",
-                "live": True,
-                "status": "live",
-                "start_display": "",
-                "market": "ML",
-                "books": {
+        teams = f"{s.get('away') or ''} @ {s.get('home') or ''}".strip(" @")
+        eid = s.get("id")
+        base = {
+            "event_id": eid,
+            "teams": teams,
+            "league": "MLB",
+            "sport_slug": "baseball",
+            "live": True,
+            "status": "live",
+            "start_display": "",
+            "plive_only": True,
+        }
+        mkts: List[Dict[str, Any]] = []
+        if store is not None and eid is not None:
+            mkts = store.markets_for_event(str(eid)) or []
+        by_name = {str(m.get("name") or ""): m for m in mkts}
+        for kind, fallback in (("ml", "ML"), ("spread", "Spread"), ("total", "Totals")):
+            mk = by_name.get(fallback)
+            if mk is not None:
+                prices = _live_prices_for_kind({"PLive": [mk]}, ["PLive"], fallback, kind)
+            elif kind == "ml":
+                prices = {
                     "PLive": {
                         "home_dec": s.get("home_dec"),
                         "away_dec": s.get("away_dec"),
                         "home_am": s.get("home_am"),
                         "away_am": s.get("away_am"),
                     }
-                },
-                "best": {
-                    "home_book": "PLive",
-                    "home_am": s.get("home_am"),
-                    "away_book": "PLive",
-                    "away_am": s.get("away_am"),
-                },
-                "plive_only": True,
-            }
-        )
+                }
+            else:
+                continue
+            if not _live_market_has_any_price(prices):
+                continue
+            bh, ham = _live_best_side(prices, "home_dec")
+            ba, aam = _live_best_side(prices, "away_dec")
+            rows.append(
+                {
+                    **base,
+                    "market": fallback,
+                    "market_kind": kind,
+                    "books": prices,
+                    "best": {
+                        "home_book": bh,
+                        "home_am": ham,
+                        "away_book": ba,
+                        "away_am": aam,
+                    },
+                }
+            )
     return rows
 
 
@@ -1109,10 +1133,19 @@ async def _live_odds_build_snapshot_with_client(
     _log_live_odds_book_flow_and_pipeline(books, rows_out, timing_l, sport_l)
     sport_wants_plive = sport_l in ("all", "baseball") or lf in ("all", "mlb")
     if sport_wants_plive:
-        have = {(str(r.get("teams") or "")).lower() for r in rows_out}
+        have = {
+            (
+                (str(r.get("teams") or "")).lower(),
+                str(r.get("market_kind") or r.get("market") or "").lower(),
+            )
+            for r in rows_out
+        }
         for extra in _plive_board_rows():
-            key = (str(extra.get("teams") or "")).lower()
-            if key and key not in have:
+            key = (
+                (str(extra.get("teams") or "")).lower(),
+                str(extra.get("market_kind") or extra.get("market") or "").lower(),
+            )
+            if key[0] and key not in have:
                 rows_out.append(extra)
                 have.add(key)
     return {

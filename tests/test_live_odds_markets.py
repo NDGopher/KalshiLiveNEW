@@ -1,6 +1,7 @@
 """/api/live_odds must emit ML + Spread + Totals, not ML-only."""
 from __future__ import annotations
 
+from ev_calculator import decimal_to_american
 from dashboard import (
     _live_market_has_any_price,
     _live_pick_kind_name,
@@ -66,3 +67,54 @@ def test_plive_market5_game_total_det_min():
     assert abs(float(row["over"]) - 1.892857) < 1e-6
     assert abs(float(row["under"]) - 1.847458) < 1e-6
     assert "Spread" not in by_name
+    # 1.892857 is a favorite (−112). (dec−1)×100 = +89 is not American.
+    assert abs(decimal_to_american(1.892857) + 112) <= 1
+    assert abs(decimal_to_american(1.847458) + 118) <= 1
+
+
+def test_plive_market5_mil_chc_and_mia_kc():
+    store = PliveStore()
+    fixtures = (
+        ("199295401", "13.5", 1.90, 1.0 + 100.0 / 120.0, -111, -120),
+        ("199295402", "15.5", 3.35, 1.0 + 100.0 / 338.0, 235, -338),
+    )
+    for eid, line, over_d, under_d, over_am, under_am in fixtures:
+        store.apply_message(
+            {
+                "isDiff": False,
+                "payload": {
+                    "c": {
+                        "m": {
+                            "5": {"o": {line: {0: over_d, 1: under_d}}},
+                            "7": {"o": {"4.5": {0: 1.80, 1: 2.00}}},
+                            "8": {"o": {"5.5": {0: 1.75, 1: 2.05}}},
+                        }
+                    }
+                },
+            },
+            event_name=f"live.main.{PLIVE_LINE_SET}.eventCoefficients.{eid}",
+        )
+        by_name = {m["name"]: m for m in store.markets_for_event(eid)}
+        assert "Totals" in by_name
+        assert "Spread" not in by_name
+        row = by_name["Totals"]["odds"][0]
+        assert abs(float(row["hdp"]) - float(line)) < 1e-9
+        assert abs(float(row["over"]) - over_d) < 1e-6
+        assert abs(float(row["under"]) - under_d) < 1e-6
+        assert abs(decimal_to_american(over_d) - over_am) <= 1
+        assert abs(decimal_to_american(under_d) - under_am) <= 1
+
+
+def test_plive_take_totals_tradable_without_kalshi():
+    doc = {
+        "bookmakers": {
+            "PLive": [
+                {
+                    "name": "Totals",
+                    "odds": [{"hdp": 13.5, "over": 1.90, "under": 1.833333}],
+                }
+            ],
+            "Kalshi": [{"name": "Totals", "odds": [{"match_failed": True}]}],
+        }
+    }
+    assert _odds_doc_has_kalshi_tradable_gameline(doc) is True

@@ -235,3 +235,33 @@ def test_keep_twins_plus203_band():
     )
     assert out["plus_alert"] is True
     assert 1.0 <= out["ev_percent"] <= 12.0
+
+
+def test_9_keep_plus_money_two_way_classes():
+    """Ninth numeric lock: Royals +163 and Twins +203 stay plus after two-way POWER."""
+    royals = evaluate_sharp_panel_ev(
+        [
+            _book("Betfair Exchange", 134, -154),
+            _book("DraftKings", 105, -125),
+            _book("FanDuel", 116, -136),
+            _book("Bet365", 100, -120),
+            _book("Caesars", 110, -130),
+        ],
+        163,
+        min_sharp_books=3,
+    )
+    twins = evaluate_sharp_panel_ev(
+        [
+            _book("DraftKings", 170, -200),
+            _book("FanDuel", 175, -210),
+            _book("Caesars", 168, -198),
+            _book("Bet365", 165, -195),
+            _book("NoVig", 180, -220),
+        ],
+        203,
+        min_sharp_books=3,
+    )
+    assert royals["plus_alert"] is True
+    assert twins["plus_alert"] is True
+    assert royals["ev_percent"] > 0
+    assert twins["ev_percent"] > 0
