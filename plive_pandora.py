@@ -20,9 +20,11 @@ per-sport price socket. Bare connect is silent. No BetBCK. No cookies.
 
 MLB is catalog sport 1 (hash ``#!/sport/1``). Soccer is native sport 5
 (``#!/sport/5``). ``#!/sport/220`` is the public-UI Top Soccer bucket.
-Both 5 and 220 ride the same ``eventData`` directory as ``s[5]`` /
-``s[220]`` — there is no extra sport-room subscribe. Trust the
-live.sports catalog over any old Selenium sport map.
+``live.sports`` names 5=Soccer and 220=Top Soccer on the same
+connection. Both ride one ``eventData`` directory (``s[5]`` / ``s[220]``)
+— there is no extra sport-room subscribe. ``s[220]`` may be omitted
+when that UI bucket is empty; native 5 still carries the soccer slate.
+Trust the live.sports catalog over any old Selenium sport map.
 
 Mapping boundary: Odds-API event IDs already join Odds-API books to
 each other. PLive uses Pandora ids and needs a separate fixture join.
