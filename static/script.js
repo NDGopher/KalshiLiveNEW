@@ -48,10 +48,10 @@ function priceToAmericanOdds(priceCents) {
     }
 }
 
-/** Odds-API limit / stake on Kalshi row (USD); show — when unknown. */
+/** Odds-API limit / stake on the take row (USD); ASCII '-' when unknown. Never an emdash. */
 function formatLiquidityUsd(n) {
     const x = Number(n);
-    if (!x || x <= 0 || Number.isNaN(x)) return '—';
+    if (!x || x <= 0 || Number.isNaN(x)) return '-';
     if (x < 10000) return `$${Math.round(x)}`;
     return `$${(x / 1000).toFixed(1)}k`;
 }
@@ -351,45 +351,27 @@ socket.on('alert_update', (data) => {
                                 hasChanges = true;
                             }
                             
-                            // Update graying status if limit changed (might affect graying)
-                            const kalshiPrice = alert.book_price || alert.american_odds || (alert.price_cents ? priceToAmericanOdds(alert.price_cents) : 'N/A');
-                            let kalshiOddsNum = null;
-                            if (kalshiPrice && kalshiPrice !== 'N/A') {
-                                const kalshiStr = String(kalshiPrice).replace(/[+]/g, '');
-                                kalshiOddsNum = parseInt(kalshiStr, 10);
-                                if (isNaN(kalshiOddsNum)) {
-                                    kalshiOddsNum = null;
-                                }
+                            const takeAm = takeAmericanFromAlert(alert, ourBooks);
+                            const paint = tilePaintState(bookName, bookOdds, alert, takeAm);
+                            if (paint.skip) {
+                                bookCell.remove();
+                                hasChanges = true;
+                                return;
                             }
-                            const devigBooks = alert.devig_books || [];
-                            const usedForLine = bookName === 'Kalshi' || bookMatchesDevigOrSharp(bookName, devigBooks, alert.sharp_books);
-                            const junkVsKalshi = bookName !== 'Kalshi' && kalshiOddsNum !== null && isJunkVsKalshi(bookOdds, kalshiOddsNum);
-                            const shouldBeGrayed = !usedForLine || junkVsKalshi;
-                            const isCurrentlyGrayed = bookCell.classList.contains('grayed-out');
-                            
-                            if (shouldBeGrayed !== isCurrentlyGrayed) {
-                                if (shouldBeGrayed) {
-                                    bookCell.classList.add('grayed-out');
-                                } else {
-                                    bookCell.classList.remove('grayed-out');
-                                }
+                            const wantTake = paint.take;
+                            const wantBetter = paint.better;
+                            const hasTakeCls = bookCell.classList.contains('take-book') || bookCell.classList.contains('kalshi-book');
+                            if (wantTake !== hasTakeCls) {
+                                bookCell.classList.toggle('kalshi-book', wantTake);
+                                bookCell.classList.toggle('take-book', wantTake);
                                 hasChanges = true;
                             }
-                            if (junkVsKalshi) bookCell.classList.add('junk-tile');
-                            else bookCell.classList.remove('junk-tile');
-                            
-                            let hasBetterOdds = false;
-                            if (!junkVsKalshi && kalshiOddsNum !== null && bookOdds !== 0 && bookName !== 'Kalshi') {
-                                hasBetterOdds = bookAmericanIsBetter(bookOdds, kalshiOddsNum);
-                            }
-                            
+                            bookCell.classList.remove('grayed-out');
+                            bookCell.classList.remove('junk-tile');
+                            bookCell.classList.remove('worse-than-kalshi');
                             const currentlyHasBetter = bookCell.classList.contains('better-than-kalshi');
-                            if (hasBetterOdds !== currentlyHasBetter) {
-                                if (hasBetterOdds) {
-                                    bookCell.classList.add('better-than-kalshi');
-                                } else {
-                                    bookCell.classList.remove('better-than-kalshi');
-                                }
+                            if (wantBetter !== currentlyHasBetter) {
+                                bookCell.classList.toggle('better-than-kalshi', wantBetter);
                                 hasChanges = true;
                             }
                         }
@@ -462,9 +444,11 @@ socket.on('alert_update', (data) => {
                         betMaxBtn.textContent = `BET MAX ($${maxBet.toFixed(0)})`;
                     }
                     // Update liquidity display if it exists
-                    const liquidityEl = alertCard.querySelector('.liquidity, .kalshi-liquidity');
+                    const liquidityEl = alertCard.querySelector('.liquidity, .kalshi-liquidity, .alert-liq-usd');
                     if (liquidityEl) {
-                        liquidityEl.textContent = formatLiquidityUsd(newLiq);
+                        liquidityEl.textContent = liquidityEl.classList.contains('alert-liq-usd')
+                            ? (`Liq ${formatLiquidityUsd(newLiq)}`)
+                            : formatLiquidityUsd(newLiq);
                     }
                 }
             }
@@ -646,6 +630,99 @@ function isPolymarketBook(name) {
     return key.includes('polymarket') || key === 'poly' || key === 'pm';
 }
 
+/** Take book for THIS card. Empty when take_book is missing -- do not default Kalshi. */
+function cardTakeKey(alert) {
+    const raw = alert && alert.take_book;
+    if (raw == null || String(raw).trim() === '') return '';
+    return normalizeBookKey(raw);
+}
+
+function isCardTakeBook(bookName, alert) {
+    const tk = cardTakeKey(alert);
+    if (!tk) return false;
+    return normalizeBookKey(bookName) === tk;
+}
+
+function parseAmericanOddsValue(value) {
+    if (value == null || value === '' || value === 'N/A') return null;
+    const n = parseInt(String(value).replace(/[+]/g, ''), 10);
+    if (!Number.isFinite(n) || n === 0) return null;
+    return n;
+}
+
+/** American odds this card is betting. Never Kalshi-by-name unless Kalshi is the take. */
+function takeAmericanFromAlert(alert, books) {
+    const tk = cardTakeKey(alert);
+    if (tk && Array.isArray(books)) {
+        const row = books.find((b) => normalizeBookKey(b && b.book) === tk);
+        if (row && bookTileHasLine(row.odds)) {
+            const am = Number(row.odds);
+            if (Number.isFinite(am) && am !== 0) return am;
+        }
+    }
+    const fromAlert = parseAmericanOddsValue(alert && (alert.book_price || alert.american_odds));
+    if (fromAlert != null) return fromAlert;
+    if (alert && alert.price_cents && typeof priceToAmericanOdds === 'function') {
+        return parseAmericanOddsValue(priceToAmericanOdds(alert.price_cents));
+    }
+    return null;
+}
+
+function isOppositeSideVsTake(bookAm, takeAm) {
+    const b = Number(bookAm);
+    const t = Number(takeAm);
+    if (!Number.isFinite(b) || !Number.isFinite(t) || b === 0 || t === 0) return false;
+    if ((b > 0) === (t > 0)) return false;
+    const bp = impliedProbFromAmerican(b);
+    const tp = impliedProbFromAmerican(t);
+    if (bp == null || tp == null) return true;
+    return Math.abs(bp - 0.5) >= 0.04 && Math.abs(tp - 0.5) >= 0.04;
+}
+
+function bookAmericanIsBetter(bookAmerican, kalshiAmerican) {
+    const b = Number(bookAmerican);
+    const k = Number(kalshiAmerican);
+    if (!Number.isFinite(b) || !Number.isFinite(k)) return false;
+    const dec = (am) => (am > 0 ? 1 + am / 100 : 1 + 100 / Math.abs(am));
+    return dec(b) > dec(k);
+}
+
+function bookTileHasLine(odds) {
+    if (odds === null || odds === undefined || odds === '') return false;
+    if (odds === 0 || odds === '0') return false;
+    const s = String(odds).replace(/\s/g, '');
+    if (!s || s === '—' || s === '-' || s === 'N/A' || s === 'n/a') return false;
+    return true;
+}
+
+/** Betting book first (left). Does not drop worse recs. */
+function orderBooksTakeFirst(books, alert) {
+    const list = Array.isArray(books) ? books.slice() : [];
+    const tk = cardTakeKey(alert);
+    if (!tk) return list;
+    return list.sort((a, b) => {
+        const aTake = normalizeBookKey(a && a.book) === tk ? 0 : 1;
+        const bTake = normalizeBookKey(b && b.book) === tk ? 0 : 1;
+        return aTake - bTake;
+    });
+}
+
+/**
+ * Tile paint lock: take=green (left), same-side strictly better=red, worse=unshaded.
+ * Skip only empty tiles or sign-flip junk. Never skip a worse rec.
+ */
+function tilePaintState(bookName, bookOdds, alert, takeAm) {
+    if (!bookTileHasLine(bookOdds)) {
+        return { skip: true, take: false, better: false };
+    }
+    if (takeAm != null && isOppositeSideVsTake(bookOdds, takeAm)) {
+        return { skip: true, take: false, better: false };
+    }
+    const take = isCardTakeBook(bookName, alert);
+    const better = !take && takeAm != null && bookAmericanIsBetter(bookOdds, takeAm);
+    return { skip: false, take: take, better: better };
+}
+
 function parseFreshnessTs(value) {
     if (value == null || value === '') return null;
     if (typeof value === 'number' && Number.isFinite(value)) {
@@ -668,24 +745,8 @@ function formatFreshnessAge(value, nowMs) {
     return Math.round(sec / 3600) + 'h';
 }
 
-function bookAmericanIsBetter(bookAmerican, kalshiAmerican) {
-    const b = Number(bookAmerican);
-    const k = Number(kalshiAmerican);
-    if (!Number.isFinite(b) || !Number.isFinite(k)) return false;
-    const dec = (am) => (am > 0 ? 1 + am / 100 : 1 + 100 / Math.abs(am));
-    return dec(b) > dec(k);
-}
-
 function isCircaBook(name) {
     return normalizeBookKey(name).startsWith('circa');
-}
-
-function bookTileHasLine(odds) {
-    if (odds === null || odds === undefined || odds === '') return false;
-    if (odds === 0 || odds === '0') return false;
-    const s = String(odds).replace(/\s/g, '');
-    if (!s || s === '—' || s === '-' || s === 'N/A' || s === 'n/a') return false;
-    return true;
 }
 
 function handleBookLogoError(img) {
@@ -758,65 +819,37 @@ function createAlertCard(alert) {
     
     // Build book prices table if display_books data is available
     let booksTableHtml = '';
-    let kalshiOddsNum = null; // Will be set from display_books if available
     
     if (alert.display_books && Object.keys(alert.display_books).length > 0) {
         // Get the selection we're betting on
         const ourSelection = alert.pick;
         const ourBooks = alert.display_books[ourSelection] || [];
         
-        // Take venue (Kalshi or PLive) is the betting book on the left.
-        const takeName = String(alert.take_book || 'Kalshi');
-        const takeKey = normalizeBookKey(takeName);
-        const kalshiBook = ourBooks.find((book) => {
-            const n = normalizeBookKey(book.book || '');
-            return n === takeKey || n === 'kalshi' && takeKey === 'kalshi';
-        }) || ourBooks.find(book => (book.book || 'Unknown') === 'Kalshi');
-        if (kalshiBook && kalshiBook.odds) {
-            kalshiOddsNum = kalshiBook.odds;
-        } else {
-            // Fallback to alert.book_price if Kalshi not in display_books
-            const kalshiPrice = alert.book_price || alert.american_odds || (alert.price_cents ? priceToAmericanOdds(alert.price_cents) : 'N/A');
-            if (kalshiPrice && kalshiPrice !== 'N/A') {
-                const kalshiStr = String(kalshiPrice).replace(/[+]/g, '');
-                kalshiOddsNum = parseInt(kalshiStr, 10);
-                if (isNaN(kalshiOddsNum)) {
-                    kalshiOddsNum = null;
-                }
-            }
-        }
+        // Take is the book THIS card is betting (PLive or Kalshi). Never default Kalshi-green.
+        const takeKey = cardTakeKey(alert);
+        const takeAm = takeAmericanFromAlert(alert, ourBooks);
         
         // Kalshi + every book that participated in devig (devig_books) or is configured sharp
-        const booksToShow = ourBooks;
+        const booksToShow = orderBooksTakeFirst(ourBooks, alert);
         
         if (booksToShow.length > 0) {
             booksTableHtml = '<div class="books-table"><div class="books-header">';
             booksToShow.forEach(book => {
                 const bookName = book.book || 'Unknown';
                 const bookOdds = book.odds || 0;
-                // Do not paint a tile when that book has no odds (Circa/BetMGM often absent).
+                // Empty Circa / no line: do not paint.
                 if (!bookTileHasLine(book.odds)) {
+                    return;
+                }
+                const paint = tilePaintState(bookName, bookOdds, alert, takeAm);
+                // Opposite-side junk (Poly +170 vs a minus take): do not render.
+                if (paint.skip) {
                     return;
                 }
                 const bookLimit = book.limit || 0;
                 const bookLimitDisplay = bookLimit ? formatLiquidityUsd(bookLimit) : '';
-                const isTakeBook =
-                    normalizeBookKey(bookName) === normalizeBookKey(alert.take_book || 'Kalshi') ||
-                    ((bookName === 'Kalshi' || normalizeBookKey(bookName) === 'kalshi') &&
-                        normalizeBookKey(alert.take_book || 'Kalshi') === 'kalshi');
-                const usedForLine =
-                    isTakeBook || bookMatchesDevigOrSharp(bookName, alert.devig_books, alert.sharp_books);
-                const inFair = bookMatchesDevigOrSharp(bookName, alert.devig_books, []);
-                const junkVsKalshi = !isTakeBook && kalshiOddsNum !== null && isJunkVsKalshi(bookOdds, kalshiOddsNum);
-                // Junk is display-gray only. Min EV never grays a tile.
-                // Poly off the rec pack: gray or don't paint (even if still a configured sharp).
-                let isGrayedOut = !usedForLine || junkVsKalshi || (isPolymarketBook(bookName) && !inFair && !isTakeBook);
-                
-                // Red only when strictly better than the take venue AND inside the 10c band.
-                let hasBetterOdds = false;
-                if (!isTakeBook && !junkVsKalshi && kalshiOddsNum !== null && bookOdds !== 0) {
-                    hasBetterOdds = bookAmericanIsBetter(bookOdds, kalshiOddsNum);
-                }
+                const isTakeBook = paint.take;
+                const hasBetterOdds = paint.better;
                 
                 const logoHtml = bookLogoHtml(bookName);
                 const bookKey = book.book_key || normalizeBookKey(bookName);
@@ -833,7 +866,7 @@ function createAlertCard(alert) {
                 }
                 
                 booksTableHtml += `
-                    <div class="book-cell ${isTakeBook ? 'kalshi-book take-book' : ''} ${isGrayedOut ? 'grayed-out' : ''} ${junkVsKalshi ? 'junk-tile' : ''} ${hasBetterOdds ? 'better-than-kalshi' : ''}" data-book-name="${escapeHtml(bookName)}" data-book-key="${escapeHtml(bookKey)}" title="${escapeHtml(titleBits.join(' · '))}">
+                    <div class="book-cell ${isTakeBook ? 'kalshi-book take-book' : ''} ${hasBetterOdds ? 'better-than-kalshi' : ''}" data-book-name="${escapeHtml(bookName)}" data-book-key="${escapeHtml(bookKey)}" title="${escapeHtml(titleBits.join(' · '))}">
                         <div class="book-logo">${logoHtml}</div>
                         <div class="book-odds" data-book-odds="${bookOdds}">${bookOdds > 0 ? '+' : ''}${bookOdds}</div>
                         ${bookLimitDisplay ? `<div class="book-limit" data-book-limit="${bookLimit}">${bookLimitDisplay}</div>` : ''}
@@ -844,20 +877,6 @@ function createAlertCard(alert) {
             booksTableHtml += '</div></div>';
         }
     }
-    
-    // Determine which books meet filter criteria (for graying out)
-    // Books are grayed out if they don't meet minSharpLimits or other filter criteria
-    const devigBooks = alert.devig_books || [];  // Books used for devigging (from API)
-    const minSharpLimits = {
-        'BookMaker': 250,
-        'Circa': 250,
-        'Novig': 200,
-        'Pinnacle': 250,
-        'ProphetX': 200,
-        'SportTrade': 200,
-        'DraftKings': 250,
-        'FanDuel': 250
-    };
     
     // Get filter name (if available)
     const filterName = alert.filter_name || '';
@@ -890,7 +909,7 @@ function createAlertCard(alert) {
             <div class="alert-header-main-col">
                 <div class="market-row-bb">
                     <span class="market-type-bb">${escapeHtml(marketTitle)}</span>
-                    <span class="alert-liq-badge" title="Kalshi line limit / stake from Odds-API (if provided)">Liq ${escapeHtml(liqBadge)}</span>
+                    <span class="alert-liq-badge alert-liq-usd" title="Kalshi line limit / stake from Odds-API (if provided)">Liq ${escapeHtml(liqBadge)}</span>
                     ${kTradeBadge}
                     <span class="ev-source-sub" title="${escapeHtml(evSourceTitle)}">${escapeHtml(evSourceLabel)}</span>
                 </div>
@@ -1882,9 +1901,9 @@ if (stoppagesOnlyCb) {
     }
 
     function fmtAm(v) {
-        if (v === null || v === undefined) return '—';
+        if (v === null || v === undefined) return '-';
         const n = Number(v);
-        if (!Number.isFinite(n)) return '—';
+        if (!Number.isFinite(n)) return '-';
         return (n > 0 ? '+' : '') + n;
     }
 
@@ -1950,7 +1969,7 @@ if (stoppagesOnlyCb) {
             const trA = document.createElement('tr');
             let cA = `<td rowspan="2" class="pto-side-label"><div>${escapeHtml(row.teams || '')}</div><div class="pto-event-meta">${meta}</div></td>`;
             cA += `<td class="pto-side-label">${escapeHtml(away)}</td>`;
-            cA += `<td rowspan="2" class="pto-odds-cell">${escapeHtml(row.start_display || '—')}</td>`;
+            cA += `<td rowspan="2" class="pto-odds-cell">${escapeHtml(row.start_display || '-')}</td>`;
             cA += `<td rowspan="2" class="pto-odds-cell">${row.live ? '●' : '○'}</td>`;
             books.forEach((b) => {
                 const p = pr[b] || {};

@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Live odds — Kalshi Dashboard</title>
+    <title>Live odds - Kalshi Dashboard</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
     <style>
         .live-odds-wrap { max-width: 1600px; margin: 0 auto; padding: 16px; }
@@ -74,9 +74,9 @@
         const tbody = document.getElementById('odds-body');
 
         function fmtAm(v) {
-            if (v === null || v === undefined) return '—';
+            if (v === null || v === undefined) return '-';
             const n = Number(v);
-            if (!Number.isFinite(n)) return '—';
+            if (!Number.isFinite(n)) return '-';
             return (n > 0 ? '+' : '') + n;
         }
 

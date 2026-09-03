@@ -1272,6 +1272,7 @@ body.dark .filter-name-badge-block {
     border-radius: 6px;
     border: 1px solid var(--border);
     min-width: 60px;
+    opacity: 1;
     transition: all 0.3s ease;
 }
 
@@ -1323,11 +1324,12 @@ body.dark .book-cell.kalshi-book {
     box-shadow: 0 0 0 1px rgba(255, 68, 68, 0.3);
 }
 
+/* Leftover class: worse recs stay unshaded full color, never red/faded. */
 .book-cell.worse-than-kalshi {
-    border: 2px solid #ff4444;
-    border-color: #ff4444;
-    box-shadow: 0 0 0 1px rgba(255, 68, 68, 0.3);
-    background: rgba(255, 68, 68, 0.05);
+    opacity: 1;
+    border: 1px solid var(--border);
+    box-shadow: none;
+    background: var(--bg-secondary);
 }
 
 .book-logo {
