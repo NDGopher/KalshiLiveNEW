@@ -103,6 +103,13 @@ _EVENT_HASH_RE = re.compile(r"#!?/event/(\d+)", re.I)
 # replaces stale Odds-API PLive ML. Markets 10/9/1 are not Game Winner
 # (first-5 / other) and must not paint a ML card.
 # Market 5 = game totals. 7/8 = team totals (click-in only) — never on Spread.
+# Soccer totals are not MLB market-3 idx1 and not a market-6 [idx0, idx1]
+# home/away pair. Strike / market identity is the outcome key only
+# (2.5 / 3.5 / 4.5, quarter-point alts, over_2.5 / under_2.5). Never infer
+# a line from a coefficient (idx0/idx1/idx2 or a price like +186=2.86).
+# Side-named soccer slots: idx0 is the take. idx1 is not Over/Under.
+# Line-only keys emit only when [idx0, idx1] is a real Over/Under pair.
+# Missing or mismatched strikes are dropped — never reuse a nearby line.
 # eventData list is [home, away] (stadium home first).
 # Sox @ Astros 199298371 Game tab: Astros −1.5 is unpriced. The only +325
 # on that event is Chicago White Sox Total Over 2.5 (market 7/8), not a run line.
@@ -449,6 +456,138 @@ def _spread_pair_from_slots(slots: Dict[int, Any]) -> Optional[Tuple[float, floa
         if pair:
             return pair
     return None
+
+
+def _slot_decimal(slots: Any, idx: int) -> Optional[float]:
+    if not isinstance(slots, dict):
+        return None
+    f = _as_float(slots.get(idx) if slots.get(idx) is not None else slots.get(str(idx)))
+    if f is not None and f > 1.0:
+        return f
+    return None
+
+
+def is_game_totals_market_name(name: Any) -> bool:
+    n = str(name or "").strip()
+    if not n:
+        return False
+    u = n.upper()
+    if "TEAM" in u:
+        return False
+    return n == "Totals" or "TOTAL" in u
+
+
+def _is_plausible_game_total_line(line: Optional[float], *, soccer: bool) -> bool:
+    """Half-point (MLB) or quarter-point (soccer Asian) grids only.
+
+    Prices are not lines: 2.86 (+186) and 3.45 (+245) fail the 0.25 grid.
+    """
+    if line is None:
+        return False
+    try:
+        lf = float(line)
+    except (TypeError, ValueError):
+        return False
+    if lf != lf or lf <= 0:
+        return False
+    step = 4.0 if soccer else 2.0
+    stepped = lf * step
+    if abs(stepped - round(stepped)) > 1e-6:
+        return False
+    if soccer:
+        return 0.25 <= lf <= 15.0
+    return 0.25 <= lf <= 50.0
+
+
+def _valid_ou_hold(over: float, under: float) -> bool:
+    """True when idx0/idx1 look like a real Over/Under two-way, not two take coeffs."""
+    if over <= 1.0 or under <= 1.0:
+        return False
+    implied = (1.0 / over) + (1.0 / under)
+    return 0.88 <= implied <= 1.15
+
+
+_SOCCER_TOTAL_OUTCOME_RE = re.compile(
+    r"^(?:(?P<side>over|under|o|u)[\s_\-/]*)?(?P<line>\d+(?:\.\d+)?)(?:[\s_\-/]*(?P<side2>over|under|o|u))?$",
+    re.I,
+)
+
+
+def parse_soccer_total_outcome(outcome: Any) -> Tuple[Optional[float], Optional[str]]:
+    """Strike + side from the outcome / market key only. Never from a price.
+
+    Bare integers (``3`` / ``4``) are over/under codes, not 3.0 / 4.0 lines.
+    """
+    raw = str(outcome or "").strip().lower()
+    if not raw:
+        return None, None
+    if raw in ("over", "o"):
+        return None, "over"
+    if raw in ("under", "u"):
+        return None, "under"
+    if re.fullmatch(r"\d{1,2}", raw):
+        return None, None
+    m = _SOCCER_TOTAL_OUTCOME_RE.match(raw)
+    if not m:
+        return None, None
+    line_tok = m.group("line")
+    if line_tok is not None and re.fullmatch(r"\d{1,2}", line_tok) and "." not in raw:
+        # ``over3`` / ``u4`` without a decimal — not an authoritative strike.
+        return None, None
+    line = _as_float(line_tok)
+    if not _is_plausible_game_total_line(line, soccer=True):
+        line = None
+    side_tok = (m.group("side") or m.group("side2") or "").lower()
+    side = None
+    if side_tok in ("over", "o"):
+        side = "over"
+    elif side_tok in ("under", "u"):
+        side = "under"
+    return line, side
+
+
+def soccer_totals_identity_rows(markets: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """Visible board rows: exact strike + Over/Under American. For payload diffs."""
+    from ev_calculator import decimal_to_american
+
+    out: List[Dict[str, Any]] = []
+    for m in markets or []:
+        if not isinstance(m, dict) or not is_game_totals_market_name(m.get("name")):
+            continue
+        for row in m.get("odds") or []:
+            if not isinstance(row, dict):
+                continue
+            line = row.get("hdp")
+            if line is None:
+                continue
+            try:
+                lf = float(line)
+            except (TypeError, ValueError):
+                continue
+            over = _as_float(row.get("over"))
+            under = _as_float(row.get("under"))
+            out.append(
+                {
+                    "line": lf,
+                    "over": over,
+                    "under": under,
+                    "over_am": decimal_to_american(over) if over and over > 1.0 else None,
+                    "under_am": decimal_to_american(under) if under and under > 1.0 else None,
+                }
+            )
+    return out
+
+
+def _soccer_total_side_take_decimal(slots: Any) -> Optional[float]:
+    """Side-named soccer total: idx0 is the take. idx1 is never Over/Under.
+
+    Independent of MLB Game Winner (idx1). If only idx1 is populated (patch
+    with a single live slot), use that sole price.
+    """
+    a = _slot_decimal(slots, 0)
+    if a is not None:
+        return a
+    return _slot_decimal(slots, 1)
 
 
 _EVENT_ID_RE = re.compile(r"(?:eventCoefficients|eventData|event)[./](\d+)", re.I)
@@ -981,9 +1120,20 @@ def merge_plive_market_lists(
     existing: Optional[List[Dict[str, Any]]],
     incoming: Optional[List[Dict[str, Any]]],
 ) -> List[Dict[str, Any]]:
-    """Live market-3 Game Winner replaces Odds-API / stale PLive ML. Overlay Spread/Totals."""
+    """Live market-3 Game Winner replaces Odds-API / stale PLive ML. Overlay Spread/Totals.
+
+    Soccer Odds-API PLive may be named ``Total Goals`` while live coeffs emit
+    ``Totals``. Keep one totals family so the dashboard and pipeline log
+    cannot read two different PLive total blocks for the same event.
+    """
     incoming_ml = any(
         isinstance(m, dict) and str(m.get("name")) == "ML" for m in (incoming or [])
+    )
+    incoming_totals = any(
+        isinstance(m, dict) and is_game_totals_market_name(m.get("name")) for m in (incoming or [])
+    )
+    incoming_spread = any(
+        isinstance(m, dict) and str(m.get("name")) == "Spread" for m in (incoming or [])
     )
     by_name: Dict[str, Dict[str, Any]] = {}
     for m in existing or []:
@@ -992,12 +1142,16 @@ def merge_plive_market_lists(
         name = str(m.get("name"))
         if name == "ML" and incoming_ml:
             continue
+        if incoming_totals and is_game_totals_market_name(name):
+            continue
+        if incoming_spread and name == "Spread":
+            continue
         by_name[name] = m
     for m in incoming or []:
         if not isinstance(m, dict) or not m.get("name"):
             continue
         name = str(m.get("name"))
-        if name in ("Spread", "Totals", "ML"):
+        if name in ("Spread", "Totals", "ML") or is_game_totals_market_name(name):
             by_name[name] = m
     return sanitize_plive_markets(list(by_name.values()))
 
@@ -1216,18 +1370,37 @@ class PliveStore:
             if not isinstance(oblock, dict):
                 continue
             for outcome, oval in oblock.items():
-                if isinstance(oval, (list, tuple)):
-                    for i, v in enumerate(oval):
-                        self.set_coeff(eid, market, str(outcome), i, v)
-                elif isinstance(oval, dict):
-                    for i, v in oval.items():
-                        try:
-                            ii = int(i)
-                        except (TypeError, ValueError):
-                            ii = None
-                        self.set_coeff(eid, market, str(outcome), ii, v)
-                else:
-                    self.set_coeff(eid, market, str(outcome), 1, oval)
+                self._ingest_coeff_value(eid, market, str(outcome), oval)
+
+    def _ingest_coeff_value(self, eid: str, market: int, outcome: str, oval: Any) -> None:
+        oc_l = str(outcome).lower()
+        if isinstance(oval, (list, tuple)):
+            for i, v in enumerate(oval):
+                self.set_coeff(eid, market, str(outcome), i, v)
+            return
+        if isinstance(oval, dict):
+            for i, v in oval.items():
+                ik = str(i)
+                ik_l = ik.lower()
+                line_from_key = _as_float(ik)
+                line_from_oc = _as_float(outcome)
+                if oc_l in ("over", "under", "o", "u") and _is_plausible_game_total_line(
+                    line_from_key, soccer=True
+                ):
+                    self._ingest_coeff_value(eid, market, f"{oc_l}_{ik}", v)
+                    continue
+                if ik_l in ("over", "under", "o", "u") and _is_plausible_game_total_line(
+                    line_from_oc, soccer=True
+                ):
+                    self._ingest_coeff_value(eid, market, f"{ik_l}_{outcome}", v)
+                    continue
+                try:
+                    ii = int(i)
+                except (TypeError, ValueError):
+                    ii = None
+                self.set_coeff(eid, market, str(outcome), ii, v)
+            return
+        self.set_coeff(eid, market, str(outcome), 1, oval)
 
     def apply_json_patch(self, eid: str, ops: Iterable[Dict[str, Any]]) -> None:
         for op in ops:
@@ -1316,9 +1489,16 @@ class PliveStore:
         ev = self.events.get(str(eid))
         if not ev:
             return []
-        return self._markets_from_coeffs(ev.get("coeffs") or {})
+        return self._markets_from_coeffs(
+            ev.get("coeffs") or {}, soccer=self.is_soccer_event(ev)
+        )
 
-    def _markets_from_coeffs(self, coeffs: Dict[Tuple[int, str], Dict[int, Any]]) -> List[Dict[str, Any]]:
+    def _markets_from_coeffs(
+        self,
+        coeffs: Dict[Tuple[int, str], Dict[int, Any]],
+        *,
+        soccer: bool = False,
+    ) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
 
         # Game Winner (market 3): outcomes 1/home vs 2/away. idx1 only.
@@ -1401,59 +1581,159 @@ class PliveStore:
         if spread_rows:
             out.append({"name": "Spread", "odds": spread_rows[:12]})
 
-        # Totals (market 5): same 2-way pair as market 6 — slot 0 over, slot 1 under.
+        # Totals (market 5). Soccer uses exact strike identity; MLB keeps
+        # the verified [idx0=over, idx1=under] pair when the outcome is the line.
         total_rows: List[Dict[str, Any]] = []
-        for mk in self.total_markets:
-            by_line: Dict[float, Dict[str, float]] = {}
-            for (market, outcome), slots in coeffs.items():
-                if market != mk:
-                    continue
-                ocl = str(outcome).lower()
-                line = _as_float(slots.get(2) or slots.get("hdp") or slots.get("max")) or _as_float(ocl)
-                pair = _spread_pair_from_slots(slots) if isinstance(slots, dict) else None
-                if pair is None and isinstance(slots, (list, tuple)):
-                    pair = _as_decimal_pair(slots)
-                if line is not None and pair is not None:
-                    by_line.setdefault(float(line), {})["over"] = pair[0]
-                    by_line[float(line)]["under"] = pair[1]
-                    continue
-                dec = _decimal_from_slot(slots) if isinstance(slots, dict) else _as_float(slots)
-                if dec is None:
-                    continue
-                side = None
-                if "over" in ocl or ocl in ("o", "3"):
-                    side = "over"
-                    if line is None:
-                        line = _as_float(ocl.replace("over", "").replace("o", "").replace("_", ""))
-                elif "under" in ocl or ocl in ("u", "4"):
-                    side = "under"
-                    if line is None:
-                        line = _as_float(ocl.replace("under", "").replace("u", "").replace("_", ""))
-                else:
-                    line = _as_float(ocl) if line is None else line
-                    side = "over" if line is not None and line not in by_line else "under"
-                if line is None or side is None:
-                    continue
-                by_line.setdefault(float(line), {})[side] = dec
-            for line, sides in by_line.items():
-                if "over" in sides and "under" in sides:
-                    total_rows.append(
-                        {
-                            "hdp": line,
-                            "max": line,
-                            "line": line,
-                            "over": sides["over"],
-                            "under": sides["under"],
-                            "plive_market": int(mk),
-                            "market_type": "game_total",
-                        }
-                    )
-            if total_rows:
-                break
+        if soccer:
+            total_rows = self._soccer_total_rows_from_coeffs(coeffs)
+        else:
+            for mk in self.total_markets:
+                by_line: Dict[float, Dict[str, float]] = {}
+                for (market, outcome), slots in coeffs.items():
+                    if market != mk:
+                        continue
+                    ocl = str(outcome).lower()
+                    line = _as_float(slots.get(2) or slots.get("hdp") or slots.get("max")) or _as_float(ocl)
+                    pair = _spread_pair_from_slots(slots) if isinstance(slots, dict) else None
+                    if pair is None and isinstance(slots, (list, tuple)):
+                        pair = _as_decimal_pair(slots)
+                    if line is not None and pair is not None:
+                        by_line.setdefault(float(line), {})["over"] = pair[0]
+                        by_line[float(line)]["under"] = pair[1]
+                        continue
+                    dec = _decimal_from_slot(slots) if isinstance(slots, dict) else _as_float(slots)
+                    if dec is None:
+                        continue
+                    side = None
+                    if "over" in ocl or ocl in ("o", "3"):
+                        side = "over"
+                        if line is None:
+                            line = _as_float(ocl.replace("over", "").replace("o", "").replace("_", ""))
+                    elif "under" in ocl or ocl in ("u", "4"):
+                        side = "under"
+                        if line is None:
+                            line = _as_float(ocl.replace("under", "").replace("u", "").replace("_", ""))
+                    else:
+                        line = _as_float(ocl) if line is None else line
+                        side = "over" if line is not None and line not in by_line else "under"
+                    if line is None or side is None:
+                        continue
+                    by_line.setdefault(float(line), {})[side] = dec
+                for line, sides in by_line.items():
+                    if "over" in sides and "under" in sides:
+                        total_rows.append(
+                            {
+                                "hdp": line,
+                                "max": line,
+                                "line": line,
+                                "over": sides["over"],
+                                "under": sides["under"],
+                                "plive_market": int(mk),
+                                "market_type": "game_total",
+                            }
+                        )
+                if total_rows:
+                    break
         if total_rows:
             out.append({"name": "Totals", "odds": total_rows[:12]})
 
         return sanitize_plive_markets(out)
+
+    def _soccer_total_rows_from_coeffs(
+        self, coeffs: Dict[Tuple[int, str], Dict[int, Any]]
+    ) -> List[Dict[str, Any]]:
+        by_line: Dict[float, Dict[str, Any]] = {}
+        rejected: Set[float] = set()
+
+        def _reject(line: float) -> None:
+            rejected.add(float(line))
+            by_line.pop(float(line), None)
+
+        def _put(line: float, side: str, dec: float, mk: int) -> None:
+            lf = float(line)
+            if lf in rejected:
+                return
+            if side not in ("over", "under") or dec <= 1.0:
+                _reject(lf)
+                return
+            rec = by_line.setdefault(lf, {"plive_market": int(mk)})
+            prev = rec.get(side)
+            if prev is not None and abs(float(prev) - float(dec)) > 1e-9:
+                _reject(lf)
+                return
+            rec[side] = float(dec)
+
+        wanted = {int(m) for m in self.total_markets}
+        named: List[Tuple[int, str, Any]] = []
+        line_only: List[Tuple[int, str, Any]] = []
+        for (market, outcome), slots in coeffs.items():
+            if int(market) not in wanted:
+                continue
+            # Outcome / market key is the only strike identity. Slot values
+            # (idx0/1/2, leftover hdp/max) are prices — never lines.
+            line, side = parse_soccer_total_outcome(outcome)
+            if line is None or not _is_plausible_game_total_line(line, soccer=True):
+                continue
+            if side:
+                named.append((int(market), str(outcome), slots))
+            else:
+                line_only.append((int(market), str(outcome), slots))
+
+        for market, outcome, slots in named:
+            line, side = parse_soccer_total_outcome(outcome)
+            if line is None or side is None:
+                continue
+            dec = _soccer_total_side_take_decimal(slots)
+            if dec is None or abs(float(dec) - float(line)) < 1e-6:
+                _reject(float(line))
+                continue
+            _put(float(line), side, dec, market)
+
+        for market, outcome, slots in line_only:
+            line, _side = parse_soccer_total_outcome(outcome)
+            if line is None:
+                continue
+            lf = float(line)
+            if lf in rejected:
+                continue
+            pair = _spread_pair_from_slots(slots) if isinstance(slots, dict) else None
+            if pair is None and isinstance(slots, (list, tuple)):
+                pair = _as_decimal_pair(slots)
+            if pair is None or not _valid_ou_hold(pair[0], pair[1]):
+                if lf in by_line:
+                    _reject(lf)
+                continue
+            if abs(pair[0] - lf) < 1e-6 or abs(pair[1] - lf) < 1e-6:
+                _reject(lf)
+                continue
+            rec = by_line.get(lf)
+            if rec and (
+                ("over" in rec and abs(float(rec["over"]) - pair[0]) > 1e-9)
+                or ("under" in rec and abs(float(rec["under"]) - pair[1]) > 1e-9)
+            ):
+                _reject(lf)
+                continue
+            _put(lf, "over", pair[0], market)
+            _put(lf, "under", pair[1], market)
+
+        rows: List[Dict[str, Any]] = []
+        for line, sides in sorted(by_line.items(), key=lambda kv: kv[0]):
+            if line in rejected:
+                continue
+            if "over" not in sides or "under" not in sides:
+                continue
+            rows.append(
+                {
+                    "hdp": line,
+                    "max": line,
+                    "line": line,
+                    "over": sides["over"],
+                    "under": sides["under"],
+                    "plive_market": int(sides.get("plive_market") or PLIVE_GAME_TOTAL_MARKET),
+                    "market_type": "game_total",
+                }
+            )
+        return rows
 
 
 class PlivePandoraFeed:
