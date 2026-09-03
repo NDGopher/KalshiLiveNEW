@@ -327,6 +327,122 @@ def test_ws_ml_only_update_keeps_totals_then_alert():
     assert alert_over.take_book == "PLive" and str(alert_over.ticker or "").startswith("PLIVE|")
 
 
+def test_merged_doc_after_ml_only_update_emits_over_card():
+    """Full ML+Spread+Totals snapshot, then ML-only WS update: Totals survive
+    and an honest +EV Over card is built from the merged bookmakers.
+    Rec O−110/U−110, take O +105 → Quant-3 +2.50% KEEP.
+    """
+    from ev_calculator import american_to_decimal, is_plus_print_ev
+
+    store = OddsWsStore()
+    eid = DET_MIN_EID
+    rec_ou = {
+        "max": 11.5,
+        "line": 11.5,
+        "over": american_to_decimal(-110),
+        "under": american_to_decimal(-110),
+    }
+    take_ou = {
+        "hdp": 11.5,
+        "max": 11.5,
+        "line": 11.5,
+        "over": american_to_decimal(105),
+        "under": american_to_decimal(-120),
+    }
+    ml = {"name": "ML", "odds": [{"home": 1.8, "away": 2.1}]}
+    spread = {"name": "Spread", "odds": [{"hdp": -1.5, "home": 1.91, "away": 1.91}]}
+    rec_books = ("FanDuel", "DraftKings", "NoVig")
+    for bookie in rec_books:
+        store.apply_message(
+            {
+                "type": "created",
+                "seq": 1,
+                "id": eid,
+                "bookie": bookie,
+                "markets": [
+                    dict(ml),
+                    dict(spread),
+                    {"name": "Totals", "odds": [dict(rec_ou)]},
+                ],
+            }
+        )
+    store.apply_message(
+        {
+            "type": "created",
+            "seq": 2,
+            "id": eid,
+            "bookie": "PLive",
+            "markets": [
+                dict(ml),
+                dict(spread),
+                {"name": "Totals", "odds": [dict(take_ou)]},
+            ],
+        }
+    )
+    store.apply_message(
+        {
+            "type": "updated",
+            "seq": 3,
+            "id": eid,
+            "bookie": "PLive",
+            "markets": [{"name": "ML", "odds": [{"home": 1.75, "away": 2.15}]}],
+        }
+    )
+    store.apply_message(
+        {
+            "type": "updated",
+            "seq": 4,
+            "id": eid,
+            "bookie": "FanDuel",
+            "markets": [{"name": "ML", "odds": [{"home": 1.82, "away": 2.08}]}],
+        }
+    )
+    doc = store.merged_doc(eid)
+    doc["home"] = "Minnesota Twins"
+    doc["away"] = "Detroit Tigers"
+    doc["league"] = "MLB"
+    names = {bk: [m.get("name") for m in mk] for bk, mk in doc["bookmakers"].items()}
+    assert "Totals" in names["PLive"]
+    assert "Spread" in names["PLive"]
+    assert "Totals" in names["FanDuel"]
+    mon = _totals_monitor()
+    alerts = mon.alerts_from_live_scan_docs({eid: doc})
+    plus = [
+        a
+        for a in alerts
+        if is_plus_print_ev(getattr(a, "ev_percent", None))
+        and str(getattr(a, "take_book", "")).lower() == "plive"
+    ]
+    over = [a for a in plus if str(a.pick).lower() == "over" and str(a.qualifier) == "11.5"]
+    under = [a for a in plus if str(a.pick).lower() == "under" and str(a.qualifier) == "11.5"]
+    assert over, f"expected Over 11.5 plus card from merged doc, got {[(a.pick, a.qualifier, a.ev_percent) for a in alerts]}"
+    assert over[0].take_book == "PLive"
+    assert str(over[0].ticker or "").startswith("PLIVE|")
+    assert float(over[0].ev_percent) > 0
+    assert not under, "both Over and Under must not both print plus"
+    try:
+        from dashboard import live_odds_board_rows_from_bookmakers
+    except Exception as exc:  # pragma: no cover
+        pytest.skip(f"dashboard import failed: {exc}")
+    rows = live_odds_board_rows_from_bookmakers(
+        event_id=eid,
+        home="Minnesota Twins",
+        away="Detroit Tigers",
+        teams="Detroit Tigers @ Minnesota Twins",
+        league="MLB",
+        sport_slug="baseball",
+        live=True,
+        status="live",
+        start_display="",
+        bks=doc["bookmakers"],
+        books=["FanDuel", "DraftKings", "NoVig", "PLive"],
+    )
+    markets = [r.get("market") for r in rows]
+    assert "ML" in markets
+    assert "Spread" in markets
+    assert "Totals" in markets
+
+
 def test_live_odds_emits_totals_and_spread_in_addition_to_ml():
     try:
         from dashboard import live_odds_board_rows_from_bookmakers

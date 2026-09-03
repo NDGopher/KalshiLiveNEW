@@ -15,8 +15,9 @@ Official contract (do not invent):
 - Message types: welcome, created, updated, deleted, no_markets, score, status,
   resync_required.
 - Upsert markets per event+bookie by market family (ML / Spread / Totals).
-  An ML-only ``updated`` must not wipe prior Spread/Totals. ``no_markets``
-  and ``deleted`` still clear. A payload that includes Totals replaces Totals.
+  An ML-only ``updated`` or ML-only REST snapshot must not wipe prior
+  Spread/Totals. ``no_markets`` and ``deleted`` still clear. A payload that
+  includes Totals replaces Totals.
 - Track ``seq``; reconnect with ``lastSeq`` (compacted latest-state replay).
 - On ``resync_required``: REST snapshot with ``includeSeq=true``, then reconnect.
 - Process updates asynchronously; exponential backoff on reconnect.
@@ -496,7 +497,10 @@ class OddsWsStore:
             maybe_log_mlb_clock_sample(self, eid, meta, source="slate")
 
     def apply_rest_docs(self, docs: Iterable[Dict[str, Any]]) -> None:
-        """Ingest /odds or /odds/multi snapshots (replace each book's markets)."""
+        """Ingest /odds or /odds/multi snapshots. Merge by family so ML-only
+        REST rows cannot wipe prior Spread/Totals (same rule as WS updated).
+        Empty markets list still clears that book.
+        """
         for doc in docs:
             if not isinstance(doc, dict) or doc.get("id") is None:
                 continue
@@ -509,11 +513,10 @@ class OddsWsStore:
                 continue
             for raw_k, markets in bks.items():
                 bookie = _canonical_odds_api_bookmaker(str(raw_k))
-                if isinstance(markets, list):
-                    self.books[(eid, bookie)] = list(markets)
+                if isinstance(markets, list) and markets:
+                    self._upsert_markets_by_family(eid, bookie, markets)
                 else:
-                    self.books[(eid, bookie)] = []
-                self.book_updated_at[(eid, bookie)] = time.time()
+                    self._replace_markets(eid, bookie, markets if isinstance(markets, list) else [])
             self.generation += 1
 
     def _replace_markets(self, eid: int, bookie: str, markets: Any) -> None:

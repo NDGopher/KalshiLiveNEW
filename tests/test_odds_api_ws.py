@@ -158,6 +158,41 @@ def test_store_ml_only_update_keeps_totals():
     assert store.book_updated_at[(100, "FanDuel")] == doc["book_updated_at"]["FanDuel"]
 
 
+def test_rest_ml_only_snapshot_keeps_totals():
+    """REST /odds ML-only row must not wipe Spread+Totals (same merge as WS)."""
+    store = OddsWsStore()
+    store.apply_rest_docs(
+        [
+            {
+                "id": 200,
+                "home": "Minnesota Twins",
+                "away": "Detroit Tigers",
+                "bookmakers": {
+                    "FanDuel": [
+                        {"name": "ML", "odds": [{"home": 1.9, "away": 2.0}]},
+                        {"name": "Spread", "odds": [{"hdp": -1.5, "home": 1.91, "away": 1.91}]},
+                        {"name": "Totals", "odds": [{"max": 11.5, "over": 1.91, "under": 1.91}]},
+                    ]
+                },
+            }
+        ]
+    )
+    store.apply_rest_docs(
+        [
+            {
+                "id": 200,
+                "bookmakers": {
+                    "FanDuel": [{"name": "ML", "odds": [{"home": 1.85, "away": 2.05}]}],
+                },
+            }
+        ]
+    )
+    names = [m["name"] for m in store.merged_doc(200)["bookmakers"]["FanDuel"]]
+    assert "ML" in names
+    assert "Totals" in names
+    assert "Spread" in names
+
+
 def test_store_deleted_and_no_markets():
     store = OddsWsStore()
     store.apply_message(
@@ -178,7 +213,8 @@ def test_resync_required_and_welcome_mismatch():
     assert extra == []
 
 
-def test_rest_docs_replace_per_book():
+def test_rest_docs_merge_by_family_per_book():
+    """REST snapshot upserts by family. A Spread-only row must not wipe ML."""
     store = OddsWsStore()
     store.apply_rest_docs(
         [
@@ -198,5 +234,7 @@ def test_rest_docs_replace_per_book():
             }
         ]
     )
-    assert [m["name"] for m in store.merged_doc(9)["bookmakers"]["Kalshi"]] == ["Spread"]
+    names = [m["name"] for m in store.merged_doc(9)["bookmakers"]["Kalshi"]]
+    assert "Spread" in names
+    assert "ML" in names
     assert store.merged_doc(9)["home"] == "Yankees"
