@@ -8,7 +8,10 @@ from dashboard import (
     _live_pick_kind_name,
     _live_prices_for_kind,
 )
-from odds_ev_monitor import _odds_doc_has_kalshi_tradable_gameline
+from odds_ev_monitor import (
+    _odds_doc_has_kalshi_tradable_gameline,
+    _odds_doc_has_take_tradable_gameline,
+)
 from plive_pandora import PliveStore, PLIVE_LINE_SET
 
 
@@ -42,7 +45,8 @@ def test_plive_only_totals_doc_is_tradable():
             ]
         }
     }
-    assert _odds_doc_has_kalshi_tradable_gameline(doc) is True
+    assert _odds_doc_has_take_tradable_gameline(doc) is True
+    assert _odds_doc_has_kalshi_tradable_gameline(doc) is False
 
 
 def test_plive_market5_game_total_det_min():
@@ -118,7 +122,8 @@ def test_plive_take_totals_tradable_without_kalshi():
             "Kalshi": [{"name": "Totals", "odds": [{"match_failed": True}]}],
         }
     }
-    assert _odds_doc_has_kalshi_tradable_gameline(doc) is True
+    assert _odds_doc_has_take_tradable_gameline(doc) is True
+    assert _odds_doc_has_kalshi_tradable_gameline(doc) is False
 
 
 def test_live_odds_line_match_skips_unpriced_and_team_total():

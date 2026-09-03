@@ -4630,7 +4630,16 @@ def listed_active_alerts(source=None):
         rows = list(src or [])
     out = [r for r in rows if not is_unlisted_match_failed(r)]
     floor = float(dashboard_min_ev or 0.0)
-    return [r for r in out if float(r.get("ev_percent") or 0.0) >= floor]
+
+    def _keeps(row: Dict) -> bool:
+        if float(row.get("ev_percent") or 0.0) >= floor:
+            return True
+        # PLive-take Over/Under still list when Kalshi ticker/EV floor would hide them.
+        if str(row.get("take_book") or "").strip().lower() != "plive":
+            return False
+        return str(row.get("pick") or "").strip().lower() in ("over", "under")
+
+    return [r for r in out if _keeps(r)]
 
 
 def unmatched_alert_should_emit_new_alert(_alert_data=None) -> bool:

@@ -464,8 +464,8 @@ def _odds_doc_has_take_tradable_gameline(
 
 
 def _odds_doc_has_kalshi_tradable_gameline(doc: Any) -> bool:
-    """True if Kalshi or PLive has a priced gameline. PLive-only Totals still scan."""
-    return _odds_doc_has_take_tradable_gameline(doc)
+    """Kalshi-only. PLive-only Totals use ``_odds_doc_has_take_tradable_gameline``."""
+    return _odds_doc_has_take_tradable_gameline(doc, books=("Kalshi",))
 
 
 def _numeric_close(a: Any, b: Any, tol: float = 1e-5) -> bool:
@@ -552,9 +552,15 @@ def _market_is_spread(mname: str) -> bool:
     )
 
 
-def _market_is_spread_or_total(mname: str) -> bool:
+def _market_is_total(mname: str) -> bool:
     mu = (mname or "").upper()
-    if "TOTAL" in mu or ("OVER" in mu and "UNDER" in mu) or mu in ("OU", "O/U"):
+    if "TEAM" in mu and "TOTAL" in mu:
+        return False
+    return "TOTAL" in mu or ("OVER" in mu and "UNDER" in mu) or mu in ("OU", "O/U")
+
+
+def _market_is_spread_or_total(mname: str) -> bool:
+    if _market_is_total(mname):
         return True
     return _market_is_spread(mname)
 
@@ -2916,7 +2922,12 @@ class OddsEVMonitor:
                 exchange_source=panel_books or surviving_books,
             )
             ev_percent = float(gated["ev_percent"])
-            if used_fallback_fair or not gated["plus_alert"]:
+            plive_total_take = (
+                take_canon.lower() == "plive"
+                and _market_is_total(mname)
+                and not used_fallback_fair
+            )
+            if used_fallback_fair or (not gated["plus_alert"] and not plive_total_take):
                 if _diagnostic_mode():
                     print(
                         f"[PIPELINE] Dropped: EV gates {gated.get('reasons') or ['no_plus']} "

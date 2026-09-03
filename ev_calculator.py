@@ -728,7 +728,9 @@ def apply_ev_hard_gates(
             reasons.append("median_gate")
 
         band = [k_imp] + surv_imps
-        if max(band) - min(band) <= TIGHT_CLUSTER_BAND:
+        # Identity only when the take is not strictly best. A longest PLive
+        # total vs a tight rec pack is a real plus, not a 4c identity lie.
+        if better > 0 and max(band) - min(band) <= TIGHT_CLUSTER_BAND:
             if abs(ev) > TIGHT_CLUSTER_EV_ABS:
                 ev = 0.0
                 allow_plus = False
