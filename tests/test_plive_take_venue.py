@@ -103,7 +103,20 @@ def test_plive_take_emits_when_plus_vs_pack():
         "away": "Chicago White Sox",
         "bookmakers": {
             "Kalshi": [{"name": "ML", "odds": [{"home": k_dec, "away": opp}]}],
-            "PLive": [{"name": "ML", "odds": [{"home": pl_dec, "away": opp}]}],
+            "PLive": [
+                {
+                    "name": "ML",
+                    "odds": [
+                        {
+                            "home": pl_dec,
+                            "away": opp,
+                            "plive_live": True,
+                            "plive_market": 3,
+                            "market_type": "game_winner",
+                        }
+                    ],
+                }
+            ],
             "FanDuel": [{"name": "ML", "odds": [{"home": fd, "away": opp}]}],
             "DraftKings": [{"name": "ML", "odds": [{"home": dk, "away": opp}]}],
             "NoVig": [{"name": "ML", "odds": [{"home": nv, "away": opp}]}],
@@ -354,7 +367,20 @@ def test_royals_ml_plus163_omits_junk_poly_keeps_plive_tile():
             "FanDuel": [{"name": "ML", "odds": [{"home": american_to_decimal(116), "away": opp}]}],
             "Bet365": [{"name": "ML", "odds": [{"home": american_to_decimal(100), "away": opp}]}],
             "Caesars": [{"name": "ML", "odds": [{"home": american_to_decimal(110), "away": opp}]}],
-            "PLive": [{"name": "ML", "odds": [{"home": american_to_decimal(118), "away": opp}]}],
+            "PLive": [
+                {
+                    "name": "ML",
+                    "odds": [
+                        {
+                            "home": american_to_decimal(118),
+                            "away": opp,
+                            "plive_live": True,
+                            "plive_market": 3,
+                            "market_type": "game_winner",
+                        }
+                    ],
+                }
+            ],
             "Polymarket": [{"name": "ML", "odds": [{"home": american_to_decimal(-455), "away": opp}]}],
             "Pinnacle": [{"name": "ML", "odds": [{"home": american_to_decimal(-455), "away": opp}]}],
         },

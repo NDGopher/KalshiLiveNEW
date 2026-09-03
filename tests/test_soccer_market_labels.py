@@ -49,6 +49,9 @@ def test_soccer_under_totals_card_uses_total_goals_and_two_way_ev():
         "hdp": 2.5,
         "over": 2.15,
         "under": 2.05,
+        "plive_live": True,
+        "plive_market": 5,
+        "market_type": "game_total",
     }
     sharp_under = 1.72
     doc = {

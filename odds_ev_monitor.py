@@ -82,6 +82,7 @@ from kalshi_public_feed import attach_public_kalshi_to_docs
 from plive_pandora import (
     extra_local_bookmakers,
     get_shared_plive_feed,
+    is_live_plive_side,
     is_run_line_spread_row,
     is_team_total_market_id,
     merge_plive_into_docs,
@@ -531,7 +532,7 @@ def _odds_doc_has_take_tradable_gameline(
             for row in mk.get("odds") or []:
                 if not isinstance(row, dict):
                     continue
-                for side in ("home", "away", "over", "under"):
+                for side in ("home", "away", "draw", "over", "under"):
                     d = _float_dec(row.get(side))
                     if d is not None and d > 1.0:
                         return True
@@ -1580,12 +1581,18 @@ def _build_display_books_payload(
             or (row.get("plive_market") is not None and not is_run_line_spread_row(row))
         ):
             continue
+        if is_plive_book(nm) and not is_live_plive_side(row, bet_side):
+            # Never paint Odds-API / Kalshi-copied PLive. Missing live Draw
+            # omits the tile; Kalshi-take can still print.
+            continue
         d = _decimal_for_side(row, bet_side)
         if d and d > 1.0:
             am = decimal_to_american(float(d))
-            # Junk vs take: skip the tile (not gray). Any book, including Poly.
-            if is_junk_vs_kalshi(am, int(kalshi_am)):
-                continue
+            # Junk vs take: skip the tile (not gray). Live PLive is a comparison
+            # book on a Kalshi-take — show +270 next to Kalshi +335.
+            if not (is_plive_book(nm) and is_live_plive_side(row, bet_side)):
+                if is_junk_vs_kalshi(am, int(kalshi_am)):
+                    continue
             canon = _norm_book(str(nm))
             blob: Dict[str, Any] = {
                 "book": canon,
@@ -2481,6 +2488,9 @@ class OddsEVMonitor:
                         continue
                     sides = _gameline_scan_sides(mname, p_row, bks=bks)
                     for bet_side in sides:
+                        if not is_live_plive_side(p_row, bet_side):
+                            # Odds-API / Kalshi-copied PLive is not a take.
+                            continue
                         key = (str(eid), mu, bet_side, _scan_strike_key(p_row, mname))
                         if key in seen_sides:
                             continue
@@ -3039,6 +3049,10 @@ class OddsEVMonitor:
         ):
             return None
         k_dec = _float_dec(bo.get(bet_side)) if isinstance(bo, dict) else None
+        if take_canon.lower() == "plive":
+            # Never start from the Kalshi value-bet decimal. Soccer Live must
+            # not invent a PLive-take from Kalshi +335.
+            k_dec = None
         if take_canon.lower() == "kalshi" and (k_dec is None or k_dec <= 1.0):
             if _diagnostic_mode():
                 print(
@@ -3078,10 +3092,15 @@ class OddsEVMonitor:
             f_row = _sharp_row_for_market(fd_mk, mname, _line_ref) if fd_mk else {}
             if take_canon.lower() == "plive":
                 plive_mk = _find_market_block(_markets_list_for_book(bks, "PLive"), mname)
+                k_row = {}
                 if canon_vb and plive_mk:
                     k_row = _sharp_row_for_market(plive_mk, mname, canon_vb)
                 elif plive_mk and not _market_is_spread_or_total(mname):
                     k_row = _first_odds_row(plive_mk) or {}
+                # Fail closed: no live coeff for this side → quote Kalshi instead.
+                # Draw needs 1X2 (plive_draw_market). Market-3 home/away is not Draw.
+                if not is_live_plive_side(k_row, bet_side):
+                    return None
                 k_dec = _decimal_for_side(k_row, bet_side)
                 if k_dec is None or k_dec <= 1.0:
                     return None

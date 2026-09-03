@@ -2317,15 +2317,12 @@ def create_alert_id(alert: EvAlert) -> str:
     # CRITICAL: Don't include odds in hash - odds can change slightly but it's still the same alert
     # We want to update the existing alert, not create a new one when odds change
     import hashlib
-    # Use ticker, pick, qualifier, and market_type to create stable ID
-    # Also include filter_name if available to distinguish same alert from different filters
-    filter_name = getattr(alert, 'filter_name', '') or ''
-    ev_source = getattr(alert, "ev_source", "") or "odds_api_value_bets"
+    # One card per event+market+side+line+take. Two dashboard filters must
+    # not print two EVs for the same take. Kalshi and PLive stay separate.
+    # Do not hash ev_source: live scan vs value-bets is the same take.
     take_book = getattr(alert, "take_book", "") or "Kalshi"
-    # Same edge from API feed vs local scan must not collide; keep legacy IDs for default feed.
-    src_part = f"|{ev_source}" if ev_source != "odds_api_value_bets" else ""
     take_part = f"|{take_book}" if str(take_book).lower() != "kalshi" else ""
-    key = f"{alert.ticker}|{alert.pick}|{alert.qualifier}|{alert.market_type}|{filter_name}{src_part}{take_part}"
+    key = f"{alert.ticker}|{alert.pick}|{alert.qualifier}|{alert.market_type}{take_part}"
     # Use MD5 hash and take first 10 digits for consistent ID
     hash_obj = hashlib.md5(key.encode('utf-8'))
     hash_hex = hash_obj.hexdigest()
@@ -3021,8 +3018,12 @@ async def handle_new_alert(alert: EvAlert):
             print(f"[HANDLE ALERT]    New: {alert.teams} - {alert.pick}")
             # Update all fields that may have changed (EV, odds, price, liquidity, etc.)
             # This ensures the frontend shows the latest data without creating duplicate alerts
+            incoming_filter = getattr(alert, "filter_name", "") or ""
+            keep_stricter_ev = _filter_min_sharp(existing_alert.get("filter_name")) > _filter_min_sharp(
+                incoming_filter
+            )
             updated = False
-            if alert.ev_percent != existing_alert.get('ev_percent', 0):
+            if alert.ev_percent != existing_alert.get('ev_percent', 0) and not keep_stricter_ev:
                 existing_alert['ev_percent'] = alert.ev_percent
                 updated = True
             if getattr(alert, 'liquidity', None) is not None and alert.liquidity != existing_alert.get('liquidity', 0):
@@ -3075,11 +3076,10 @@ async def handle_new_alert(alert: EvAlert):
             if existing_alert.get("status_detail"):
                 existing_alert["statusDetail"] = existing_alert["status_detail"]
             
-            # CRITICAL: Preserve filter_name - use existing if new alert doesn't have it, otherwise update
-            if hasattr(alert, 'filter_name') and alert.filter_name:
-                existing_alert['filter_name'] = alert.filter_name
+            # Keep the stricter filter label when two views hit the same card.
+            if incoming_filter and not keep_stricter_ev:
+                existing_alert['filter_name'] = incoming_filter
                 updated = True
-            # If new alert doesn't have filter_name, preserve the existing one (don't overwrite with None)
             
             # Emit update to frontend if anything changed
             if updated:
@@ -4365,12 +4365,19 @@ def run_monitor_loop():
             if alert_id in active_alerts:
                 # Update existing alert data
                 alert_data = active_alerts[alert_id]
-                alert_data['ev_percent'] = alert.ev_percent
-                alert_data['expected_profit'] = alert.expected_profit
+                incoming_filter = getattr(alert, "filter_name", "") or ""
+                keep_stricter_ev = _filter_min_sharp(alert_data.get("filter_name")) > _filter_min_sharp(
+                    incoming_filter
+                )
+                if not keep_stricter_ev:
+                    alert_data['ev_percent'] = alert.ev_percent
+                    alert_data['expected_profit'] = alert.expected_profit
+                    alert_data['fair_odds'] = alert.fair_odds
+                    if incoming_filter:
+                        alert_data['filter_name'] = incoming_filter
                 alert_data['liquidity'] = alert.liquidity
                 alert_data['odds'] = alert.odds
                 alert_data['book_price'] = alert.book_price
-                alert_data['fair_odds'] = alert.fair_odds
                 alert_data['display_books'] = getattr(alert, 'display_books', {})
                 alert_data['devig_books'] = getattr(alert, 'devig_books', [])
                 if hasattr(alert, 'strict_pass'):
@@ -4391,10 +4398,6 @@ def run_monitor_loop():
                     alert_data["statusDetail"] = alert_data["status_detail"]
                 # Update last_seen timestamp for stale alert detection
                 alert_data['last_seen'] = time.time()
-                # CRITICAL: Preserve filter_name - use existing if new alert doesn't have it, otherwise update
-                if hasattr(alert, 'filter_name') and alert.filter_name:
-                    alert_data['filter_name'] = alert.filter_name
-                # If new alert doesn't have filter_name, preserve the existing one (don't overwrite with None)
                 
                 # Update price if available
                 if hasattr(alert, 'price_cents') and alert.price_cents:
@@ -4807,6 +4810,73 @@ def is_unlisted_match_failed(row: Dict) -> bool:
     return False
 
 
+def alert_card_identity(row: Any) -> Tuple[str, str, str, str, str, str]:
+    """event+market+side+line+take. Two filters collapse; Kalshi and PLive do not."""
+    if not isinstance(row, dict):
+        row = {
+            "teams": getattr(row, "teams", ""),
+            "market_type": getattr(row, "market_type", ""),
+            "pick": getattr(row, "pick", ""),
+            "qualifier": getattr(row, "qualifier", None),
+            "line": getattr(row, "line", None),
+            "take_book": getattr(row, "take_book", "Kalshi"),
+        }
+    return (
+        str(row.get("teams") or "").strip().lower(),
+        str(row.get("market_type") or "").strip().lower(),
+        str(row.get("pick") or "").strip().lower(),
+        str(row.get("qualifier") if row.get("qualifier") is not None else ""),
+        str(row.get("line") if row.get("line") is not None else ""),
+        str(row.get("take_book") or "Kalshi").strip().lower(),
+    )
+
+
+def _filter_min_sharp(name: Any) -> int:
+    payload = saved_filters.get(str(name or "")) or {}
+    try:
+        return int((payload.get("devigFilter") or {}).get("minSharpBooks") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _filter_select_index(name: Any) -> int:
+    sel = list(selected_dashboard_filters or [])
+    key = str(name or "")
+    try:
+        return sel.index(key)
+    except ValueError:
+        return 999
+
+
+def prefer_alert_card(existing: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep the stricter filter (higher minSharp), else the selected-view order."""
+    e_s = _filter_min_sharp(existing.get("filter_name"))
+    i_s = _filter_min_sharp(incoming.get("filter_name"))
+    if i_s > e_s:
+        return incoming
+    if i_s < e_s:
+        return existing
+    if _filter_select_index(incoming.get("filter_name")) < _filter_select_index(existing.get("filter_name")):
+        return incoming
+    return existing
+
+
+def dedupe_listed_alert_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """One card per event+market+side+line+take_book across dashboard filters."""
+    by_id: Dict[Tuple[str, str, str, str, str, str], Dict[str, Any]] = {}
+    order: List[Tuple[str, str, str, str, str, str]] = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        ident = alert_card_identity(r)
+        if ident not in by_id:
+            by_id[ident] = r
+            order.append(ident)
+            continue
+        by_id[ident] = prefer_alert_card(by_id[ident], r)
+    return [by_id[i] for i in order]
+
+
 def listed_active_alerts(source=None):
     src = active_alerts if source is None else source
     if isinstance(src, dict):
@@ -4816,7 +4886,8 @@ def listed_active_alerts(source=None):
     out = [r for r in rows if not is_unlisted_match_failed(r)]
     floor = float(dashboard_min_ev or 0.0)
     # Zero is not a KEEP. PLive O/U still list only with honest EV>0.
-    return [r for r in out if is_plus_print_ev(r.get("ev_percent"), floor)]
+    plus = [r for r in out if is_plus_print_ev(r.get("ev_percent"), floor)]
+    return dedupe_listed_alert_rows(plus)
 
 
 def unmatched_alert_should_emit_new_alert(_alert_data=None) -> bool:

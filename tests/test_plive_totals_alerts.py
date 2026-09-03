@@ -22,7 +22,14 @@ DET_MIN_EID = 199295331
 PLIVE_OVER = 1.892857
 PLIVE_UNDER = 1.847458
 # Parser/live shape: hdp only (max/line are copied on emit). Matcher must still join.
-PLIVE_HDP_ONLY = {"hdp": 11.5, "over": PLIVE_OVER, "under": PLIVE_UNDER}
+PLIVE_HDP_ONLY = {
+    "hdp": 11.5,
+    "over": PLIVE_OVER,
+    "under": PLIVE_UNDER,
+    "plive_live": True,
+    "plive_market": 5,
+    "market_type": "game_total",
+}
 # Odds-API fair block the matcher actually reads — max/line, not hdp.
 ODDS_API_FAIR_11 = {"max": 11.5, "line": 11.5, "over": 1.80, "under": 1.94}
 TOTALS_11 = {"hdp": 11.5, "max": 11.5, "line": 11.5, "over": PLIVE_OVER, "under": PLIVE_UNDER}
@@ -43,7 +50,14 @@ def det_min_plive_totals_doc(*, include_kalshi: bool = False) -> dict:
                 "name": "Totals",
                 "odds": [
                     dict(PLIVE_HDP_ONLY),
-                    {"hdp": 12.5, "over": 2.47, "under": 1.502513},
+                    {
+                        "hdp": 12.5,
+                        "over": 2.47,
+                        "under": 1.502513,
+                        "plive_live": True,
+                        "plive_market": 5,
+                        "market_type": "game_total",
+                    },
                 ],
             }
         ],
@@ -284,29 +298,49 @@ def test_plive_take_over_under_alerts_without_kalshi_ticker():
 
 
 def test_ws_ml_only_update_keeps_totals_then_alert():
+    """Odds-API WS must not ingest PLive. Live Totals stay on the Pandora book."""
     store = OddsWsStore()
     eid = DET_MIN_EID
-    totals = {
-        "name": "Totals",
-        "odds": [dict(TOTALS_11), {"hdp": 12.5, "max": 12.5, "over": 2.47, "under": 1.502513}],
-    }
+    rec_totals = {"name": "Totals", "odds": [dict(ODDS_API_FAIR_11)]}
     store.apply_message(
         {
             "type": "created",
             "seq": 1,
             "id": eid,
+            "bookie": "FanDuel",
+            "markets": [
+                {"name": "ML", "odds": [{"home": 1.8, "away": 2.1}]},
+                {"name": "Spread", "odds": [{"hdp": -1.5, "home": 1.91, "away": 1.91}]},
+                rec_totals,
+            ],
+        }
+    )
+    store.apply_message(
+        {
+            "type": "created",
+            "seq": 2,
+            "id": eid,
             "bookie": "PLive",
             "markets": [
                 {"name": "ML", "odds": [{"home": 1.8, "away": 2.1}]},
                 {"name": "Spread", "odds": [{"hdp": -1.5, "home": 1.91, "away": 1.91}]},
-                totals,
+                {"name": "Totals", "odds": [dict(TOTALS_11)]},
             ],
         }
     )
     store.apply_message(
         {
             "type": "updated",
-            "seq": 2,
+            "seq": 3,
+            "id": eid,
+            "bookie": "FanDuel",
+            "markets": [{"name": "ML", "odds": [{"home": 1.75, "away": 2.15}]}],
+        }
+    )
+    store.apply_message(
+        {
+            "type": "updated",
+            "seq": 4,
             "id": eid,
             "bookie": "PLive",
             "markets": [{"name": "ML", "odds": [{"home": 1.75, "away": 2.15}]}],
@@ -316,9 +350,10 @@ def test_ws_ml_only_update_keeps_totals_then_alert():
     assert counts["totals"] >= 1
     assert counts["spread"] >= 1
     doc = store.merged_doc(eid)
-    assert any(m.get("name") == "Totals" for m in doc["bookmakers"]["PLive"])
-    pl_tot = next(m for m in doc["bookmakers"]["PLive"] if m.get("name") == "Totals")
-    row = next(r for r in pl_tot["odds"] if abs(float(r.get("hdp") or r.get("max")) - 11.5) < 1e-9)
+    assert "PLive" not in doc["bookmakers"]
+    assert any(m.get("name") == "Totals" for m in doc["bookmakers"]["FanDuel"])
+    row = dict(TOTALS_11)
+    row.update({"plive_live": True, "plive_market": 5, "market_type": "game_total"})
     fd = {"name": "Totals", "odds": [dict(ODDS_API_FAIR_11)]}
     assert _pick_matching_odds_row(fd, "Totals", row).get("max") == 11.5
     mon = _totals_monitor()
@@ -404,7 +439,16 @@ def test_merged_doc_after_ml_only_update_emits_over_card():
     doc["home"] = "Minnesota Twins"
     doc["away"] = "Detroit Tigers"
     doc["league"] = "MLB"
+    # PLive is local-only. Odds-API WS never stores it. Live coeffs attach here.
+    live_take = dict(take_ou)
+    live_take.update({"plive_live": True, "plive_market": 5, "market_type": "game_total"})
+    doc["bookmakers"]["PLive"] = [
+        {"name": "ML", "odds": [{**ml["odds"][0], "plive_live": True, "plive_market": 3}]},
+        {"name": "Spread", "odds": [{**spread["odds"][0], "plive_live": True, "plive_market": 6}]},
+        {"name": "Totals", "odds": [live_take]},
+    ]
     names = {bk: [m.get("name") for m in mk] for bk, mk in doc["bookmakers"].items()}
+    assert "PLive" not in store.merged_doc(eid)["bookmakers"]
     assert "Totals" in names["PLive"]
     assert "Spread" in names["PLive"]
     assert "Totals" in names["FanDuel"]
