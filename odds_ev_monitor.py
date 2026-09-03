@@ -547,9 +547,13 @@ def _odds_doc_has_kalshi_tradable_gameline(doc: Any) -> bool:
 
 def _numeric_close(a: Any, b: Any, tol: float = 1e-5) -> bool:
     try:
-        return abs(float(a) - float(b)) <= tol
+        fa, fb = float(a), float(b)
     except (TypeError, ValueError):
         return False
+    if abs(fa - fb) > max(tol, 0.05):
+        return False
+    # 1.75 must never join 1.8 / 2.0. Compare exact stored strikes only.
+    return abs(fa - fb) <= tol
 
 
 def _scan_strike_key(row: Optional[Dict[str, Any]], mname: str = "") -> Optional[float]:
@@ -1042,6 +1046,20 @@ def format_spread_qualifier(hdp: Optional[float]) -> Optional[str]:
     return f"{hf:+.1f}"
 
 
+def format_total_qualifier(line: Optional[float]) -> Optional[str]:
+    """Exact strike text. Asian quarters stay 1.75 — never ``.1f`` → 1.8."""
+    lf = _float_hdp(line)
+    if lf is None:
+        return None
+    fourths = lf * 4.0
+    if abs(fourths - round(fourths)) <= 1e-9:
+        q = round(fourths) / 4.0
+        if abs(q * 2.0 - round(q * 2.0)) <= 1e-9:
+            return f"{q:.1f}"
+        return f"{q:.2f}"
+    return f"{lf:g}"
+
+
 def parse_painted_handicap(qualifier: Any) -> Optional[float]:
     if qualifier is None or qualifier == "":
         return None
@@ -1074,10 +1092,11 @@ def _pick_qualifier_line_for_side(
     mname = (market_name or "").upper()
     if "TOTAL" in mname or "OVER" in mname or "UNDER" in mname or mname in ("OU", "O/U"):
         lf = total_line_value(row)
+        qual = format_total_qualifier(lf)
         if side == "over":
-            return "Over", (f"{lf:.1f}" if lf is not None else None), lf
+            return "Over", qual, lf
         if side == "under":
-            return "Under", (f"{lf:.1f}" if lf is not None else None), lf
+            return "Under", qual, lf
     if "SPREAD" in mname or "HANDICAP" in mname or "PUCK LINE" in mname or "PUCKLINE" in mname.replace(" ", ""):
         # Home-centric hdp. Away label+ticker is always -hdp.
         hf = side_signed_line(row, side)

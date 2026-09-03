@@ -63,6 +63,7 @@ from odds_ev_monitor import (
     _numeric_close,
     _pick_matching_odds_row,
     _pick_qualifier_line_for_side,
+    format_total_qualifier,
     apply_betmgm_ml_grid_consensus_fix,
     total_line_value,
 )
@@ -1274,11 +1275,7 @@ def live_odds_board_rows_from_bookmakers(
                 for p in prices.values()
             ):
                 continue
-            line_s = f"{line:g}" if float(line).is_integer() else f"{line:.1f}"
-            try:
-                line_s = f"{float(line):.1f}"
-            except (TypeError, ValueError):
-                line_s = str(line)
+            line_s = format_total_qualifier(line) or str(line)
             out.append(
                 _live_odds_finish_row(
                     **common,

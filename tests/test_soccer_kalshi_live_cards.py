@@ -21,7 +21,14 @@ from kalshi_public_feed import (
     sport_key_for_doc,
     _ml_row,
 )
-from odds_ev_monitor import OddsEVMonitor, is_synthetic_kxscan_ticker
+from odds_ev_monitor import (
+    OddsEVMonitor,
+    _numeric_close,
+    _pick_matching_odds_row,
+    _pick_qualifier_line_for_side,
+    format_total_qualifier,
+    is_synthetic_kxscan_ticker,
+)
 from plive_pandora import (
     PLIVE_LINE_SET,
     PliveStore,
@@ -458,6 +465,136 @@ def test_soccer_under_25_does_not_attach_to_35_45_or_425():
         assert by_line[lf]["over_am"] != 186
     owners = [r["line"] for r in ident if r.get("under_am") == 186]
     assert owners == [2.5]
+
+
+def test_kortrijk_under_175_prints_175_not_18():
+    """Kortrijk @ Anderlecht Under 1.75 stays 1.75. Never .1f → 1.8. Never join 1.8/2.0."""
+    store = PliveStore()
+    store.apply_meta(
+        "2201001",
+        {
+            "sportId": 5,
+            "home": "RSC Anderlecht",
+            "away": "KV Kortrijk",
+            "leagueName": "Belgium Jupiler League",
+            "ip": True,
+        },
+    )
+    under175 = american_to_decimal(186)
+    store.apply_message(
+        {
+            "isDiff": False,
+            "payload": {
+                "c": {
+                    "m": {
+                        "5": {
+                            "o": {
+                                "over_1.75": {0: 1.80, 1: 1.90},
+                                "under_1.75": {0: under175, 1: 2.10},
+                                "over_1.8": {0: 1.70, 1: 1.85},
+                                "under_1.8": {0: 2.20, 1: 2.40},
+                                "over_2.0": {0: 2.05, 1: 2.20},
+                                "under_2.0": {0: 1.75, 1: 1.90},
+                            }
+                        }
+                    }
+                }
+            },
+        },
+        event_name=f"live.main.{PLIVE_LINE_SET}.eventCoefficients.2201001",
+    )
+    ident = soccer_totals_identity_rows(store.markets_for_event("2201001"))
+    by_line = {round(float(r["line"]), 2): r for r in ident}
+    assert 1.75 in by_line
+    assert 1.8 not in by_line
+    assert by_line[1.75]["under_am"] == 186
+    owners = [r["line"] for r in ident if r.get("under_am") == 186]
+    assert owners == [1.75]
+
+    row_175 = {
+        "hdp": 1.75,
+        "max": 1.75,
+        "line": 1.75,
+        "over": 1.80,
+        "under": under175,
+        "plive_live": True,
+        "plive_market": 5,
+        "market_type": "game_total",
+    }
+    pick, qual, line_val = _pick_qualifier_line_for_side(
+        "RSC Anderlecht", "KV Kortrijk", "Totals", "under", row_175
+    )
+    assert pick == "Under"
+    assert qual == "1.75"
+    assert qual != "1.8"
+    assert float(line_val) == 1.75
+    assert format_total_qualifier(1.75) == "1.75"
+    assert format_total_qualifier(1.75) != "1.8"
+    assert format_total_qualifier(8.5) == "8.5"
+    assert format_total_qualifier(-3.5) == "-3.5" or format_total_qualifier(3.5) == "3.5"
+    assert _numeric_close(1.75, 1.8) is False
+    assert _numeric_close(1.75, 2.0) is False
+    mk = {
+        "name": "Totals",
+        "odds": [
+            row_175,
+            {"hdp": 1.8, "max": 1.8, "over": 1.70, "under": 2.20},
+            {"hdp": 2.0, "max": 2.0, "over": 2.05, "under": 1.75},
+        ],
+    }
+    hit = _pick_matching_odds_row(mk, "Totals", {"hdp": 1.75, "max": 1.75, "under": under175})
+    assert abs(float(hit["hdp"]) - 1.75) < 1e-9
+    assert _pick_matching_odds_row(mk, "Totals", {"hdp": 1.8, "max": 1.8}) != hit
+
+    mon = _soccer_mon()
+    # Same-sign plus pack as Al-Kholood Under 2.5 +186. A minus 1.72 pack
+    # is a sign-flip vs +186 and gets junked — that is not this bug.
+    # FanDuel 1.8 must not join the 1.75 take.
+    pack_over, pack_under = 1.55, 2.40
+    doc = {
+        "home": "RSC Anderlecht",
+        "away": "KV Kortrijk",
+        "sport": {"slug": "football"},
+        "league": {"name": "Belgium Jupiler League"},
+        "bookmakers": {
+            "PLive": [{"name": "Totals", "odds": [row_175]}],
+            "Betfair Exchange": [
+                {"name": "Totals", "odds": [{"max": 1.75, "over": pack_over, "under": pack_under}]}
+            ],
+            "Bet365": [
+                {"name": "Totals", "odds": [{"max": 1.75, "over": 1.56, "under": 2.38}]}
+            ],
+            "DraftKings": [
+                {"name": "Totals", "odds": [{"max": 1.75, "over": 1.54, "under": 2.42}]}
+            ],
+            "Polymarket": [
+                {"name": "Totals", "odds": [{"max": 1.75, "over": 1.57, "under": 2.36}]}
+            ],
+            "FanDuel": [{"name": "Totals", "odds": [{"max": 1.8, "over": 1.70, "under": 2.20}]}],
+        },
+    }
+    vb = {
+        "event": {
+            "home": "RSC Anderlecht",
+            "away": "KV Kortrijk",
+            "league": "Belgium Jupiler League",
+            "sport": {"slug": "football"},
+        },
+        "market": {"name": "Totals", **row_175},
+        "betSide": "under",
+        "bookmakerOdds": {"under": under175, "over": 1.80},
+        "_live_broad_scan": True,
+        "_ev_source": "plive_take",
+        "_take_only": "PLive",
+        "_canonical_kalshi_row": dict(row_175),
+    }
+    built = mon._value_bet_to_normalized_bet(vb, doc, take_book="PLive")
+    assert built is not None
+    assert built["selection"] == "Under"
+    assert built["qualifier"] == "1.75"
+    assert built["qualifier"] != "1.8"
+    assert float(built["line"]) == 1.75
+    assert built["autobet_allow"] is False
 
 
 def test_paper_kalshi_ticker_is_not_kxscan_and_not_executable():
