@@ -10,16 +10,26 @@ Handshake matches the public live UI at https://plive.becoms.co/live/ :
     2) subscribeSystemEvents {partnerId: 113}
     3) subscribe + getCache once for live.sports (catalog names) and
        live.main.<LINE_SET>.eventData (directory). live.events is dead.
-    4) For each live MLB eventId (sport 1, league 8) subscribe
-       eventCoefficients.{eventId} (click-in full book: run lines, team
-       totals, margins). Unsubscribe that room when the event is finished.
+    4) For each wanted live eventId subscribe eventCoefficients.{eventId}
+       (MLB sport 1 / league 8, plus soccer sport 5 and Top Soccer 220).
+       Unsubscribe that room when the event is finished.
 
 Do not scrape ``https://plive.becoms.co/live/?#!/event/{id}`` — the hash
 is a client-side route; ``{id}`` is the pandora event id. This is not a
 per-sport price socket. Bare connect is silent. No BetBCK. No cookies.
 
-MLB is catalog sport 1 (hash ``#!/sport/1``). ``#!/sport/220`` is Top Soccer.
-Trust the live.sports catalog over any old Selenium sport map.
+MLB is catalog sport 1 (hash ``#!/sport/1``). Soccer is native sport 5
+(``#!/sport/5``). ``#!/sport/220`` is the public-UI Top Soccer bucket.
+Both 5 and 220 ride the same ``eventData`` directory as ``s[5]`` /
+``s[220]`` — there is no extra sport-room subscribe. Trust the
+live.sports catalog over any old Selenium sport map.
+
+Mapping boundary: Odds-API event IDs already join Odds-API books to
+each other. PLive uses Pandora ids and needs a separate fixture join.
+Soccer matching is conservative (normalized league, same-orientation
+home+away tokens, start/live timing, stale-price age). Zero or two-plus
+hits emit no PLive markets (no EV). MLB still uses the looser
+swap-tolerant team matcher.
 
 Lines become ``bookmakers["PLive"]``. PLive is a betting / take venue
 (same role as Kalshi), not a sharp. Fair is the other pack.
@@ -32,9 +42,10 @@ import json
 import os
 import re
 import time
+import unicodedata
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
-from odds_api_client import _canonical_odds_api_bookmaker
+from odds_api_client import _canonical_odds_api_bookmaker, sport_slug_query_for_api
 
 PLIVE_BOOK_NAME = "PLive"
 PLIVE_ORIGIN = "https://plive.becoms.co"
@@ -48,8 +59,19 @@ PLIVE_LINE_SET = "U0VWU1NWUkJSMFU9"
 PLIVE_MLB_SPORT_ID = 1
 PLIVE_MLB_LEAGUE_ID = 8  # eventData path s[1][…][8] = MLB; not catalog sport 8 (Tennis)
 PLIVE_MLB_HASH = "#!/sport/1"
+PLIVE_SOCCER_SPORT_ID = 5
+PLIVE_SOCCER_HASH = "#!/sport/5"
 PLIVE_TOP_SOCCER_SPORT_ID = 220
 PLIVE_TOP_SOCCER_HASH = "#!/sport/220"
+# Native Soccer (5) plus the public-UI Top Soccer bucket (220). eventData is one
+# directory; both ids appear as s[5] and s[220]. Odds-API event ids do not join
+# PLive — PLive is a separate fixture join.
+DEFAULT_PLIVE_SPORT_IDS = (PLIVE_MLB_SPORT_ID, PLIVE_SOCCER_SPORT_ID, PLIVE_TOP_SOCCER_SPORT_ID)
+PLIVE_SOCCER_SPORT_IDS = (PLIVE_SOCCER_SPORT_ID, PLIVE_TOP_SOCCER_SPORT_ID)
+# Start-time join window when both sides publish a kickoff. 15 minutes.
+DEFAULT_PLIVE_START_TOLERANCE_SEC = 900
+# Reject PLive take prices older than this. Coeffs stamp ``coeff_updated_at``.
+DEFAULT_PLIVE_STALE_SEC = 90
 
 # Fallback only. Prefer names from the live.sports snapshot when present.
 # Do NOT use the old UnifiedBetting2 Selenium map (nfl=2 / nba=3) — that
@@ -140,15 +162,61 @@ def parse_event_hash(value: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+def plive_sport_ids() -> List[int]:
+    """Sports to keep from eventData. Default MLB (1) + Soccer (5) + Top Soccer (220).
+
+    ``PLIVE_SPORT_IDS`` is the explicit list. ``PLIVE_PAGE`` / ``#!/sport/5`` is
+    added to the default set so a soccer URL does not drop MLB. A single
+    ``PLIVE_SPORT_ID`` is not used as an exclusive filter.
+    """
+    raw_multi = (os.getenv("PLIVE_SPORT_IDS") or "").strip()
+    if raw_multi:
+        out: List[int] = []
+        seen: Set[int] = set()
+        for part in raw_multi.replace(";", ",").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                n = int(part)
+            except ValueError:
+                continue
+            if n not in seen:
+                seen.add(n)
+                out.append(n)
+        if out:
+            return out
+    ids = list(DEFAULT_PLIVE_SPORT_IDS)
+    hashed = parse_sport_hash((os.getenv("PLIVE_PAGE") or os.getenv("PLIVE_HASH") or "").strip())
+    if hashed is not None and hashed not in ids:
+        ids.append(hashed)
+    return ids
+
+
+def plive_soccer_sport_ids() -> Tuple[int, ...]:
+    """PLive catalog ids treated as soccer: native 5 and Top Soccer 220."""
+    wanted = set(plive_sport_ids())
+    return tuple(i for i in PLIVE_SOCCER_SPORT_IDS if i in wanted) or PLIVE_SOCCER_SPORT_IDS
+
+
 def plive_sport_id() -> int:
-    page = (os.getenv("PLIVE_PAGE") or os.getenv("PLIVE_HASH") or "").strip()
-    hashed = parse_sport_hash(page)
-    if hashed is not None:
-        return hashed
+    """Primary / status sport. First of ``plive_sport_ids()`` (MLB=1 by default)."""
+    ids = plive_sport_ids()
+    return int(ids[0]) if ids else PLIVE_MLB_SPORT_ID
+
+
+def plive_start_tolerance_sec() -> int:
     try:
-        return int(os.getenv("PLIVE_SPORT_ID", str(PLIVE_MLB_SPORT_ID)))
+        return max(0, int(os.getenv("PLIVE_START_TOLERANCE_SEC", str(DEFAULT_PLIVE_START_TOLERANCE_SEC))))
     except ValueError:
-        return PLIVE_MLB_SPORT_ID
+        return DEFAULT_PLIVE_START_TOLERANCE_SEC
+
+
+def plive_stale_sec() -> int:
+    try:
+        return max(1, int(os.getenv("PLIVE_STALE_SEC", str(DEFAULT_PLIVE_STALE_SEC))))
+    except ValueError:
+        return DEFAULT_PLIVE_STALE_SEC
 
 
 def plive_line_prefix() -> str:
@@ -469,12 +537,25 @@ def walk_event_data_tree(
                 if len(path) >= 2 and str(path[-2]).isdigit():
                     rec["leagueId"] = int(path[-2])
                 for extra in node[2:]:
+                    if isinstance(extra, (int, float)) and extra > 1_000_000_000:
+                        rec["start"] = int(extra)
+                        continue
                     if not isinstance(extra, dict):
                         continue
                     if extra.get("ip") is True:
                         rec["finished"] = False
+                        rec["ip"] = True
                     elif extra.get("ip") is False or extra.get("finished") is True:
                         rec["finished"] = True
+                    for lk in ("league", "leagueName", "competition", "name"):
+                        val = extra.get(lk)
+                        if isinstance(val, str) and val.strip():
+                            rec["leagueName"] = val.strip()
+                            break
+                    st = extra.get("start") or extra.get("startTime") or extra.get("date")
+                    unix = _parse_start_unix(st)
+                    if unix:
+                        rec["start"] = unix
                 yield eid, rec
         return
     if not isinstance(node, dict):
@@ -591,11 +672,259 @@ def event_id_from_channel(event_name: Optional[str]) -> Optional[str]:
     return None
 
 
+_TEAM_STOPWORDS = frozenset(
+    {
+        "fc",
+        "cf",
+        "club",
+        "sc",
+        "ac",
+        "afc",
+        "cfc",
+        "the",
+        "de",
+        "la",
+        "el",
+        "football",
+        "soccer",
+        "team",
+    }
+)
+_COMP_STOPWORDS = frozenset(
+    {
+        "the",
+        "league",
+        "liga",
+        "cup",
+        "division",
+        "conference",
+        "men",
+        "women",
+        "football",
+        "soccer",
+        "club",
+    }
+)
+
+
+def _strip_accents(s: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFKD", s or "") if not unicodedata.combining(c))
+
+
 def _norm_team(s: str) -> str:
-    t = (s or "").lower()
+    t = _strip_accents(s or "").lower()
     for ch in ("'", ".", ",", "-", "_"):
         t = t.replace(ch, " ")
+    t = t.replace("utd", "united")
     return " ".join(t.split())
+
+
+def _team_identity_tokens(s: str) -> Set[str]:
+    return {w for w in _norm_team(s).split() if w and w not in _TEAM_STOPWORDS}
+
+
+def _comp_identity_tokens(s: str) -> Set[str]:
+    t = _strip_accents(s or "").lower()
+    for ch in ("'", ".", ",", "-", "_"):
+        t = t.replace(ch, " ")
+    return {w for w in t.split() if w and w not in _COMP_STOPWORDS}
+
+
+def _parse_start_unix(raw: Any) -> Optional[int]:
+    """Odds-API ``date`` / ``startsAt`` / ``startTime`` / ``commence_time``, or unix seconds."""
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        n = float(raw)
+        if n > 1e12:
+            n = n / 1000.0
+        if n > 1_000_000_000:
+            return int(n)
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    try:
+        n = float(s)
+        if n > 1e12:
+            n = n / 1000.0
+        if n > 1_000_000_000:
+            return int(n)
+    except ValueError:
+        pass
+    iso = s.replace("Z", "+00:00")
+    try:
+        from datetime import datetime
+
+        dt = datetime.fromisoformat(iso)
+        return int(dt.timestamp())
+    except ValueError:
+        return None
+
+
+def odds_event_start_unix(doc: Optional[Dict[str, Any]]) -> Optional[int]:
+    ev = doc if isinstance(doc, dict) else {}
+    nest = ev.get("event") if isinstance(ev.get("event"), dict) else {}
+    for blob in (ev, nest):
+        if not isinstance(blob, dict):
+            continue
+        for key in ("startTime", "startsAt", "commence_time", "date", "start"):
+            unix = _parse_start_unix(blob.get(key))
+            if unix:
+                return unix
+    return None
+
+
+def plive_event_start_unix(ev: Optional[Dict[str, Any]]) -> Optional[int]:
+    if not isinstance(ev, dict):
+        return None
+    return _parse_start_unix(ev.get("start") or ev.get("startTime") or ev.get("date"))
+
+
+def _odds_doc_is_soccer(doc: Optional[Dict[str, Any]]) -> bool:
+    ev = doc if isinstance(doc, dict) else {}
+    sp = ev.get("sport") or ev.get("sport_slug")
+    slug = ""
+    if isinstance(sp, dict):
+        slug = str(sp.get("slug") or sp.get("name") or "")
+    else:
+        slug = str(sp or "")
+    q = sport_slug_query_for_api(slug)
+    return q == "football"
+
+
+def _odds_event_is_live(doc: Optional[Dict[str, Any]]) -> bool:
+    ev = doc if isinstance(doc, dict) else {}
+    if ev.get("live") is True or ev.get("isLive") is True or ev.get("ip") is True:
+        return True
+    st = str(ev.get("status") or ev.get("state") or "").lower().replace(" ", "")
+    return st in ("live", "inprogress", "inplay", "started", "running")
+
+
+def _plive_event_is_live(ev: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(ev, dict) or ev.get("finished") is True:
+        return False
+    if ev.get("ip") is True or ev.get("live") is True:
+        return True
+    return ev.get("finished") is False
+
+
+def _odds_league_name(doc: Optional[Dict[str, Any]]) -> str:
+    ev = doc if isinstance(doc, dict) else {}
+    lg = ev.get("league")
+    if isinstance(lg, dict):
+        return str(lg.get("name") or lg.get("slug") or "").strip()
+    if isinstance(lg, str):
+        return lg.strip()
+    return str(ev.get("league_name") or ev.get("leagueName") or "").strip()
+
+
+def leagues_compatible(plive_name: str, odds_name: str) -> Optional[bool]:
+    """True/False when both names exist. None if either side is missing (unknown)."""
+    pa, pb = _comp_identity_tokens(plive_name), _comp_identity_tokens(odds_name)
+    if not pa or not pb:
+        return None
+    if pa == pb:
+        return True
+    if pa <= pb or pb <= pa:
+        return True
+    na, nb = " ".join(sorted(pa)), " ".join(sorted(pb))
+    if na in nb or nb in na:
+        return True
+    return False
+
+
+def teams_same_orientation(odds_home: str, odds_away: str, plive_home: str, plive_away: str) -> bool:
+    """Both teams must match on the same home/away side. Never join a swap."""
+    th_o, ta_o = _team_identity_tokens(odds_home), _team_identity_tokens(odds_away)
+    th_p, ta_p = _team_identity_tokens(plive_home), _team_identity_tokens(plive_away)
+    if not th_o or not ta_o or not th_p or not ta_p:
+        return False
+    return th_o == th_p and ta_o == ta_p
+
+
+def timing_compatible(
+    plive_ev: Optional[Dict[str, Any]],
+    odds_doc: Optional[Dict[str, Any]],
+    *,
+    tolerance_sec: Optional[int] = None,
+) -> bool:
+    """Require a start-time window when both publish kickoff; else both must be live."""
+    if isinstance(plive_ev, dict) and plive_ev.get("finished") is True:
+        return False
+    tol = plive_start_tolerance_sec() if tolerance_sec is None else max(0, int(tolerance_sec))
+    p_start = plive_event_start_unix(plive_ev)
+    o_start = odds_event_start_unix(odds_doc)
+    if p_start and o_start:
+        return abs(p_start - o_start) <= tol
+    return bool(_plive_event_is_live(plive_ev) and _odds_event_is_live(odds_doc))
+
+
+def plive_price_is_stale(ev: Optional[Dict[str, Any]], *, now: Optional[float] = None) -> bool:
+    if not isinstance(ev, dict):
+        return True
+    stamp = ev.get("coeff_updated_at")
+    try:
+        ts = float(stamp)
+    except (TypeError, ValueError):
+        return True
+    if ts <= 0:
+        return True
+    age = (time.time() if now is None else float(now)) - ts
+    return age > float(plive_stale_sec())
+
+
+def match_plive_soccer_to_odds_doc(
+    plive_events: Dict[str, Dict[str, Any]],
+    odds_doc: Dict[str, Any],
+    *,
+    now: Optional[float] = None,
+) -> Optional[str]:
+    """Conservative soccer join. PLive ids ≠ Odds-API ids.
+
+    Requires soccer sport family (PLive 5 or 220), same-orientation home+away
+    token identity, non-conflicting competition, and start/live timing.
+    Team-name fuzzy-only is forbidden. Swapped home/away is forbidden.
+    Zero or two-plus survivors → None (no EV).
+    """
+    if not _odds_doc_is_soccer(odds_doc):
+        return None
+    home = str(odds_doc.get("home") or "")
+    away = str(odds_doc.get("away") or "")
+    if not home or not away:
+        return None
+    odds_league = _odds_league_name(odds_doc)
+    soccer_ids = set(plive_soccer_sport_ids())
+    hits: List[str] = []
+    for eid, ev in (plive_events or {}).items():
+        if not isinstance(ev, dict):
+            continue
+        sid = ev.get("sport_id")
+        try:
+            if sid is not None and int(sid) not in soccer_ids:
+                continue
+        except (TypeError, ValueError):
+            continue
+        if ev.get("finished") is True:
+            continue
+        ph = str(ev.get("home") or "")
+        pa = str(ev.get("away") or "")
+        if not teams_same_orientation(home, away, ph, pa):
+            continue
+        lg = str(ev.get("league_name") or ev.get("leagueName") or "")
+        compat = leagues_compatible(lg, odds_league)
+        if compat is False:
+            continue
+        if not timing_compatible(ev, odds_doc):
+            continue
+        if plive_price_is_stale(ev, now=now):
+            continue
+        hits.append(str(eid))
+    if len(hits) != 1:
+        return None
+    return hits[0]
 
 
 def _team_score(a: str, b: str) -> int:
@@ -718,6 +1047,7 @@ class PliveStore:
             if not is_team_total_market_id(m) and int(m) not in self.total_markets
         ) or _DEFAULT_SPREAD_MARKETS
         self.sport_id = plive_sport_id()
+        self.sport_ids = list(plive_sport_ids())
         self.sport_catalog: Dict[int, str] = dict(PLIVE_SPORT_CATALOG_FALLBACK)
 
     def _event(self, eid: str) -> Dict[str, Any]:
@@ -727,9 +1057,13 @@ class PliveStore:
                 "id": eid,
                 "sport_id": None,
                 "league_id": None,
+                "league_name": None,
+                "start": None,
+                "ip": None,
                 "finished": False,
                 "home": None,
                 "away": None,
+                "coeff_updated_at": 0.0,
                 "coeffs": {},  # (market, outcome) -> {index: value}
             }
             self.events[eid] = ev
@@ -756,14 +1090,14 @@ class PliveStore:
             )
 
     def apply_event_catalog(self, data: Any) -> List[str]:
-        """Ingest eventData directory. Sport 1 baseball; league 8 is MLB."""
+        """Ingest eventData directory. Keep MLB (1), Soccer (5), and Top Soccer (220)."""
         seen: List[str] = []
-        want = int(self.sport_id)
+        want = {int(x) for x in (self.sport_ids or [self.sport_id])}
         for eid, rec in iter_event_records(data):
             sid = rec.get("sportId") or rec.get("sport_id") or rec.get("si") or rec.get("s")
             if sid is not None:
                 try:
-                    if int(sid) != want:
+                    if int(sid) not in want:
                         continue
                 except (TypeError, ValueError):
                     continue
@@ -777,7 +1111,7 @@ class PliveStore:
                 sid = ev.get("sport_id")
                 if sid is not None:
                     try:
-                        if int(sid) != want:
+                        if int(sid) not in want:
                             continue
                     except (TypeError, ValueError):
                         pass
@@ -806,8 +1140,12 @@ class PliveStore:
                     ev["sport_id"] = 1
                 elif name in ("basketball", "nba"):
                     ev["sport_id"] = 2
-                elif name in ("football", "nfl"):
+                elif name in ("nfl", "american football", "americanfootball"):
                     ev["sport_id"] = 3
+                elif name == "top soccer":
+                    ev["sport_id"] = 220
+                elif name == "soccer":
+                    ev["sport_id"] = 5
         home, away = _teams_from_event(data)
         if home:
             ev["home"] = home
@@ -815,12 +1153,26 @@ class PliveStore:
             ev["away"] = away
         league = data.get("leagueId") or data.get("league_id") or data.get("li") or data.get("lg")
         if isinstance(league, dict):
+            lname = league.get("name") or league.get("slug")
+            if lname:
+                ev["league_name"] = str(lname)
             league = league.get("id") or league.get("leagueId")
         if league is not None:
             try:
                 ev["league_id"] = int(league)
             except (TypeError, ValueError):
-                pass
+                if isinstance(league, str) and league.strip():
+                    ev["league_name"] = league.strip()
+        for lk in ("leagueName", "league_name", "competition"):
+            raw = data.get(lk)
+            if isinstance(raw, str) and raw.strip():
+                ev["league_name"] = raw.strip()
+                break
+        unix = _parse_start_unix(data.get("start") or data.get("startTime") or data.get("date"))
+        if unix:
+            ev["start"] = unix
+        if data.get("ip") is True:
+            ev["ip"] = True
         if data.get("finished") is True:
             ev["finished"] = True
         elif data.get("finished") is False or data.get("ip") is True:
@@ -838,6 +1190,7 @@ class PliveStore:
             slots[1] = value
         else:
             slots[int(index)] = value
+        ev["coeff_updated_at"] = time.time()
         self.generation += 1
 
     def apply_coeff_tree(self, eid: str, tree: Any) -> None:
@@ -925,6 +1278,16 @@ class PliveStore:
     def mlb_events(self) -> Dict[str, Dict[str, Any]]:
         return {k: v for k, v in self.events.items() if self.is_mlb_event(v)}
 
+    def is_soccer_event(self, ev: Dict[str, Any]) -> bool:
+        sid = ev.get("sport_id")
+        try:
+            return int(sid) in set(plive_soccer_sport_ids())
+        except (TypeError, ValueError):
+            return False
+
+    def soccer_events(self) -> Dict[str, Dict[str, Any]]:
+        return {k: v for k, v in self.events.items() if self.is_soccer_event(v)}
+
     def wants_mlb_coeff(self, ev: Dict[str, Any]) -> bool:
         """Live MLB (league 8) only. MiLB on sport 1 stays out when league is set."""
         if ev.get("finished"):
@@ -938,6 +1301,14 @@ class PliveStore:
             return int(lg) == int(PLIVE_MLB_LEAGUE_ID)
         except (TypeError, ValueError):
             return True
+
+    def wants_coeff(self, ev: Dict[str, Any]) -> bool:
+        """MLB league-8 plus native soccer 5 and Top Soccer 220."""
+        if self.wants_mlb_coeff(ev):
+            return True
+        if ev.get("finished"):
+            return False
+        return self.is_soccer_event(ev)
 
     def markets_for_event(self, eid: str) -> List[Dict[str, Any]]:
         ev = self.events.get(str(eid))
@@ -1239,8 +1610,29 @@ class PlivePandoraFeed:
                 self.handle_payload(data, event_name)
 
     def markets_for_odds_event(self, doc: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Join PLive take prices onto an Odds-API event.
+
+        Odds-API event IDs already join its own books. PLive uses Pandora
+        ids. Soccer uses a separate conservative fixture join and never
+        emits markets when the match is missing, swapped, stale, or
+        ambiguous. MLB keeps the existing swap-tolerant matcher.
+        """
         home = str(doc.get("home") or "")
         away = str(doc.get("away") or "")
+        if _odds_doc_is_soccer(doc):
+            eid = match_plive_soccer_to_odds_doc(self.store.soccer_events(), doc)
+            if not eid:
+                return []
+            ev = self.store.events.get(str(eid)) or {}
+            if plive_price_is_stale(ev):
+                return []
+            return align_plive_markets_to_odds_fixture(
+                self.store.markets_for_event(eid),
+                plive_home=str(ev.get("home") or ""),
+                plive_away=str(ev.get("away") or ""),
+                odds_home=home,
+                odds_away=away,
+            )
         eid = match_plive_event_to_odds_doc(self.store.mlb_events(), home, away)
         if not eid:
             return []
@@ -1306,7 +1698,7 @@ class PlivePandoraFeed:
         for room in list(self._coeff_subscribed):
             eid = event_id_from_channel(room)
             ev = self.store.events.get(str(eid)) if eid else None
-            if ev is None or not self.store.wants_mlb_coeff(ev):
+            if ev is None or not self.store.wants_coeff(ev):
                 drop.append(room)
         return drop
 
@@ -1329,10 +1721,10 @@ class PlivePandoraFeed:
     async def _subscribe_mlb_coefficients(self, sio: Any) -> None:
         """Per-event click-in coeff rooms (full book: run lines, team totals, margins)."""
         await self._unsubscribe_finished_coefficients(sio)
-        want = int(self.store.sport_id)
+        want = list(self.store.sport_ids or [self.store.sport_id])
         new_rooms: List[str] = []
         for eid, ev in self.store.events.items():
-            if not self.store.wants_mlb_coeff(ev):
+            if not self.store.wants_coeff(ev):
                 continue
             room = coeff_room_for_event(str(eid))
             if room in self._coeff_subscribed:
@@ -1347,7 +1739,7 @@ class PlivePandoraFeed:
             try:
                 await sio.emit("subscribe", batch)
                 await sio.emit("getCache", batch)
-                print(f"[PLIVE] subscribed eventCoefficients for {len(batch)} events (sport {want})")
+                print(f"[PLIVE] subscribed eventCoefficients for {len(batch)} events (sports {want})")
             except Exception as ex:
                 print(f"[PLIVE] [WARN] coeff subscribe failed: {ex}")
 
@@ -1360,7 +1752,8 @@ class PlivePandoraFeed:
         print(
             f"[PLIVE] starting Pandora Socket.IO ({PLIVE_URL}) origin={PLIVE_ORIGIN} "
             f"partner={PLIVE_PARTNER_ID} flavor={PLIVE_FLAVOR} MLB {PLIVE_MLB_HASH} "
-            f"sportId={plive_sport_id()} (no login, no cookies)"
+            f"soccer {PLIVE_SOCCER_HASH}+{PLIVE_TOP_SOCCER_HASH} "
+            f"sportIds={plive_sport_ids()} (no login, no cookies)"
         )
 
     async def stop(self) -> None:

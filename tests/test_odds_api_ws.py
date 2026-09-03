@@ -67,6 +67,22 @@ def test_ws_wanted_defaults_true_when_key(monkeypatch):
     assert odds_api_ws_wanted() is False
 
 
+def test_unset_sports_is_multi_sport_no_league_pin(monkeypatch):
+    monkeypatch.delenv("ODDS_API_SPORTS", raising=False)
+    monkeypatch.delenv("ODDS_API_WS_SPORT", raising=False)
+    monkeypatch.delenv("ODDS_API_WS_SPORTS", raising=False)
+    monkeypatch.delenv("ODDS_API_WS_LEAGUES", raising=False)
+    monkeypatch.delenv("ODDS_API_WS_EVENT_IDS", raising=False)
+    monkeypatch.delenv("ODDS_API_WS_STATUS", raising=False)
+    assert mlb_ws_slice_active() is False
+    f = ws_filters_from_env()
+    assert f["sport"] == ["baseball", "football", "american-football"]
+    assert f["leagues"] == []
+    assert f["eventIds"] == []
+    assert f["status"] is None
+    assert f["markets"] == ["ML", "Spread", "Totals"]
+
+
 def test_mlb_ws_filters_prematch_and_live(monkeypatch):
     monkeypatch.setenv("ODDS_API_SPORTS", "baseball")
     monkeypatch.setenv("ODDS_API_LEAGUE_MLB", "usa-mlb")

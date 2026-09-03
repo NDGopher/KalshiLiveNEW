@@ -694,9 +694,18 @@ async def _diag_fetch_pregame_by_sports(client: Any, cap_per_sport: int) -> List
     return out
 
 
-def _league_matches_filter(league: str, leagues_filter: List[str]) -> bool:
-    """Map BookieBeats-style league ids to Odds-API.io league name substrings."""
+def _league_matches_filter(
+    league: str, leagues_filter: List[str], sport_slug: str = ""
+) -> bool:
+    """Map BookieBeats-style league ids to Odds-API.io league / sport slugs.
+
+    ``SOCCER_ALL`` accepts Odds-API sport slug ``football`` (soccer) so
+    leagues like Eredivisie are not dropped just because the name lacks
+    PREMIER/UEFA/MLS. ``FOOTBALL_ALL`` is American football (NFL + CFB);
+    ``NFL`` stays NFL-only. Do not treat soccer ``football`` as NFL.
+    """
     league_u = (league or "").upper()
+    slug = (sport_slug or "").lower().replace("_", "-")
     if not leagues_filter:
         return True
     for token in leagues_filter:
@@ -710,14 +719,39 @@ def _league_matches_filter(league: str, leagues_filter: List[str]) -> bool:
         elif t == "NCAAB":
             if any(x in league_u for x in ("NCAAB", "NCAA", "COLLEGE", "NCAAM", "DIVISION")):
                 return True
-        elif t in ("FOOTBALL_ALL", "NFL"):
+        elif t == "NFL":
             if "NFL" in league_u:
+                return True
+        elif t == "FOOTBALL_ALL":
+            if "NFL" in league_u:
+                return True
+            if any(x in league_u for x in ("NCAAF", "CFB")):
+                return True
+            if "FOOTBALL" in league_u and any(x in league_u for x in ("NCAA", "COLLEGE")):
+                return True
+            if slug in ("american-football", "americanfootball") and any(
+                x in league_u for x in ("NCAA", "COLLEGE", "NCAAF", "CFB")
+            ):
                 return True
         elif t in ("HOCKEY_ALL", "NHL"):
             if "NHL" in league_u:
                 return True
         elif t in ("SOCCER_ALL",):
-            if any(x in league_u for x in ("SOCCER", "PREMIER", "UEFA", "MLS", "LIGUE", "BUNDES", "SERIE A", "LA LIGA")):
+            if slug == "football":
+                return True
+            if any(
+                x in league_u
+                for x in (
+                    "SOCCER",
+                    "PREMIER",
+                    "UEFA",
+                    "MLS",
+                    "LIGUE",
+                    "BUNDES",
+                    "SERIE A",
+                    "LA LIGA",
+                )
+            ):
                 return True
         else:
             if t.replace("_", " ") in league_u or t in league_u:
@@ -2489,7 +2523,7 @@ class OddsEVMonitor:
             if not _event_odds_actionable(e):
                 continue
             lg = _league_str(e.get("league"))
-            if leagues_filter and not _league_matches_filter(lg, leagues_filter):
+            if leagues_filter and not _league_matches_filter(lg, leagues_filter, _sport_slug(e)):
                 continue
             b = _broad_scan_bucket(e) or _sport_slug(e).upper() or "OTHER"
             ne = dict(e)
@@ -2689,7 +2723,7 @@ class OddsEVMonitor:
                 continue
             ev_obj = vb.get("event") or {}
             league = _league_str(ev_obj.get("league"))
-            if not _league_matches_filter(league, leagues_filter):
+            if not _league_matches_filter(league, leagues_filter, _sport_slug(ev_obj)):
                 drops["league"] += 1
                 continue
             if mlb_nba_gate and not _mlb_nba_only(league):
@@ -3454,7 +3488,8 @@ class OddsEVMonitor:
         if ws_on:
             print(
                 "   WS-first: live lines from Odds-API.io WebSocket "
-                "(baseball / usa-mlb, prematch+live, ML/Spread/Totals). "
+                "(default baseball+football+american-football, no usa-mlb pin, "
+                "prematch+live, ML/Spread/Totals). "
                 "REST used for /events slate + resync only — not the hot /odds/multi loop."
             )
         else:
