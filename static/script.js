@@ -663,6 +663,17 @@ function isCardTakeBook(bookName, alert) {
     return normalizeBookKey(bookName) === tk;
 }
 
+/** Click-to-bet is Kalshi-only. PLive cards are display / take-venue, not Kalshi orders. */
+function canPlaceKalshiBet(alert) {
+    if (!alert) return false;
+    const ticker = String(alert.ticker || '');
+    if (!ticker || ticker.toUpperCase().startsWith('PLIVE')) return false;
+    if (cardTakeKey(alert) === 'plive') return false;
+    if (!alert.side) return false;
+    if (alert.match_failed) return false;
+    return true;
+}
+
 function parseAmericanOddsValue(value) {
     if (value == null || value === '' || value === 'N/A') return null;
     const n = parseInt(String(value).replace(/[+]/g, '').replace(/[−–—]/g, '-'), 10);
@@ -1002,6 +1013,7 @@ function createAlertCard(alert) {
         ${booksTableHtml}
         
         <div class="alert-betting-section">
+            ${canPlaceKalshiBet(alert) ? `
             <div class="bet-actions-bb">
                 <div class="bet-input-group-bb">
                     <input 
@@ -1028,6 +1040,7 @@ function createAlertCard(alert) {
                     </button>
                 ` : ''}
             </div>
+            ` : ''}
         </div>
         
         <div class="bet-status"></div>
@@ -1035,7 +1048,7 @@ function createAlertCard(alert) {
     
     // Add Enter key handler for bet input
     const input = card.querySelector('.bet-input-bb');
-    if (input) {
+    if (input && canPlaceKalshiBet(alert)) {
         input.addEventListener('keypress', (e) => {
             if (e.key === 'Enter') {
                 placeBet(alert.id, false);
@@ -1080,6 +1093,10 @@ async function placeBet(alertId, betMax) {
     const alert = alerts.get(String(alertId));
     if (!alert) {
         console.error('Alert not found:', alertId);
+        return;
+    }
+    if (!canPlaceKalshiBet(alert)) {
+        console.error('Refusing non-Kalshi or unmatched click-to-bet:', alertId);
         return;
     }
     
