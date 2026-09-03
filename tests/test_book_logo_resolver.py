@@ -58,6 +58,20 @@ def test_no_two_letter_substring_fallback():
     assert "substring" not in JS[start:end]
 
 
+def test_required_logo_pngs_exist():
+    """Stephen restored these. BFX/CZ text is the missing-file fallback. Do not delete."""
+    required = (
+        "logos/Bet365.png",
+        "logos/Betfair.png",
+        "logos/BetMGM.png",
+        "logos/Caesars.png",
+    )
+    for rel in required:
+        path = REPO / rel
+        assert path.is_file(), f"missing {rel}"
+        assert path.stat().st_size > 100, f"{rel} is empty"
+
+
 def test_logo_paths_are_named_files_not_two_letter():
     assert "'/logos/Bet365.png'" in JS
     assert "'/logos/Betfair.png'" in JS

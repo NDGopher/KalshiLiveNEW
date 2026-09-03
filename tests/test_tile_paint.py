@@ -312,3 +312,7 @@ def test_unique_logos():
     assert "substring(0, 2)" not in JS
     assert "'NoVig': '/logos/NV.png'" in JS
     assert "'BetMGM': '/logos/BetMGM.png'" in JS
+    for rel in ("logos/Bet365.png", "logos/Betfair.png", "logos/BetMGM.png", "logos/Caesars.png"):
+        path = REPO / rel
+        assert path.is_file(), f"missing {rel}"
+        assert path.stat().st_size > 100, f"{rel} is empty"
