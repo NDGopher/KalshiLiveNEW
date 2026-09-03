@@ -212,7 +212,9 @@ def test_card_generation_without_trading_credentials():
 
     mon = _cards_monitor()
     vbs = mon.live_scan_value_bets_from_docs(odds_by_id)
-    kalshi_vbs = [r for r in vbs if not r.get("_take_only")]
+    kalshi_vbs = [
+        r for r in vbs if not r.get("_take_only") or r.get("_take_only") == "Kalshi"
+    ]
     home_rows = [r for r in kalshi_vbs if r.get("betSide") == "home" and r.get("_scan_mname") == "ML"]
     assert home_rows, [ (r.get("_scan_mname"), r.get("betSide")) for r in kalshi_vbs ]
     href = (home_rows[0].get("bookmakerOdds") or {}).get("href")

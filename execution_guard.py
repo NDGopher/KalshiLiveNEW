@@ -67,7 +67,18 @@ def is_kalshi_ticker(ticker: Any) -> bool:
         return False
     if t.startswith("KXSCAN"):
         return False
+    if t.startswith("KALSHI|"):
+        return False
     return bool(_TICKER_RE.match(t)) and t.startswith("KX")
+
+
+def is_paper_kalshi_ticker(ticker: Any) -> bool:
+    """Display-only Kalshi identity. Never executable."""
+    return _upper(ticker).startswith("KALSHI|")
+
+
+def paper_kalshi_ticker(teams: Any, pick: Any, qualifier: Any) -> str:
+    return f"KALSHI|{teams}|{pick}|{qualifier}"
 
 
 def series_family(series: str) -> str:

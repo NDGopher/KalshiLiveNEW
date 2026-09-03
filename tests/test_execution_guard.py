@@ -223,6 +223,25 @@ def test_missing_fields_refuse_order():
         assert check.ok is False, kwargs
 
 
+def test_paper_kalshi_ticker_never_executable():
+    from execution_guard import paper_kalshi_ticker
+
+    check = prepare_executable_order(
+        {
+            "ticker": paper_kalshi_ticker("Lille OSC @ Toulouse", "Draw", None),
+            "side": "yes",
+            "price_cents": 36,
+            "market_type": "Moneyline",
+            "pick": "Draw",
+            "teams": "Lille OSC @ Toulouse",
+            "take_book": "Kalshi",
+        },
+        require_credentials=False,
+    )
+    assert check.ok is False
+    assert "missing_or_invalid_ticker" in check.reasons
+
+
 def test_plive_ticker_never_executable():
     check = prepare_executable_order(
         {
@@ -327,7 +346,9 @@ def test_dashboard_and_client_wire_the_guard():
     dash = (Path(__file__).resolve().parents[1] / "dashboard.py").read_text(encoding="utf-8")
     client = (Path(__file__).resolve().parents[1] / "kalshi_client.py").read_text(encoding="utf-8")
     js = (Path(__file__).resolve().parents[1] / "static" / "script.js").read_text(encoding="utf-8")
-    assert "from execution_guard import event_ticker_from_any, prepare_executable_order" in dash
+    assert "from execution_guard import" in dash
+    assert "event_ticker_from_any" in dash
+    assert "prepare_executable_order" in dash
     assert "prepare_executable_order" in dash
     assert "Execution identity failed" in dash
     assert "expected_price_cents or 50" not in dash

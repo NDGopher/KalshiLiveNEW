@@ -38,6 +38,7 @@ import aiohttp
 
 from auto_bet_sheet import live_context_from_event
 from ev_alert import EvAlert
+from execution_guard import is_kalshi_ticker, paper_kalshi_ticker
 from ev_calculator import (
     EVCalculator,
     LIVE_REC_POWER_MAX_AGE_SEC,
@@ -546,9 +547,13 @@ def _odds_doc_has_kalshi_tradable_gameline(doc: Any) -> bool:
 
 def _numeric_close(a: Any, b: Any, tol: float = 1e-5) -> bool:
     try:
-        return abs(float(a) - float(b)) <= tol
+        fa, fb = float(a), float(b)
     except (TypeError, ValueError):
         return False
+    if abs(fa - fb) > max(tol, 0.05):
+        return False
+    # 1.75 must never join 1.8 / 2.0. Compare exact stored strikes only.
+    return abs(fa - fb) <= tol
 
 
 def _scan_strike_key(row: Optional[Dict[str, Any]], mname: str = "") -> Optional[float]:
@@ -1041,6 +1046,20 @@ def format_spread_qualifier(hdp: Optional[float]) -> Optional[str]:
     return f"{hf:+.1f}"
 
 
+def format_total_qualifier(line: Optional[float]) -> Optional[str]:
+    """Exact strike text. Asian quarters stay 1.75 — never ``.1f`` → 1.8."""
+    lf = _float_hdp(line)
+    if lf is None:
+        return None
+    fourths = lf * 4.0
+    if abs(fourths - round(fourths)) <= 1e-9:
+        q = round(fourths) / 4.0
+        if abs(q * 2.0 - round(q * 2.0)) <= 1e-9:
+            return f"{q:.1f}"
+        return f"{q:.2f}"
+    return f"{lf:g}"
+
+
 def parse_painted_handicap(qualifier: Any) -> Optional[float]:
     if qualifier is None or qualifier == "":
         return None
@@ -1073,10 +1092,11 @@ def _pick_qualifier_line_for_side(
     mname = (market_name or "").upper()
     if "TOTAL" in mname or "OVER" in mname or "UNDER" in mname or mname in ("OU", "O/U"):
         lf = total_line_value(row)
+        qual = format_total_qualifier(lf)
         if side == "over":
-            return "Over", (f"{lf:.1f}" if lf is not None else None), lf
+            return "Over", qual, lf
         if side == "under":
-            return "Under", (f"{lf:.1f}" if lf is not None else None), lf
+            return "Under", qual, lf
     if "SPREAD" in mname or "HANDICAP" in mname or "PUCK LINE" in mname or "PUCKLINE" in mname.replace(" ", ""):
         # Home-centric hdp. Away label+ticker is always -hdp.
         hf = side_signed_line(row, side)
@@ -1585,6 +1605,14 @@ def _build_display_books_payload(
             # Never paint Odds-API / Kalshi-copied PLive. Missing live Draw
             # omits the tile; Kalshi-take can still print.
             continue
+        if _market_is_total(mname):
+            # Exact strike only. Kalshi soccer totals are halves (1.5 / 2.5).
+            # PLive 1.75 must not join Kalshi 1.5/2.5 or a rounded 1.8.
+            # Missing strike → omit the tile (Kalshi is not required on 1.75).
+            ref_ln = total_line_value(ref) if ref else None
+            row_ln = total_line_value(row)
+            if ref_ln is None or row_ln is None or not _numeric_close(ref_ln, row_ln):
+                continue
         d = _decimal_for_side(row, bet_side)
         if d and d > 1.0:
             am = decimal_to_american(float(d))
@@ -1696,6 +1724,8 @@ class OddsEVMonitor:
             selection = bet.get("selection", "")
             line = bet.get("line")
             qualifier = bet.get("qualifier")
+            if line is not None and "total" in str(market_type).lower():
+                qualifier = format_total_qualifier(line) or qualifier
             odds_american = bet.get("odds")
             odds_str = None
             if odds_american is not None:
@@ -2443,10 +2473,12 @@ class OddsEVMonitor:
                             "href": str(side_href),
                             "home": k_row.get("home"),
                             "away": k_row.get("away"),
+                            bet_side: dec,
                         }
                         for kk in ("hdp", "max", "line", "over", "under", "draw"):
                             if k_row.get(kk) is not None:
                                 bo[kk] = k_row.get(kk)
+                        bo[bet_side] = dec
                         scan_rows.append(
                             {
                                 "eventId": eid,
@@ -2457,29 +2489,17 @@ class OddsEVMonitor:
                                 "expectedValue": 0.0,
                                 "_live_broad_scan": True,
                                 "_ev_source": "live_event_scan",
+                                "_take_only": "Kalshi",
                                 "_scan_teams": teams,
                                 "_scan_mname": mname,
                                 "_canonical_kalshi_row": canon,
                             }
                         )
-            # Strike (hdp/max/line) is required. Kalshi Over 7 must not
-            # skip PLive Over 10.5 as a duplicate Over.
-            seen_sides = {
-                (
-                    str(r.get("eventId")),
-                    str(r.get("_scan_mname") or "").upper(),
-                    str(r.get("betSide") or "").lower(),
-                    _scan_strike_key(
-                        r.get("_canonical_kalshi_row") or r.get("market") or {},
-                        str(r.get("_scan_mname") or ""),
-                    ),
-                )
-                for r in scan_rows
-                if r.get("eventId") == eid
-                and extract_kalshi_ticker_from_href(
-                    ((r.get("bookmakerOdds") or {}) if isinstance(r.get("bookmakerOdds"), dict) else {}).get("href")
-                )
-            }
+            # Independent takes: a Kalshi ticker on this strike must not
+            # hide the live PLive coeff (Astros -3.5 PLive -164 / Kalshi -179).
+            # Strike is still on the key so Kalshi Over 7 never collapses
+            # PLive Over 10.5, and PLive does not emit the same row twice.
+            seen_sides: set = set()
             for mname, pl_mk in _kalshi_scan_gameline_markets(bks, "PLive"):
                 odds_rows = pl_mk.get("odds") or []
                 mu = mname.upper()
@@ -3037,17 +3057,9 @@ class OddsEVMonitor:
         take_only = vb.get("_take_only")
         if take_only and _norm_book(str(take_only)).lower() != take_canon.lower():
             return None
-        # href="" synthetic scan rows are not Kalshi-take cards. PLive O/U print
-        # without a Kalshi ticker — do not send them through find_submarket.
-        if (
-            take_canon.lower() == "kalshi"
-            and not ticker
-            and (
-                vb.get("_live_broad_scan")
-                or str(vb.get("_ev_source") or "") in ("live_event_scan", "plive_take")
-            )
-        ):
-            return None
+        # Missing ticker must not kill a priced Kalshi live-scan row.
+        # _take_only already keeps PLive-only rows off the Kalshi take.
+        # Paper cards print; execution_guard stays fail-closed without a real ticker.
         k_dec = _float_dec(bo.get(bet_side)) if isinstance(bo, dict) else None
         if take_canon.lower() == "plive":
             # Never start from the Kalshi value-bet decimal. Soccer Live must
@@ -3130,6 +3142,8 @@ class OddsEVMonitor:
 
         row_for_pick = k_row if k_row else f_row if f_row else market
         pick, qualifier, line_val = _pick_qualifier_line_for_side(home, away, mname, bet_side, row_for_pick)
+        if _market_is_total(mname) and line_val is not None:
+            qualifier = format_total_qualifier(line_val)
         if _market_is_spread(mname):
             actual_hdp = side_signed_line(row_for_pick, bet_side)
             if actual_hdp is not None:
@@ -3531,7 +3545,11 @@ class OddsEVMonitor:
             "kalshi_last_trade_ts": kalshi_trade_ts,
             "displayBooks": display,
             "devigBooks": devig_books,
-            "ticker": ticker if take_canon.lower() == "kalshi" else f"PLIVE|{teams}|{pick}|{qualifier}",
+            "ticker": (
+                f"PLIVE|{teams}|{pick}|{qualifier}"
+                if take_canon.lower() == "plive"
+                else (ticker if ticker and is_kalshi_ticker(ticker) else paper_kalshi_ticker(teams, pick, qualifier))
+            ),
             "strict_pass": strict_ok,
             "ev_source": (
                 "plive_take"
@@ -3539,7 +3557,7 @@ class OddsEVMonitor:
                 else str(vb.get("_ev_source") or "odds_api_value_bets")
             ),
             "take_book": take_canon,
-            "autobet_allow": bool(shape["allow"]),
+            "autobet_allow": bool(shape["allow"]) and take_canon.lower() == "kalshi" and bool(ticker and is_kalshi_ticker(ticker)),
         }
 
     async def check_for_new_alerts(self) -> None:

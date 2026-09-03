@@ -36,6 +36,18 @@ def _totals_row(line: float, over_am: int, under_am: int, **extra) -> dict:
     return row
 
 
+def _live_plive_totals_row(line: float, over_am: int, under_am: int, **extra) -> dict:
+    return _totals_row(
+        line,
+        over_am,
+        under_am,
+        plive_live=True,
+        plive_market=5,
+        market_type="game_total",
+        **extra,
+    )
+
+
 def yankees_angels_1_5_doc(*, plive_under: bool = True) -> dict:
     """Screenshot fixture: NYY @ LAA Total 1.5. Take is not best on either side."""
     plive = {"hdp": 1.5, "max": 1.5, "line": 1.5, "over": _am(-391)}
@@ -282,11 +294,11 @@ def _dual_strike_doc(*, plive_10_best: bool) -> dict:
     """Same game: O7 pack at −110 and O10.5 alt. Each strike is its own two-way."""
     rec_7 = _totals_row(7.0, -110, -110)
     rec_10 = _totals_row(10.5, -110, -110)
-    take_7 = _totals_row(7.0, 105, -120)
+    take_7 = _live_plive_totals_row(7.0, 105, -120)
     take_10 = (
-        _totals_row(10.5, 105, -120)
+        _live_plive_totals_row(10.5, 105, -120)
         if plive_10_best
-        else _totals_row(10.5, 378, -480)
+        else _live_plive_totals_row(10.5, 378, -480)
     )
     rec_10_fd = rec_10 if plive_10_best else _totals_row(10.5, 410, -520)
     return {
@@ -406,9 +418,9 @@ def test_scan_walks_every_totals_hdp_not_first_row_only():
                 {
                     "name": "Totals",
                     "odds": [
-                        _totals_row(7.0, 105, -120),
-                        _totals_row(10.5, 105, -120),
-                        _totals_row(11.5, 130, -160),
+                        _live_plive_totals_row(7.0, 105, -120),
+                        _live_plive_totals_row(10.5, 105, -120),
+                        _live_plive_totals_row(11.5, 130, -160),
                     ],
                 }
             ],
