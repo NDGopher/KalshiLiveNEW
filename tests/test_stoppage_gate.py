@@ -226,3 +226,53 @@ def test_parse_bet_to_alert_wires_clock_fields():
     assert alert.score == "14-11"
     assert alert.clock_running is False
     assert alert.scores == {"home": 14, "away": 11}
+
+
+def test_js_format_alert_game_status_and_paint_hooks():
+    import json
+    import shutil
+    import subprocess
+
+    js = (REPO / "static" / "script.js").read_text(encoding="utf-8")
+    css = (REPO / "static" / "style.css").read_text(encoding="utf-8")
+    assert ".alert-game-status" in css
+    assert "alert-game-status" in js
+    node = shutil.which("node")
+    if not node:
+        return
+    snippet = r"""
+const fs = require('fs');
+const src = fs.readFileSync('static/script.js','utf8');
+const start = src.indexOf('function formatAlertGameStatus');
+const end = src.indexOf('// Create alert card element');
+eval(src.slice(start, end));
+const nba = formatAlertGameStatus({
+  game_status: '14-11 · Q3 4:12 · STOPPED',
+  score: '14-11',
+  clock: {running: false, period: 3, playedSeconds: 252},
+});
+const soccer = formatAlertGameStatus({
+  game_status: "1-1 · 67' · 2nd half",
+});
+const mlb = formatAlertGameStatus({
+  score: '3-2',
+  status_detail: '7th inning',
+  clock: {running: false},
+});
+const missing = formatAlertGameStatus({teams: 'A @ B'});
+console.log(JSON.stringify({nba, soccer, mlb, missing}));
+"""
+    proc = subprocess.run(
+        [node, "-e", snippet],
+        cwd=str(REPO),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    data = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert data["nba"] == "14-11 · Q3 4:12 · STOPPED"
+    assert data["soccer"] == "1-1 · 67' · 2nd half"
+    assert data["mlb"] == "3-2 · 7th"
+    assert "STOPPED" not in data["mlb"]
+    assert data["missing"] == ""
