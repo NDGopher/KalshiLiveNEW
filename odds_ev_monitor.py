@@ -67,6 +67,7 @@ from odds_api_client import (
     odds_api_master_bookmakers,
     odds_api_sports_list,
     reset_shared_odds_client,
+    sport_slug_query_for_api,
     _norm_book,
 )
 from odds_api_ws import (
@@ -1115,6 +1116,9 @@ def _two_way_pick_opp_decimals(row: Dict[str, Any], bet_side: str) -> Optional[T
         return (d1, d2) if side == "over" else (d2, d1)
     if side == "draw":
         return None
+    if side in ("home", "away") and _ml_row_has_draw(row):
+        # Soccer 1X2 (and any ML with draw): never sister home vs away only.
+        return None
     dh = _float_dec(row.get("home"))
     da = _float_dec(row.get("away"))
     if not dh or not da or dh <= 1.0 or da <= 1.0:
@@ -1251,6 +1255,98 @@ def _three_way_draw_decimals(row: Dict[str, Any]) -> Optional[Tuple[float, float
     if dh and dd and da and min(dh, dd, da) > 1.0:
         return dh, dd, da
     return None
+
+
+def _ml_row_has_draw(row: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(row, dict):
+        return False
+    dd = _float_dec(row.get("draw"))
+    return dd is not None and dd > 1.0
+
+
+def _event_is_soccer(ev: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(ev, dict):
+        return False
+    slug = _sport_slug(ev) or str(ev.get("sport_slug") or "")
+    return sport_slug_query_for_api(slug) == "football"
+
+
+def gameline_totals_market_type(
+    *,
+    league: str = "",
+    ev: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Display label for game totals. Soccer → Total Goals; NBA → Total Points; else Total Runs."""
+    if _event_is_soccer(ev):
+        return "Total Goals"
+    lu = (league or "").upper()
+    if "NBA" in lu or "BASKETBALL" in lu or "NATIONAL BASKETBALL" in lu:
+        return "Total Points"
+    return "Total Runs"
+
+
+def gameline_market_type_for_alert(
+    mname: str,
+    *,
+    league: str = "",
+    ev: Optional[Dict[str, Any]] = None,
+) -> str:
+    if _market_is_total(mname):
+        return gameline_totals_market_type(league=league, ev=ev)
+    if _market_is_spread(mname):
+        return "Point Spread"
+    return "Moneyline"
+
+
+def _ml_market_is_three_way(
+    bks: Optional[Dict[str, Any]],
+    mname: str,
+    ref_row: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """True when any book exposes a draw price on this ML market (soccer 1X2)."""
+    if not _moneyline_market_name(mname) or not isinstance(bks, dict):
+        return False
+    for bk_key in bks:
+        mk = _find_market_block(_markets_list_for_book(bks, str(bk_key)), mname)
+        row = (
+            _sharp_row_for_market(mk or {}, mname, ref_row)
+            if ref_row
+            else (_first_odds_row(mk or {}) or {})
+        )
+        if _ml_row_has_draw(row):
+            return True
+    return False
+
+
+def _gameline_scan_sides(
+    mname: str,
+    row: Dict[str, Any],
+    *,
+    bks: Optional[Dict[str, Any]],
+) -> Tuple[str, ...]:
+    """Scan bet sides for live broad scan. Suppress 1X2 home/away when draw is priced."""
+    if _market_is_total(mname):
+        return ("over", "under")
+    if _moneyline_market_name(mname) and _ml_market_is_three_way(bks, mname, row):
+        return ("draw",) if _ml_row_has_draw(row) else ()
+    return ("home", "away")
+
+
+def _soccer_ml_home_away_suppressed(
+    ev: Optional[Dict[str, Any]],
+    mname: str,
+    bet_side: str,
+    bks: Optional[Dict[str, Any]],
+    ref_row: Optional[Dict[str, Any]],
+) -> bool:
+    """Soccer match-winner with draw on the wire: no two-way POWER on home/away."""
+    if bet_side not in ("home", "away"):
+        return False
+    if not _moneyline_market_name(mname):
+        return False
+    if not _event_is_soccer(ev):
+        return False
+    return _ml_market_is_three_way(bks, mname, ref_row)
 
 
 def _ml_median_dec(vals: List[Optional[float]]) -> Optional[float]:
@@ -1643,13 +1739,8 @@ class OddsEVMonitor:
         lv = doc.get("live", "")
         return f"{away} @ {home}  |  {league}  |  {dt}  |  status={st}  live={lv}"
 
-    def _market_type_label(self, mname: str, league: str) -> str:
-        u = (mname or "").upper()
-        if "TOTAL" in u or "OVER" in u or "UNDER" in u:
-            return "Total Points" if ("NBA" in league.upper() or "BASKETBALL" in league.upper()) else "Total Runs"
-        if "SPREAD" in u or "HANDICAP" in u:
-            return "Point Spread"
-        return "Moneyline"
+    def _market_type_label(self, mname: str, league: str, ev: Optional[Dict[str, Any]] = None) -> str:
+        return gameline_market_type_for_alert(mname, league=league, ev=ev)
 
     def _debug_row_would_alert_production(self, row: Dict[str, Any], league: str) -> Tuple[bool, float]:
         """
@@ -1853,7 +1944,7 @@ class OddsEVMonitor:
                 if not fd_rows:
                     continue
                 stats["markets_analyzed"] += 1
-                mlabel = self._market_type_label(mname, league)
+                mlabel = self._market_type_label(mname, league, doc)
 
                 mn_u = (mname or "").upper()
                 is_spread_m = "SPREAD" in mn_u or "HANDICAP" in mn_u
@@ -2245,12 +2336,11 @@ class OddsEVMonitor:
                 if not odds_rows:
                     continue
                 mu = mname.upper()
-                is_tot = "TOTAL" in mu or ("OVER" in mu and "UNDER" in mu) or mu in ("OU", "O/U")
-                sides: Tuple[str, ...] = ("over", "under") if is_tot else ("home", "away")
                 for ri, k_row in enumerate(odds_rows[:12]):
                     if not isinstance(k_row, dict):
                         continue
                     canon = dict(k_row)
+                    sides = _gameline_scan_sides(mname, k_row, bks=bks)
                     for bet_side in sides:
                         dec = _decimal_for_side(k_row, bet_side)
                         if dec is None or dec <= 1.0:
@@ -2308,11 +2398,10 @@ class OddsEVMonitor:
             for mname, pl_mk in _kalshi_scan_gameline_markets(bks, "PLive"):
                 odds_rows = pl_mk.get("odds") or []
                 mu = mname.upper()
-                is_tot = "TOTAL" in mu or ("OVER" in mu and "UNDER" in mu) or mu in ("OU", "O/U")
-                sides: Tuple[str, ...] = ("over", "under") if is_tot else ("home", "away")
                 for ri, p_row in enumerate(odds_rows[:12]):
                     if not isinstance(p_row, dict):
                         continue
+                    sides = _gameline_scan_sides(mname, p_row, bks=bks)
                     for bet_side in sides:
                         key = (str(eid), mu, bet_side, _scan_strike_key(p_row, mname))
                         if key in seen_sides:
@@ -2843,6 +2932,9 @@ class OddsEVMonitor:
         away = str(ev_obj.get("away") or "")
         teams = f"{away} @ {home}" if away and home else ""
         league = _league_str(ev_obj.get("league"))
+        ev_merged = dict(ev_obj)
+        if odds_doc and not ev_merged.get("sport"):
+            ev_merged["sport"] = odds_doc.get("sport")
         market = vb.get("market") or {}
         mname = str(market.get("name") or "")
         bet_side = str(vb.get("betSide") or "").lower()
@@ -2889,16 +2981,7 @@ class OddsEVMonitor:
                     print(f"[PIPELINE] Dropped: excluded category ({ex}) | {teams} | {mname}")
                 return None
 
-        market_type_bb = "Moneyline"
-        if "TOTAL" in mname.upper() or "OVER" in mname.upper() or "UNDER" in mname.upper():
-            market_type_bb = "Total Points" if ("NBA" in league.upper() or "BASKETBALL" in league.upper()) else "Total Runs"
-        elif (
-            "SPREAD" in mname.upper()
-            or "HANDICAP" in mname.upper()
-            or "PUCK LINE" in mname.upper()
-            or "PUCKLINE" in mname.upper().replace(" ", "")
-        ):
-            market_type_bb = "Point Spread"
+        market_type_bb = gameline_market_type_for_alert(mname, league=league, ev=ev_merged)
 
         canon_vb = vb.get("_canonical_kalshi_row") if isinstance(vb.get("_canonical_kalshi_row"), dict) else None
         k_row: Dict[str, Any] = {}
@@ -2932,6 +3015,14 @@ class OddsEVMonitor:
         elif take_canon.lower() == "plive":
             return None
         if k_dec is None or k_dec <= 1.0:
+            return None
+        ref_for_gate = canon_vb or (k_row if k_row else None)
+        if _soccer_ml_home_away_suppressed(ev_merged, mname, bet_side, bks, ref_for_gate):
+            if _diagnostic_mode():
+                print(
+                    f"[PIPELINE] Dropped: soccer 1X2 ML side={bet_side} "
+                    f"(draw on wire — no two-way POWER) | {teams} | {mname}"
+                )
             return None
         # Totals: missing sister = no card. Each strike (O7 / O10.5) is its own two-way.
         # Do not drop O10.5 because the board also has o7 — that is a valid alt.
