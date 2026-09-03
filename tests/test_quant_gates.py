@@ -64,7 +64,12 @@ def _totals_rec_book(name: str, over_am: int, under_am: int) -> dict:
 
 def _totals_take_doc(take_over: int, take_under: int = -125) -> dict:
     rec = _totals_ou_row(-110, -110)
-    take = _totals_ou_row(take_over, take_under)
+    take = {
+        **_totals_ou_row(take_over, take_under),
+        "plive_live": True,
+        "plive_market": 5,
+        "market_type": "game_total",
+    }
     return {
         "id": 199300003,
         "home": "Team Home",
@@ -80,7 +85,12 @@ def _totals_take_doc(take_over: int, take_under: int = -125) -> dict:
 
 
 def _totals_over_vb(take_over: int, take_under: int = -125) -> dict:
-    take = _totals_ou_row(take_over, take_under)
+    take = {
+        **_totals_ou_row(take_over, take_under),
+        "plive_live": True,
+        "plive_market": 5,
+        "market_type": "game_total",
+    }
     return {
         "event": {"home": "Team Home", "away": "Team Away", "league": "MLB"},
         "market": {"name": "Totals", **take},

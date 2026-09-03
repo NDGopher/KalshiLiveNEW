@@ -51,7 +51,12 @@ warnings.filterwarnings('ignore', message='.*SSL.*')
 from ev_alert import EvAlert
 from market_matcher import MarketMatcher
 from kalshi_client import KalshiClient
-from execution_guard import event_ticker_from_any, prepare_executable_order
+from execution_guard import (
+    event_ticker_from_any,
+    is_kalshi_ticker,
+    is_paper_kalshi_ticker,
+    prepare_executable_order,
+)
 from odds_ev_monitor import (
     OddsEVMonitor as EvMonitorImpl,
     _market_names_match,
@@ -2343,6 +2348,18 @@ def _is_plive_take_alert(alert: EvAlert) -> bool:
     return False
 
 
+def _is_paper_kalshi_alert(alert: EvAlert) -> bool:
+    """Kalshi-priced display card with no real ticker. Auto-bet stays fail-closed."""
+    if _is_plive_take_alert(alert):
+        return False
+    ticker = str(getattr(alert, "ticker", "") or "")
+    if is_paper_kalshi_ticker(ticker):
+        return True
+    if not ticker:
+        return False
+    return not is_kalshi_ticker(ticker) and not ticker.upper().startswith("KXSCAN")
+
+
 def _row_is_plive_take(row: Dict) -> bool:
     if not isinstance(row, dict):
         return False
@@ -2433,6 +2450,83 @@ async def handle_plive_take_display_alert(alert: EvAlert) -> None:
     socketio.emit("new_alert", alert_data)
 
 
+async def handle_kalshi_paper_display_alert(alert: EvAlert) -> None:
+    """Kalshi-take card with a live decimal but no real ticker. Display only. No auto-bet."""
+    global active_alerts, dashboard_min_ev, selected_dashboard_filters
+    filter_name = getattr(alert, "filter_name", "") or ""
+    if filter_name and filter_name not in selected_dashboard_filters:
+        print(f"[ALERT] SKIP: paper Kalshi from filter '{filter_name}' not in selected dashboard filters")
+        return
+    if not is_plus_print_ev(alert.ev_percent, dashboard_min_ev):
+        print(
+            f"❌ Filtered paper Kalshi (EV {alert.ev_percent:.2f}% not plus / min {dashboard_min_ev:.2f}%): "
+            f"{alert.teams} - {alert.pick}"
+        )
+        return
+    alert_id = create_alert_id(alert)
+    price_cents = getattr(alert, "price_cents", None)
+    if price_cents is None:
+        price_cents = market_matcher.parse_odds_to_price_cents(alert.odds)
+    american_odds = price_to_american_odds(price_cents) if price_cents else "N/A"
+    sharp_books = []
+    if filter_name and filter_name in saved_filters:
+        payload = saved_filters[filter_name]
+        sharp_books = list((payload.get("devigFilter") or {}).get("sharps") or [])
+    sharp_books = [
+        b for b in sharp_books if str(b).strip().lower() not in ("plive", "kalshi")
+    ]
+    ticker = getattr(alert, "ticker", None) or f"KALSHI|{alert.teams}|{alert.pick}|{alert.qualifier}"
+    alert_data = {
+        "id": alert_id,
+        "timestamp": alert.timestamp.isoformat(),
+        "market_type": alert.market_type,
+        "teams": alert.teams,
+        "pick": alert.pick,
+        "qualifier": alert.qualifier,
+        "ev_percent": alert.ev_percent,
+        "expected_profit": alert.expected_profit,
+        "odds": alert.odds,
+        "liquidity": alert.liquidity,
+        "book_price": american_odds,
+        "fair_odds": alert.fair_odds,
+        "ticker": ticker,
+        "event_ticker": None,
+        "side": None,
+        "price_cents": price_cents,
+        "american_odds": american_odds,
+        "match_confidence": 1.0,
+        "market_url": alert.market_url,
+        "display_books": getattr(alert, "display_books", {}),
+        "devig_books": [b for b in (getattr(alert, "devig_books", []) or []) if str(b).strip().lower() != "plive"],
+        "sharp_books": sharp_books,
+        "market_data": None,
+        "filter_name": filter_name,
+        "expiry": (datetime.now() + timedelta(seconds=30)).timestamp(),
+        "last_seen": time.time(),
+        "match_failed": False,
+        "strict_pass": getattr(alert, "strict_pass", True),
+        "autobet_allow": False,
+        "ev_source": getattr(alert, "ev_source", "live_event_scan"),
+        "take_book": "Kalshi",
+        "line": getattr(alert, "line", None),
+        "live": getattr(alert, "live", None),
+        "clock": getattr(alert, "clock", None),
+        "clock_running": getattr(alert, "clock_running", None),
+        "status_detail": getattr(alert, "status_detail", None) or "",
+        "statusDetail": getattr(alert, "status_detail", None) or getattr(alert, "statusDetail", None) or "",
+        "score": getattr(alert, "score", None) or "",
+        "scores": getattr(alert, "scores", None),
+        "game_status": getattr(alert, "game_status", None) or "",
+        "book_updated_at": getattr(alert, "book_updated_at", None) or {},
+        "kalshi_last_trade_ts": getattr(alert, "kalshi_last_trade_ts", None),
+    }
+    active_alerts[alert_id] = alert_data
+    print(
+        f"[ALERT] ✅ Emitting paper Kalshi take card: EV {alert.ev_percent:.2f}% | {alert.teams} - {alert.pick}"
+    )
+    socketio.emit("new_alert", alert_data)
+
+
 async def handle_new_alert(alert: EvAlert):
     """Handle a new alert from the Odds-API.io monitor — optimized for speed (async)."""
     global active_alerts, dashboard_min_ev, selected_dashboard_filters, selected_auto_bettor_filters, auto_bet_settings_by_filter, auto_bet_ev_min
@@ -2440,6 +2534,9 @@ async def handle_new_alert(alert: EvAlert):
     print(f"[HANDLE ALERT] 📥 Received alert | filter={filter_name} | {alert.teams} - {alert.pick} ({alert.ev_percent:.2f}% EV)")
     if _is_plive_take_alert(alert):
         await handle_plive_take_display_alert(alert)
+        return
+    if _is_paper_kalshi_alert(alert):
+        await handle_kalshi_paper_display_alert(alert)
         return
     
     # CRITICAL: Check if this is a high-EV alert that should trigger auto-bet

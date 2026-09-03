@@ -38,6 +38,7 @@ import aiohttp
 
 from auto_bet_sheet import live_context_from_event
 from ev_alert import EvAlert
+from execution_guard import is_kalshi_ticker, paper_kalshi_ticker
 from ev_calculator import (
     EVCalculator,
     LIVE_REC_POWER_MAX_AGE_SEC,
@@ -2443,10 +2444,12 @@ class OddsEVMonitor:
                             "href": str(side_href),
                             "home": k_row.get("home"),
                             "away": k_row.get("away"),
+                            bet_side: dec,
                         }
                         for kk in ("hdp", "max", "line", "over", "under", "draw"):
                             if k_row.get(kk) is not None:
                                 bo[kk] = k_row.get(kk)
+                        bo[bet_side] = dec
                         scan_rows.append(
                             {
                                 "eventId": eid,
@@ -2457,6 +2460,7 @@ class OddsEVMonitor:
                                 "expectedValue": 0.0,
                                 "_live_broad_scan": True,
                                 "_ev_source": "live_event_scan",
+                                "_take_only": "Kalshi",
                                 "_scan_teams": teams,
                                 "_scan_mname": mname,
                                 "_canonical_kalshi_row": canon,
@@ -3037,17 +3041,9 @@ class OddsEVMonitor:
         take_only = vb.get("_take_only")
         if take_only and _norm_book(str(take_only)).lower() != take_canon.lower():
             return None
-        # href="" synthetic scan rows are not Kalshi-take cards. PLive O/U print
-        # without a Kalshi ticker — do not send them through find_submarket.
-        if (
-            take_canon.lower() == "kalshi"
-            and not ticker
-            and (
-                vb.get("_live_broad_scan")
-                or str(vb.get("_ev_source") or "") in ("live_event_scan", "plive_take")
-            )
-        ):
-            return None
+        # Missing ticker must not kill a priced Kalshi live-scan row.
+        # _take_only already keeps PLive-only rows off the Kalshi take.
+        # Paper cards print; execution_guard stays fail-closed without a real ticker.
         k_dec = _float_dec(bo.get(bet_side)) if isinstance(bo, dict) else None
         if take_canon.lower() == "plive":
             # Never start from the Kalshi value-bet decimal. Soccer Live must
@@ -3531,7 +3527,11 @@ class OddsEVMonitor:
             "kalshi_last_trade_ts": kalshi_trade_ts,
             "displayBooks": display,
             "devigBooks": devig_books,
-            "ticker": ticker if take_canon.lower() == "kalshi" else f"PLIVE|{teams}|{pick}|{qualifier}",
+            "ticker": (
+                f"PLIVE|{teams}|{pick}|{qualifier}"
+                if take_canon.lower() == "plive"
+                else (ticker if ticker and is_kalshi_ticker(ticker) else paper_kalshi_ticker(teams, pick, qualifier))
+            ),
             "strict_pass": strict_ok,
             "ev_source": (
                 "plive_take"
@@ -3539,7 +3539,7 @@ class OddsEVMonitor:
                 else str(vb.get("_ev_source") or "odds_api_value_bets")
             ),
             "take_book": take_canon,
-            "autobet_allow": bool(shape["allow"]),
+            "autobet_allow": bool(shape["allow"]) and take_canon.lower() == "kalshi" and bool(ticker and is_kalshi_ticker(ticker)),
         }
 
     async def check_for_new_alerts(self) -> None:

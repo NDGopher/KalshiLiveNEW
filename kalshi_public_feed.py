@@ -23,12 +23,56 @@ from plive_pandora import _norm_team, _team_identity_tokens, odds_event_start_un
 
 KALSHI_BASE = "https://api.elections.kalshi.com"
 KALSHI_MARKETS_PATH = "/trade-api/v2/markets"
+KALSHI_SERIES_PATH = "/trade-api/v2/series"
 KALSHI_HREF = "https://kalshi.com/markets/{ticker}"
 
 CACHE_TTL_SEC = float(os.getenv("KALSHI_PUBLIC_FEED_TTL_SEC", "45") or "45")
+SOCCER_SERIES_TTL_SEC = float(os.getenv("KALSHI_SOCCER_SERIES_TTL_SEC", "300") or "300")
 START_TOLERANCE_SEC = int(os.getenv("KALSHI_PUBLIC_START_TOLERANCE_SEC", "64800") or "64800")
 MAX_PAGES = 8
 PAGE_LIMIT = 200
+
+_SOCCER_SERIES_STOP = frozenset(
+    {
+        "game",
+        "total",
+        "totals",
+        "goals",
+        "point",
+        "the",
+        "of",
+        "and",
+        "fc",
+        "soccer",
+        "football",
+        "winner",
+    }
+)
+_SOCCER_LEAGUE_HINTS = (
+    "soccer",
+    "premier league",
+    "la liga",
+    "laliga",
+    "ligue 1",
+    "ligue 2",
+    "serie a",
+    "bundesliga",
+    "scotland",
+    "scottish",
+    "eredivisie",
+    "mls",
+    "uefa",
+    "champions league",
+    "europa league",
+    "conference league",
+    "liga 1",
+    "serie b",
+    "jupiler",
+    "pro league",
+    "primeira",
+    "brasileiro",
+    "ligue1",
+)
 
 _MONTH = {
     "JAN": 1,
@@ -61,6 +105,7 @@ _SUFFIX_RE = re.compile(
 
 _cache_lock: Optional[asyncio.Lock] = None
 _cache: Dict[str, Any] = {"ts": 0.0, "key": "", "markets": []}
+_soccer_series_cache: Dict[str, Any] = {"ts": 0.0, "series": []}
 
 
 def _lock() -> asyncio.Lock:
@@ -94,6 +139,44 @@ def _league_blob(doc: Dict[str, Any]) -> str:
     return f"{league} {sport}".lower()
 
 
+def _sport_slug_from_doc(doc: Dict[str, Any]) -> str:
+    for key in ("sport", "sport_slug"):
+        sp = doc.get(key)
+        if isinstance(sp, dict):
+            return str(sp.get("slug") or sp.get("name") or "").lower()
+        if sp:
+            return str(sp).lower()
+    return ""
+
+
+def _doc_is_soccer(doc: Dict[str, Any], blob: str = "") -> bool:
+    """Odds-API soccer is sport=football. Never classify MLB/NFL as soccer."""
+    blob = blob or _league_blob(doc)
+    if any(
+        x in blob
+        for x in (
+            "american-football",
+            "american football",
+            "ncaaf",
+            "ncaab",
+            "college football",
+            "college basketball",
+        )
+    ):
+        return False
+    if any(x in blob for x in ("mlb", "baseball", "nba", "nhl", "wnba")):
+        return False
+    # Bare "nfl" after american-football check. "nfl" is not in soccer league names.
+    if re.search(r"\bnfl\b", blob):
+        return False
+    slug = _sport_slug_from_doc(doc).replace("_", "-")
+    if slug in ("american-football", "americanfootball"):
+        return False
+    if slug in ("football", "soccer"):
+        return True
+    return any(h in blob for h in _SOCCER_LEAGUE_HINTS)
+
+
 def sport_key_for_doc(doc: Dict[str, Any]) -> Optional[str]:
     blob = _league_blob(doc)
     if "ncaab" in blob or "ncaamb" in blob or "college basketball" in blob:
@@ -110,16 +193,144 @@ def sport_key_for_doc(doc: Dict[str, Any]) -> Optional[str]:
         return "nhl"
     if "nfl" in blob or "american-football" in blob or "american football" in blob:
         return "nfl"
+    if _doc_is_soccer(doc, blob):
+        return "soccer"
     return None
 
 
 def series_for_docs(docs: Union[Dict[Any, Dict[str, Any]], Sequence[Dict[str, Any]]]) -> List[str]:
     needed: Set[str] = set()
+    soccer_docs: List[Dict[str, Any]] = []
     for doc in _as_docs(docs):
         key = sport_key_for_doc(doc)
-        if key and key in _SERIES_BY_SPORT:
+        if key == "soccer":
+            soccer_docs.append(doc)
+        elif key and key in _SERIES_BY_SPORT:
             needed.update(_SERIES_BY_SPORT[key])
+    if soccer_docs:
+        cached = list(_soccer_series_cache.get("series") or [])
+        if cached:
+            needed.update(soccer_series_for_docs(soccer_docs, cached))
     return sorted(needed)
+
+
+def _series_match_tokens(text: str) -> Set[str]:
+    raw = re.findall(r"[a-z0-9]+", str(text or "").lower())
+    return {t for t in raw if t not in _SOCCER_SERIES_STOP and len(t) >= 2}
+
+
+def _tok_hit(left: str, right: str) -> bool:
+    if left == right:
+        return True
+    if len(left) >= 4 and len(right) >= 4:
+        if left.startswith(right) or right.startswith(left) or left[:4] == right[:4]:
+            return True
+    return False
+
+
+def _token_overlap_score(league_tokens: Set[str], series_tokens: Set[str]) -> int:
+    score = 0
+    used_b: Set[str] = set()
+    for a in league_tokens:
+        for b in series_tokens:
+            if b in used_b:
+                continue
+            if _tok_hit(a, b):
+                score += 1
+                used_b.add(b)
+                break
+    return score
+
+
+def is_soccer_gameline_series(ticker: str, tags: Any = None) -> bool:
+    """Public unsigned catalog: Soccer tag + GAME/TOTAL. No guessed tickers."""
+    t = str(ticker or "").strip().upper()
+    tag_list = tags if isinstance(tags, (list, tuple, set)) else ([tags] if tags else [])
+    tags_l = [str(x).lower() for x in tag_list]
+    if "soccer" not in tags_l:
+        return False
+    if any(bad in t for bad in ("TEAMTOTAL", "1HTOTAL", "2HTOTAL", "BTTS", "FTTS")):
+        return False
+    if "1H" in t or "2H" in t:
+        return False
+    return t.endswith("GAME") or t.endswith("TOTAL")
+
+
+def filter_soccer_gameline_catalog(series: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for s in series or []:
+        if not isinstance(s, dict):
+            continue
+        ticker = str(s.get("ticker") or s.get("series_ticker") or "").strip().upper()
+        if not ticker or ticker in seen:
+            continue
+        if not is_soccer_gameline_series(ticker, s.get("tags")):
+            continue
+        seen.add(ticker)
+        out.append({**s, "ticker": ticker})
+    return out
+
+
+def soccer_series_for_docs(
+    docs: Union[Dict[Any, Dict[str, Any]], Sequence[Dict[str, Any]]],
+    catalog: Sequence[Dict[str, Any]],
+) -> List[str]:
+    """League-matched GAME + TOTAL from a discovered catalog. Ambiguous → omit."""
+    filtered = filter_soccer_gameline_catalog(catalog)
+    if not filtered:
+        return []
+    needed: Set[str] = set()
+    for doc in _as_docs(docs):
+        if sport_key_for_doc(doc) != "soccer":
+            continue
+        league = ""
+        lg = doc.get("league")
+        if isinstance(lg, dict):
+            league = str(lg.get("name") or lg.get("slug") or "")
+        else:
+            league = str(lg or "")
+        picked = _unique_soccer_series_for_league(league, filtered)
+        needed.update(picked)
+    return sorted(needed)
+
+
+def _unique_soccer_series_for_league(
+    league: str, catalog: Sequence[Dict[str, Any]]
+) -> List[str]:
+    """Fail-closed: 0 or 2+ equally good GAME matches → no series for this league."""
+    league_tokens = _series_match_tokens(league)
+    if not league_tokens:
+        return []
+    scored: List[Tuple[int, str, str]] = []
+    for s in catalog:
+        ticker = str(s.get("ticker") or "").upper()
+        if not ticker.endswith("GAME"):
+            continue
+        title = str(s.get("title") or "")
+        series_tokens = _series_match_tokens(f"{ticker} {title}")
+        score = _token_overlap_score(league_tokens, series_tokens)
+        if score <= 0:
+            continue
+        if score == 1:
+            # Single short token (e.g. "liga") is not enough.
+            distinctive = any(len(t) >= 5 for t in league_tokens)
+            if not distinctive:
+                continue
+        scored.append((score, ticker, title))
+    if not scored:
+        return []
+    best = max(s[0] for s in scored)
+    winners = [t for sc, t, _title in scored if sc == best]
+    if len(set(winners)) != 1:
+        return []
+    game = winners[0]
+    out = [game]
+    prefix = game[: -len("GAME")] if game.endswith("GAME") else game
+    total = f"{prefix}TOTAL"
+    if any(str(s.get("ticker") or "").upper() == total for s in catalog):
+        out.append(total)
+    return out
 
 
 def _ask_prob(market: Dict[str, Any], side: str) -> Optional[float]:
@@ -266,8 +477,17 @@ def tokens_match_team(odds_name: str, kalshi_name: str) -> bool:
     return bool(a & b)
 
 
+def _is_draw_title(title: str) -> bool:
+    t = re.sub(r"[^a-z0-9]+", " ", str(title or "").lower()).strip()
+    if not t:
+        return False
+    return t in {"draw", "tie", "x", "draw tie", "tie draw"} or t.endswith(" draw")
+
+
 def assign_kalshi_title_side(title: str, odds_home: str, odds_away: str) -> Optional[str]:
-    """Map a Kalshi yes-title onto odds home/away. Ambiguous → None."""
+    """Map a Kalshi yes-title onto odds home/away/draw. Ambiguous → None."""
+    if _is_draw_title(title):
+        return "draw"
     hit_h = tokens_match_team(odds_home, title)
     hit_a = tokens_match_team(odds_away, title)
     if hit_h and hit_a:
@@ -296,7 +516,7 @@ def kalshi_already_priced(doc: Dict[str, Any]) -> bool:
         for row in mk.get("odds") or []:
             if not isinstance(row, dict):
                 continue
-            for side in ("home", "away", "over", "under"):
+            for side in ("home", "away", "draw", "over", "under"):
                 try:
                     if float(row.get(side)) > 1.0:
                         return True
@@ -376,7 +596,7 @@ def _unique_title_sides(
 ) -> Optional[Set[str]]:
     assigned: Set[str] = set()
     for title in titles:
-        if not title or str(title).lower() in ("over", "under"):
+        if not title or str(title).lower() in ("over", "under") or _is_draw_title(title):
             continue
         hit_h = tokens_match_team(home, title)
         hit_a = tokens_match_team(away, title)
@@ -433,30 +653,47 @@ def match_public_event(
 def _ml_row(
     markets: Sequence[Dict[str, Any]], home: str, away: str
 ) -> Optional[Dict[str, Any]]:
-    home_m = away_m = None
+    home_m = away_m = draw_m = None
     for m in markets:
         side = assign_kalshi_title_side(_title(m), home, away)
         if side == "home":
             home_m = m
         elif side == "away":
             away_m = m
-    if not home_m or not away_m:
-        return None
-    home_dec = decimal_from_ask(_ask_prob(home_m, "yes"))
-    away_dec = decimal_from_ask(_ask_prob(away_m, "yes"))
-    if home_dec is None or away_dec is None:
-        return None
-    ht = str(home_m.get("ticker") or "")
-    at = str(away_m.get("ticker") or "")
-    return {
-        "home": home_dec,
-        "away": away_dec,
-        "home_href": market_href(ht),
-        "away_href": market_href(at),
-        "href": market_href(ht),
-        "ticker": ht,
-        "away_ticker": at,
-    }
+        elif side == "draw":
+            draw_m = m
+    home_dec = decimal_from_ask(_ask_prob(home_m, "yes")) if home_m else None
+    away_dec = decimal_from_ask(_ask_prob(away_m, "yes")) if away_m else None
+    draw_dec = decimal_from_ask(_ask_prob(draw_m, "yes")) if draw_m else None
+    if home_dec is not None and away_dec is not None:
+        ht = str(home_m.get("ticker") or "")
+        at = str(away_m.get("ticker") or "")
+        row: Dict[str, Any] = {
+            "home": home_dec,
+            "away": away_dec,
+            "home_href": market_href(ht),
+            "away_href": market_href(at),
+            "href": market_href(ht),
+            "ticker": ht,
+            "away_ticker": at,
+        }
+        if draw_dec is not None:
+            dt = str(draw_m.get("ticker") or "")
+            row["draw"] = draw_dec
+            row["draw_href"] = market_href(dt)
+            row["draw_ticker"] = dt
+        return row
+    if draw_dec is not None:
+        dt = str(draw_m.get("ticker") or "")
+        href = market_href(dt)
+        return {
+            "draw": draw_dec,
+            "draw_href": href,
+            "draw_ticker": dt,
+            "href": href,
+            "ticker": dt,
+        }
+    return None
 
 
 def _spread_row(market: Dict[str, Any], home: str, away: str) -> Optional[Dict[str, Any]]:
@@ -632,12 +869,74 @@ async def fetch_open_series_markets(
     return markets
 
 
+async def fetch_soccer_series_catalog(
+    *,
+    session: Any = None,
+) -> List[Dict[str, Any]]:
+    """Unsigned GET /series. Keep real Soccer GAME/TOTAL tickers only."""
+    now = time.time()
+    async with _lock():
+        if (now - float(_soccer_series_cache.get("ts") or 0)) < SOCCER_SERIES_TTL_SEC:
+            return list(_soccer_series_cache.get("series") or [])
+
+    import aiohttp
+
+    own_session = session is None
+    if own_session:
+        session = aiohttp.ClientSession()
+    raw: List[Dict[str, Any]] = []
+    try:
+        cursor = None
+        for _page in range(80):
+            params: Dict[str, Any] = {"limit": 1000}
+            if cursor:
+                params["cursor"] = cursor
+            try:
+                async with session.get(
+                    f"{KALSHI_BASE}{KALSHI_SERIES_PATH}",
+                    params=params,
+                ) as resp:
+                    if resp.status == 429:
+                        await asyncio.sleep(2.0)
+                        continue
+                    if resp.status != 200:
+                        print(f"[KALSHI PUBLIC] series list status={resp.status}")
+                        break
+                    data = await resp.json()
+            except Exception as ex:
+                print(f"[KALSHI PUBLIC] series list failed: {ex}")
+                break
+            page = data.get("series") or []
+            for s in page:
+                if isinstance(s, dict):
+                    raw.append(s)
+            cursor = data.get("cursor") or None
+            if not cursor:
+                break
+            await asyncio.sleep(0.15)
+    finally:
+        if own_session:
+            await session.close()
+
+    filtered = filter_soccer_gameline_catalog(raw)
+    async with _lock():
+        _soccer_series_cache["ts"] = time.time()
+        _soccer_series_cache["series"] = filtered
+    return list(filtered)
+
+
 async def attach_public_kalshi_to_docs(
     docs: Union[Dict[Any, Dict[str, Any]], Sequence[Dict[str, Any]]],
     markets: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> int:
     """Attach public Kalshi take lines. Fetches when ``markets`` is omitted."""
     if markets is None:
+        soccer_docs = [d for d in _as_docs(docs) if sport_key_for_doc(d) == "soccer"]
+        if soccer_docs and not (_soccer_series_cache.get("series")):
+            try:
+                await fetch_soccer_series_catalog()
+            except Exception as ex:
+                print(f"[KALSHI PUBLIC] soccer series catalog failed: {ex}")
         series = series_for_docs(docs)
         if not series:
             return 0
