@@ -94,6 +94,8 @@ def _merge_odds_multi_by_event_id(
         assert isinstance(tgt_bks, dict)
         for raw_k, v in bks_in.items():
             ck = _canonical_odds_api_bookmaker(str(raw_k))
+            if is_local_only_bookmaker(ck):
+                continue
             tgt_bks[ck] = v
     out = list(by_id.values())
     if id_order:

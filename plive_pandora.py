@@ -104,10 +104,11 @@ _EVENT_HASH_RE = re.compile(r"#!?/event/(\d+)", re.I)
 #   /c/m/{market}/o/{outcome}/{index}
 # Market 6 run line: each outcome is a HOME handicap. [idx0, idx1] is a
 # 2-way pair (~7% hold), NOT [money price, decimal]. Both slots are decimals.
-# Market 3 = Game Winner ML. idx1 is the public-UI decimal. Do not treat
-# [idx0, idx1] as a 2-way pair. idx0 is not the take price. Live market 3
-# replaces stale Odds-API PLive ML. Markets 10/9/1 are not Game Winner
-# (first-5 / other) and must not paint a ML card.
+# Market 3 = Game Winner ML (2-way home/away). idx1 is the public-UI decimal
+# on MLB. Do not treat [idx0, idx1] as a 2-way pair. idx0 is not the MLB take.
+# Soccer Draw is NOT market 3. 1X2 Draw is a different market (often market 1
+# outcome X). Board Draw take is idx0 — never Kalshi, never Odds-API PLive.
+# Markets 10/9/1 are not Game Winner on MLB (first-5 / other).
 # Market 5 = game totals. 7/8 = team totals (click-in only) — never on Spread.
 # Soccer totals are not MLB market-3 idx1 and not a market-6 [idx0, idx1]
 # home/away pair. Strike / market identity is the outcome key only
@@ -126,6 +127,9 @@ _DEFAULT_TOTAL_MARKETS = (5,)
 _TEAM_TOTAL_MARKETS = (7, 8)
 PLIVE_RUN_LINE_MARKET = 6
 PLIVE_GAME_TOTAL_MARKET = 5
+# Soccer match-result 1X2. MLB market 1 is first-5 and must not paint ML.
+_DEFAULT_SOCCER_1X2_MARKETS = (1,)
+_SOCCER_DRAW_OUTCOMES = frozenset({"x", "draw", "d", "tie", "n"})
 
 
 def _env_bool(name: str, default: str = "false") -> bool:
@@ -491,6 +495,35 @@ def is_run_line_spread_row(row: Any) -> bool:
     return home > 1.0 and away > 1.0
 
 
+def mark_live_plive_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Stamp a row as a live Pandora eventCoefficients price. Never Odds-API / Kalshi."""
+    row["plive_live"] = True
+    return row
+
+
+def is_live_plive_row(row: Any) -> bool:
+    """True only for a live eventCoefficients row. Odds-API PLive overlay fails."""
+    if not isinstance(row, dict):
+        return False
+    if row.get("plive_live") is True:
+        return True
+    mk = row.get("plive_market")
+    if mk is None:
+        return False
+    try:
+        int(mk)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _market_is_live_plive(market: Any) -> bool:
+    if not isinstance(market, dict):
+        return False
+    rows = [r for r in (market.get("odds") or []) if isinstance(r, dict)]
+    return bool(rows) and all(is_live_plive_row(r) for r in rows)
+
+
 def sanitize_plive_markets(markets: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
     """Drop team-total rows from Spread / game Totals before they hit a tile."""
     out: List[Dict[str, Any]] = []
@@ -583,6 +616,23 @@ _SOCCER_TOTAL_OUTCOME_RE = re.compile(
     r"^(?:(?P<side>over|under|o|u)[\s_\-/]*)?(?P<line>\d+(?:\.\d+)?)(?:[\s_\-/]*(?P<side2>over|under|o|u))?$",
     re.I,
 )
+
+
+def parse_soccer_1x2_outcome(outcome: Any) -> Optional[str]:
+    """Soccer 1X2 side from the outcome key. Draw is X — not market-3 home/away."""
+    oc = str(outcome or "").strip().lower()
+    if oc in ("1", "home", "h"):
+        return "home"
+    if oc in ("2", "away", "a"):
+        return "away"
+    if oc in _SOCCER_DRAW_OUTCOMES:
+        return "draw"
+    return None
+
+
+def soccer_1x2_draw_take_decimal(slots: Any) -> Optional[float]:
+    """Board Draw take is idx0. Never idx1 (MLB Game Winner) and never Kalshi."""
+    return _slot_decimal(slots, 0)
 
 
 def parse_soccer_total_outcome(outcome: Any) -> Tuple[Optional[float], Optional[str]]:
@@ -1192,23 +1242,26 @@ def merge_plive_market_lists(
     existing: Optional[List[Dict[str, Any]]],
     incoming: Optional[List[Dict[str, Any]]],
 ) -> List[Dict[str, Any]]:
-    """Live market-3 Game Winner replaces Odds-API / stale PLive ML. Overlay Spread/Totals.
+    """Live coeffs replace Odds-API / stale PLive. Never keep an overlay row.
 
-    Soccer Odds-API PLive may be named ``Total Goals`` while live coeffs emit
-    ``Totals``. Keep one totals family so the dashboard and pipeline log
-    cannot read two different PLive total blocks for the same event.
+    Odds-API PLive (no ``plive_live`` / ``plive_market``) is dropped. Incoming
+    live families replace the same family. Empty incoming is a drop, not a keep.
     """
+    incoming = sanitize_plive_markets(incoming)
+    if not incoming:
+        return []
+    existing = [m for m in (existing or []) if _market_is_live_plive(m)]
     incoming_ml = any(
-        isinstance(m, dict) and str(m.get("name")) == "ML" for m in (incoming or [])
+        isinstance(m, dict) and str(m.get("name")) == "ML" for m in incoming
     )
     incoming_totals = any(
-        isinstance(m, dict) and is_game_totals_market_name(m.get("name")) for m in (incoming or [])
+        isinstance(m, dict) and is_game_totals_market_name(m.get("name")) for m in incoming
     )
     incoming_spread = any(
-        isinstance(m, dict) and str(m.get("name")) == "Spread" for m in (incoming or [])
+        isinstance(m, dict) and str(m.get("name")) == "Spread" for m in incoming
     )
     by_name: Dict[str, Dict[str, Any]] = {}
-    for m in existing or []:
+    for m in existing:
         if not isinstance(m, dict) or not m.get("name"):
             continue
         name = str(m.get("name"))
@@ -1219,7 +1272,7 @@ def merge_plive_market_lists(
         if incoming_spread and name == "Spread":
             continue
         by_name[name] = m
-    for m in incoming or []:
+    for m in incoming:
         if not isinstance(m, dict) or not m.get("name"):
             continue
         name = str(m.get("name"))
@@ -1594,7 +1647,10 @@ class PliveStore:
     ) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
 
-        # Game Winner (market 3): outcomes 1/home vs 2/away. idx1 only.
+        # Game Winner (market 3): outcomes 1/home vs 2/away. idx1 only on MLB.
+        # Soccer Draw is a different 1X2 market — idx0 take, never Kalshi.
+        home = away = None
+        ml_mk = None
         for mk in self.ml_markets:
             if int(mk) in _TEAM_TOTAL_MARKETS or int(mk) in self.total_markets:
                 continue
@@ -1607,26 +1663,47 @@ class PliveStore:
                 dec = _ml_decimal_from_slot(slots) if int(mk) == PLIVE_ML_MARKET else _decimal_from_slot(slots)
                 if dec is None:
                     continue
+                side = parse_soccer_1x2_outcome(outcome) if soccer else None
                 oc = str(outcome).lower()
-                if oc in ("1", "home", "h"):
+                if oc in ("1", "home", "h") or side == "home":
                     home = dec
-                elif oc in ("2", "away", "a"):
+                elif oc in ("2", "away", "a") or side == "away":
                     away = dec
             if home and away:
-                out.append(
-                    {
-                        "name": "ML",
-                        "odds": [
-                            {
-                                "home": home,
-                                "away": away,
-                                "plive_market": int(mk),
-                                "market_type": "game_winner",
-                            }
-                        ],
-                    }
-                )
+                ml_mk = int(mk)
                 break
+        draw_dec = draw_mk = None
+        if soccer:
+            draw_dec, draw_mk = self._soccer_draw_from_coeffs(coeffs)
+        if home and away:
+            ml_row = mark_live_plive_row(
+                {
+                    "home": home,
+                    "away": away,
+                    "plive_market": int(ml_mk or PLIVE_ML_MARKET),
+                    "market_type": "game_winner",
+                }
+            )
+            if draw_dec:
+                ml_row["draw"] = draw_dec
+                ml_row["plive_draw_market"] = draw_mk
+            out.append({"name": "ML", "odds": [ml_row]})
+        elif soccer and draw_dec:
+            out.append(
+                {
+                    "name": "ML",
+                    "odds": [
+                        mark_live_plive_row(
+                            {
+                                "draw": draw_dec,
+                                "plive_market": int(draw_mk or 1),
+                                "plive_draw_market": draw_mk,
+                                "market_type": "soccer_1x2_draw",
+                            }
+                        )
+                    ],
+                }
+            )
 
         # Run line only (market 6). Team totals 7/8 and game totals 5 never land here.
         spread_rows: List[Dict[str, Any]] = []
@@ -1660,14 +1737,16 @@ class PliveStore:
                 by_line[float(line)] = {"home": home_dec, "away": opp}
             for line, sides in by_line.items():
                 spread_rows.append(
-                    {
-                        "hdp": line,
-                        "home": sides["home"],
-                        "away": sides["away"],
-                        "line_style": "american",
-                        "plive_market": int(mk),
-                        "market_type": "run_line",
-                    }
+                    mark_live_plive_row(
+                        {
+                            "hdp": line,
+                            "home": sides["home"],
+                            "away": sides["away"],
+                            "line_style": "american",
+                            "plive_market": int(mk),
+                            "market_type": "run_line",
+                        }
+                    )
                 )
             if spread_rows:
                 break
@@ -1715,15 +1794,17 @@ class PliveStore:
                 for line, sides in by_line.items():
                     if "over" in sides and "under" in sides:
                         total_rows.append(
-                            {
-                                "hdp": line,
-                                "max": line,
-                                "line": line,
-                                "over": sides["over"],
-                                "under": sides["under"],
-                                "plive_market": int(mk),
-                                "market_type": "game_total",
-                            }
+                            mark_live_plive_row(
+                                {
+                                    "hdp": line,
+                                    "max": line,
+                                    "line": line,
+                                    "over": sides["over"],
+                                    "under": sides["under"],
+                                    "plive_market": int(mk),
+                                    "market_type": "game_total",
+                                }
+                            )
                         )
                 if total_rows:
                     break
@@ -1816,17 +1897,55 @@ class PliveStore:
             if "over" not in sides or "under" not in sides:
                 continue
             rows.append(
-                {
-                    "hdp": line,
-                    "max": line,
-                    "line": line,
-                    "over": sides["over"],
-                    "under": sides["under"],
-                    "plive_market": int(sides.get("plive_market") or PLIVE_GAME_TOTAL_MARKET),
-                    "market_type": "game_total",
-                }
+                mark_live_plive_row(
+                    {
+                        "hdp": line,
+                        "max": line,
+                        "line": line,
+                        "over": sides["over"],
+                        "under": sides["under"],
+                        "plive_market": int(sides.get("plive_market") or PLIVE_GAME_TOTAL_MARKET),
+                        "market_type": "game_total",
+                    }
+                )
             )
         return rows
+
+    def _soccer_draw_from_coeffs(
+        self, coeffs: Dict[Tuple[int, str], Dict[int, Any]]
+    ) -> Tuple[Optional[float], Optional[int]]:
+        """Soccer 1X2 Draw from the board market. idx0 take. Fail closed if ambiguous."""
+        skip = {
+            int(PLIVE_ML_MARKET),
+            int(PLIVE_RUN_LINE_MARKET),
+            int(PLIVE_GAME_TOTAL_MARKET),
+        }
+        skip.update(int(m) for m in _TEAM_TOTAL_MARKETS)
+        skip.update(int(m) for m in self.spread_markets)
+        skip.update(int(m) for m in self.total_markets)
+        found: List[Tuple[int, float]] = []
+        prefer = {int(m) for m in _int_csv("PLIVE_MARKET_SOCCER_1X2", _DEFAULT_SOCCER_1X2_MARKETS)}
+        for (market, outcome), slots in coeffs.items():
+            mk = int(market)
+            if mk in skip:
+                continue
+            if parse_soccer_1x2_outcome(outcome) != "draw":
+                continue
+            dec = soccer_1x2_draw_take_decimal(slots)
+            if dec is None or dec <= 1.0:
+                continue
+            found.append((mk, float(dec)))
+        if not found:
+            return None, None
+        preferred = [item for item in found if item[0] in prefer]
+        # Exact 1X2 market only. Do not fall back to some other market's X.
+        use = preferred if prefer else found
+        if not use:
+            return None, None
+        prices = {round(d, 6) for _mk, d in use}
+        if len(prices) > 1:
+            return None, None
+        return use[0][1], use[0][0]
 
 
 class PlivePandoraFeed:
@@ -2054,6 +2173,34 @@ class PlivePandoraFeed:
         if isinstance(data, dict):
             self.handle_payload(data, event_name)
 
+    def _join_odds_doc(self, doc: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Fixture join + live markets. Empty markets when unmatched, stale, or missing stamp."""
+        home = str(doc.get("home") or "")
+        away = str(doc.get("away") or "")
+        if _odds_doc_is_soccer(doc):
+            eid = match_plive_soccer_to_odds_doc(self.store.soccer_events(), doc)
+        else:
+            eid = match_plive_event_to_odds_doc(self.store.mlb_events(), home, away)
+        if not eid:
+            return None, []
+        ev = self.store.events.get(str(eid)) or {}
+        if plive_price_is_stale(ev):
+            return ev, []
+        try:
+            stamp = float(ev.get("coeff_updated_at") or 0)
+        except (TypeError, ValueError):
+            stamp = 0.0
+        if stamp <= 0:
+            return ev, []
+        markets = align_plive_markets_to_odds_fixture(
+            self.store.markets_for_event(eid),
+            plive_home=str(ev.get("home") or ""),
+            plive_away=str(ev.get("away") or ""),
+            odds_home=home,
+            odds_away=away,
+        )
+        return ev, markets
+
     def markets_for_odds_event(self, doc: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Join PLive take prices onto an Odds-API event.
 
@@ -2062,35 +2209,23 @@ class PlivePandoraFeed:
         emits markets when the match is missing, swapped, stale, or
         ambiguous. MLB keeps the existing swap-tolerant matcher.
         """
-        home = str(doc.get("home") or "")
-        away = str(doc.get("away") or "")
-        if _odds_doc_is_soccer(doc):
-            eid = match_plive_soccer_to_odds_doc(self.store.soccer_events(), doc)
-            if not eid:
-                return []
-            ev = self.store.events.get(str(eid)) or {}
-            if plive_price_is_stale(ev):
-                return []
-            return align_plive_markets_to_odds_fixture(
-                self.store.markets_for_event(eid),
-                plive_home=str(ev.get("home") or ""),
-                plive_away=str(ev.get("away") or ""),
-                odds_home=home,
-                odds_away=away,
-            )
-        eid = match_plive_event_to_odds_doc(self.store.mlb_events(), home, away)
-        if not eid:
-            return []
-        ev = self.store.events.get(str(eid)) or {}
-        if plive_price_is_stale(ev):
-            return []
-        return align_plive_markets_to_odds_fixture(
-            self.store.markets_for_event(eid),
-            plive_home=str(ev.get("home") or ""),
-            plive_away=str(ev.get("away") or ""),
-            odds_home=home,
-            odds_away=away,
-        )
+        _ev, markets = self._join_odds_doc(doc)
+        return markets
+
+    def live_plive_for_odds_doc(
+        self, doc: Dict[str, Any]
+    ) -> Tuple[List[Dict[str, Any]], Optional[float]]:
+        """Live coeff markets + coeff_updated_at. Empty when missing/stale/unmatched."""
+        ev, markets = self._join_odds_doc(doc)
+        if not markets or not ev:
+            return [], None
+        try:
+            stamp = float(ev.get("coeff_updated_at") or 0)
+        except (TypeError, ValueError):
+            return [], None
+        if stamp <= 0:
+            return [], None
+        return markets, stamp
 
     def _record_ack(self, event_name: Optional[str], data: Any = None) -> None:
         kind = note_handshake_ack(event_name, data)
@@ -2438,17 +2573,36 @@ async def reset_shared_plive_feed() -> None:
             _shared_plive = None
 
 
+def strip_odds_api_plive_book(doc: Dict[str, Any]) -> None:
+    """Remove any Odds-API / leftover PLive book. Live coeffs re-attach separately."""
+    if not isinstance(doc, dict):
+        return
+    bks = doc.get("bookmakers")
+    if not isinstance(bks, dict):
+        return
+    book = _canonical_odds_api_bookmaker(PLIVE_BOOK_NAME)
+    for key in list(bks.keys()):
+        if _canonical_odds_api_bookmaker(str(key)).lower() == book.lower():
+            bks.pop(key, None)
+    stamps = doc.get("book_updated_at")
+    if isinstance(stamps, dict):
+        for key in list(stamps.keys()):
+            if _canonical_odds_api_bookmaker(str(key)).lower() == book.lower():
+                stamps.pop(key, None)
+
+
 def merge_plive_into_docs(docs: List[Dict[str, Any]]) -> int:
     """
-    Replace (not merge-into-markets) ``bookmakers["PLive"]`` on each Odds-API doc
-    when a PLive MLB event matches. Returns how many docs gained a PLive book.
+    Attach live Pandora ``eventCoefficients`` as ``bookmakers["PLive"]``.
+
+    Never keep Odds-API PLive. If the live fixture/market/strike is missing,
+    stale, or unmatched: pop PLive and do not emit a take. Replace, never
+    overlay live coeffs onto an Odds-API snapshot. Stamp from ``coeff_updated_at``.
     """
     feed = peek_shared_plive_feed()
-    if feed is None:
-        return 0
-    n = 0
     book = _canonical_odds_api_bookmaker(PLIVE_BOOK_NAME)
-    feed_ok = feed.price_feed_ok()
+    n = 0
+    feed_ok = bool(feed is not None and feed.price_feed_ok())
     for doc in docs:
         if not isinstance(doc, dict):
             continue
@@ -2456,23 +2610,16 @@ def merge_plive_into_docs(docs: List[Dict[str, Any]]) -> int:
         if not isinstance(bks, dict):
             doc["bookmakers"] = {}
             bks = doc["bookmakers"]
-        if not feed_ok:
-            # Subscribed but silent/stale — do not keep a stale PLive take.
-            bks.pop(book, None)
+        strip_odds_api_plive_book(doc)
+        if feed is None or not feed_ok:
             continue
-        markets = feed.markets_for_odds_event(doc)
-        existing = bks.get(book) if isinstance(bks.get(book), list) else []
-        if not markets:
-            # No live coeff match — do not invent. Existing Odds-API PLive stays.
+        markets, stamp = feed.live_plive_for_odds_doc(doc)
+        if not markets or stamp is None:
             continue
-        incoming_spread = any(str(m.get("name")) == "Spread" for m in markets if isinstance(m, dict))
-        merged = merge_plive_market_lists(existing, markets)
-        if not incoming_spread:
-            merged = [m for m in merged if str(m.get("name")) != "Spread"]
-        bks[book] = merged
+        bks[book] = sanitize_plive_markets(markets)
         stamps = doc.setdefault("book_updated_at", {})
         if isinstance(stamps, dict):
-            stamps[book] = time.time()
+            stamps[book] = float(stamp)
         n += 1
     return n
 

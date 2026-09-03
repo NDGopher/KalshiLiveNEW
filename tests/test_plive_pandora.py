@@ -623,12 +623,12 @@ def test_event_199295331_market5_totals_not_on_spread():
     assert all(r.get("over") != 1.220264 for r in by_name["Totals"]["odds"])
 
 
-def test_merge_keeps_odds_api_plive_ml():
+def test_merge_drops_odds_api_plive_ml():
+    """Odds-API / Kalshi-copied PLive is not a live coeff. Never keep it."""
     existing = [{"name": "ML", "odds": [{"home": 1.69, "away": 2.10}]}]
     incoming = [{"name": "Spread", "odds": [{"hdp": 1.5, "home": 1.45, "away": 2.65}]}]
     merged = merge_plive_market_lists(existing, incoming)
-    ml = next(m for m in merged if m["name"] == "ML")
-    assert ml["odds"][0]["home"] == 1.69
+    assert all(m.get("name") != "ML" for m in merged)
     assert any(m["name"] == "Spread" for m in merged)
 
 

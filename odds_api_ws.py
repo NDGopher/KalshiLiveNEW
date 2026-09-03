@@ -43,6 +43,7 @@ from odds_api_client import (
     _canonical_odds_api_bookmaker,
     api_wire_bookmakers,
     get_shared_odds_client,
+    is_local_only_bookmaker,
     odds_api_master_bookmakers,
     sport_slug_query_for_api,
 )
@@ -636,6 +637,8 @@ class OddsWsStore:
                 continue
             for raw_k, markets in bks.items():
                 bookie = _canonical_odds_api_bookmaker(str(raw_k))
+                if is_local_only_bookmaker(bookie):
+                    continue
                 if isinstance(markets, list) and markets:
                     self._upsert_markets_by_name(eid, bookie, markets)
                 else:
@@ -736,6 +739,8 @@ class OddsWsStore:
         if t in ("created", "updated"):
             if eid is None or not bookie:
                 return AppliedMessage(type=t, event_id=eid, bookie=bookie, seq=seq)
+            if is_local_only_bookmaker(bookie):
+                return AppliedMessage(type=t, event_id=eid, bookie=bookie, seq=seq)
             # Do not replace the whole markets list. ML-only updated keeps Totals.
             self._upsert_markets_by_name(eid, bookie, msg.get("markets"))
             meta = self.event_meta.setdefault(eid, {"id": eid})
@@ -781,6 +786,8 @@ class OddsWsStore:
         bks: Dict[str, List[Dict[str, Any]]] = {}
         for (eid, book), markets in self.books.items():
             if eid == event_id:
+                if is_local_only_bookmaker(book):
+                    continue
                 bks[book] = list(markets)
         meta["bookmakers"] = bks
         meta["book_updated_at"] = {
