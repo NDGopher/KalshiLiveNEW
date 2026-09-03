@@ -73,10 +73,14 @@ _SPORT_HASH_RE = re.compile(r"#!?/sport/(\d+)", re.I)
 # Market 3 ML: idx1 is the true decimal. Do not overwrite Odds-API PLive ML.
 # Market 5 = game totals. 7/8 = team totals (click-in only) — never on Spread.
 # eventData list is [home, away] (stadium home first).
+# Sox @ Astros 199298371 Game tab: Astros −1.5 is unpriced. The only +325
+# on that event is Chicago White Sox Total Over 2.5 (market 7/8), not a run line.
 _DEFAULT_ML_MARKETS = (10, 9, 1)
 _DEFAULT_SPREAD_MARKETS = (6,)
 _DEFAULT_TOTAL_MARKETS = (5,)
 _TEAM_TOTAL_MARKETS = (7, 8)
+PLIVE_RUN_LINE_MARKET = 6
+PLIVE_GAME_TOTAL_MARKET = 5
 
 
 def _env_bool(name: str, default: str = "false") -> bool:
@@ -279,6 +283,62 @@ def _as_decimal_pair(value: Any) -> Optional[Tuple[float, float]]:
         if a is not None and b is not None and a > 1.0 and b > 1.0:
             return (a, b)
     return None
+
+
+def is_team_total_market_id(market: Any) -> bool:
+    try:
+        return int(market) in _TEAM_TOTAL_MARKETS
+    except (TypeError, ValueError):
+        return False
+
+
+def is_run_line_spread_row(row: Any) -> bool:
+    """True only for a market-6 home/away pair. Team-total overs never pass."""
+    if not isinstance(row, dict):
+        return False
+    mk = row.get("plive_market")
+    if is_team_total_market_id(mk):
+        return False
+    if mk is not None:
+        try:
+            if int(mk) == PLIVE_GAME_TOTAL_MARKET or int(mk) in _DEFAULT_TOTAL_MARKETS:
+                return False
+        except (TypeError, ValueError):
+            pass
+    if str(row.get("market_type") or "").lower() in ("team_total", "game_total"):
+        return False
+    if row.get("over") is not None and row.get("home") is None:
+        return False
+    try:
+        home = float(row.get("home"))
+        away = float(row.get("away"))
+    except (TypeError, ValueError):
+        return False
+    return home > 1.0 and away > 1.0
+
+
+def sanitize_plive_markets(markets: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """Drop team-total rows from Spread / game Totals before they hit a tile."""
+    out: List[Dict[str, Any]] = []
+    for m in markets or []:
+        if not isinstance(m, dict) or not m.get("name"):
+            continue
+        name = str(m.get("name"))
+        rows = [r for r in (m.get("odds") or []) if isinstance(r, dict)]
+        if name == "Spread":
+            rows = [r for r in rows if is_run_line_spread_row(r)]
+            if not rows:
+                continue
+            out.append({**m, "odds": rows})
+            continue
+        if name == "Totals":
+            rows = [r for r in rows if not is_team_total_market_id(r.get("plive_market"))]
+            if not rows:
+                continue
+            out.append({**m, "odds": rows})
+            continue
+        out.append(m)
+    return out
 
 
 def _spread_pair_from_slots(slots: Dict[int, Any]) -> Optional[Tuple[float, float]]:
@@ -562,7 +622,7 @@ def merge_plive_market_lists(
             continue
         if name in ("Spread", "Totals", "ML"):
             by_name[name] = m
-    return list(by_name.values())
+    return sanitize_plive_markets(list(by_name.values()))
 
 
 def match_plive_event_to_odds_doc(
@@ -601,8 +661,16 @@ class PliveStore:
         self.events: Dict[str, Dict[str, Any]] = {}
         self.generation = 0
         self.ml_markets = _int_csv("PLIVE_MARKET_ML", _DEFAULT_ML_MARKETS)
-        self.spread_markets = _int_csv("PLIVE_MARKET_SPREAD", _DEFAULT_SPREAD_MARKETS)
-        self.total_markets = _int_csv("PLIVE_MARKET_TOTALS", _DEFAULT_TOTAL_MARKETS)
+        raw_spread = _int_csv("PLIVE_MARKET_SPREAD", _DEFAULT_SPREAD_MARKETS)
+        raw_totals = _int_csv("PLIVE_MARKET_TOTALS", _DEFAULT_TOTAL_MARKETS)
+        self.total_markets = tuple(
+            m for m in raw_totals if not is_team_total_market_id(m)
+        ) or _DEFAULT_TOTAL_MARKETS
+        self.spread_markets = tuple(
+            m
+            for m in raw_spread
+            if not is_team_total_market_id(m) and int(m) not in self.total_markets
+        ) or _DEFAULT_SPREAD_MARKETS
         self.sport_id = plive_sport_id()
         self.sport_catalog: Dict[int, str] = dict(PLIVE_SPORT_CATALOG_FALLBACK)
 
@@ -871,6 +939,8 @@ class PliveStore:
                         "home": sides["home"],
                         "away": sides["away"],
                         "line_style": "american",
+                        "plive_market": int(mk),
+                        "market_type": "run_line",
                     }
                 )
             if spread_rows:
@@ -921,6 +991,8 @@ class PliveStore:
                             "line": line,
                             "over": sides["over"],
                             "under": sides["under"],
+                            "plive_market": int(mk),
+                            "market_type": "game_total",
                         }
                     )
             if total_rows:
@@ -928,7 +1000,7 @@ class PliveStore:
         if total_rows:
             out.append({"name": "Totals", "odds": total_rows[:12]})
 
-        return out
+        return sanitize_plive_markets(out)
 
 
 class PlivePandoraFeed:

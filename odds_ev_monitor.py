@@ -74,6 +74,8 @@ from odds_api_ws import (
 from plive_pandora import (
     extra_local_bookmakers,
     get_shared_plive_feed,
+    is_run_line_spread_row,
+    is_team_total_market_id,
     merge_plive_into_docs,
     peek_shared_plive_feed,
     plive_wanted,
@@ -525,8 +527,12 @@ def _pick_matching_odds_row(mk: Dict[str, Any], mname: str, ref_row: Dict[str, A
                 continue
             if r.get("over") is not None and r.get("home") is None:
                 continue
+            if is_team_total_market_id(r.get("plive_market")):
+                continue
+            if r.get("plive_market") is not None and not is_run_line_spread_row(r):
+                continue
             if _numeric_close(r.get("hdp"), ref_row.get("hdp")):
-                return r
+                return r if is_run_line_spread_row(r) or r.get("plive_market") is None else {}
     # Same-line only for spread/total. Do not take row[0] (alt / flipped line).
     if is_total or is_spread:
         return {}
@@ -1214,6 +1220,11 @@ def _build_display_books_payload(
                 ndh, nda = _maybe_swap_ml_decimals_to_consensus(dh, da, med_home, med_away)
                 if ndh != dh or nda != da:
                     row = {**row, "home": ndh, "away": nda}
+        if _market_is_spread(mname) and (
+            is_team_total_market_id(row.get("plive_market"))
+            or (row.get("plive_market") is not None and not is_run_line_spread_row(row))
+        ):
+            continue
         d = _decimal_for_side(row, bet_side)
         if d and d > 1.0:
             am = decimal_to_american(float(d))

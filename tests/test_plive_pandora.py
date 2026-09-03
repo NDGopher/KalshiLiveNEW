@@ -434,8 +434,9 @@ def test_event_199298371_live_ws_dump_pair_and_away_sign():
     assert plus25["home"] == 1.301205
     assert plus25["away"] == 3.32
     # Guard: game total +279 and team totals never sit on Spread.
-    assert all(r.get("home") != 3.79 for r in rows)
+    assert all(r.get("home") not in (3.79, 4.97, 3.12, 4.25, 4.1) for r in rows)
     assert all(r.get("away") not in (4.97, 3.12, 4.25, 4.1) for r in rows)
+    assert all(r.get("plive_market") == 6 for r in rows)
     # Market 3 is the real ML (+111 / -148) but must not replace Odds-API PLive ML.
     assert "ML" not in by_name or by_name["ML"]["odds"][0].get("home") != 2.11
 
@@ -528,3 +529,96 @@ def test_merge_keeps_odds_api_plive_ml():
     ml = next(m for m in merged if m["name"] == "ML")
     assert ml["odds"][0]["home"] == 1.69
     assert any(m["name"] == "Spread" for m in merged)
+
+
+def test_event_199298371_sox_tt_over_325_never_on_spread():
+    """7th 0–0 Game tab: Astros −1.5 is —. Only +325 is Sox team total Over 2.5."""
+    from ev_calculator import american_to_decimal, decimal_to_american
+    from odds_ev_monitor import (
+        _build_display_books_payload,
+        _pick_matching_odds_row,
+        _pick_qualifier_line_for_side,
+    )
+
+    over_325 = american_to_decimal(325)
+    astros_plus15 = american_to_decimal(-392)
+    sox_minus15 = american_to_decimal(266)
+    astros_ml = american_to_decimal(-145)
+    sox_ml = american_to_decimal(110)
+    assert abs(over_325 - 4.25) < 1e-9
+    store = PliveStore()
+    eid = "199298371"
+    store.spread_markets = (6, 7, 8)
+    store.apply_message(
+        {
+            "isDiff": False,
+            "payload": {
+                "c": {
+                    "m": {
+                        "3": {"o": {"1": {"1": astros_ml}, "2": {"1": sox_ml}}},
+                        "6": {
+                            "o": {
+                                "1.5": {0: astros_plus15, 1: sox_minus15},
+                            }
+                        },
+                        "7": {"o": {"2.5": {0: over_325, 1: 1.144928}}},
+                        "8": {"o": {"2.5": {0: 3.12, 1: 1.319489}}},
+                    }
+                }
+            },
+        },
+        event_name=f"live.main.{PLIVE_LINE_SET}.eventCoefficients.{eid}",
+    )
+    by_name = {m["name"]: m for m in store.markets_for_event(eid)}
+    assert "Spread" in by_name
+    rows = by_name["Spread"]["odds"]
+    assert all(abs(float(r["hdp"]) + 1.5) > 1e-9 for r in rows)
+    plus15 = next(r for r in rows if abs(float(r["hdp"]) - 1.5) < 1e-9)
+    assert abs(float(plus15["home"]) - astros_plus15) < 1e-6
+    assert abs(float(plus15["away"]) - sox_minus15) < 1e-6
+    assert plus15["plive_market"] == 6
+    assert all(r.get("plive_market") == 6 for r in rows)
+    assert all(abs(float(r.get("home") or 0) - over_325) > 1e-6 for r in rows)
+    assert all(abs(float(r.get("away") or 0) - over_325) > 1e-6 for r in rows)
+    assert decimal_to_american(plus15["away"]) == 266
+    assert decimal_to_american(plus15["home"]) == -392
+
+    odds_home, odds_away = "Houston Astros", "Chicago White Sox"
+    _h, h_qual, h_line = _pick_qualifier_line_for_side(
+        odds_home, odds_away, "Spread", "home", plus15
+    )
+    a_pick, a_qual, a_line = _pick_qualifier_line_for_side(
+        odds_home, odds_away, "Spread", "away", plus15
+    )
+    assert h_line == 1.5 and h_qual == "+1.5"
+    assert a_pick == odds_away
+    assert a_line == -1.5
+    assert a_qual == "-1.5"
+
+    leaked = {
+        "name": "Spread",
+        "odds": [
+            {"hdp": -1.5, "home": over_325, "away": 1.14, "plive_market": 7, "market_type": "team_total"},
+            plus15,
+        ],
+    }
+    assert _pick_matching_odds_row(leaked, "Spread", {"hdp": -1.5}) == {}
+    assert _pick_matching_odds_row(leaked, "Spread", {"hdp": 1.5})["home"] == plus15["home"]
+
+    bks = {
+        "Kalshi": [{"name": "Spread", "odds": [{"hdp": -1.5, "home": 1.80, "away": 2.10}]}],
+        "PLive": store.markets_for_event(eid),
+    }
+    painted = _build_display_books_payload(
+        "Houston Astros",
+        bks,
+        "Spread",
+        "home",
+        ["Kalshi", "PLive"],
+        -110,
+        {"hdp": -1.5, "home": 1.80, "away": 2.10},
+        take_book="Kalshi",
+    )
+    plive_tiles = [r for r in painted["Houston Astros"] if str(r.get("book")) == "PLive"]
+    assert plive_tiles == []
+    assert all(int(r.get("odds") or 0) != 325 for r in painted["Houston Astros"])

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from ev_calculator import decimal_to_american
 from dashboard import (
+    _live_collect_lines,
     _live_market_has_any_price,
     _live_pick_kind_name,
     _live_prices_for_kind,
@@ -118,3 +119,49 @@ def test_plive_take_totals_tradable_without_kalshi():
         }
     }
     assert _odds_doc_has_kalshi_tradable_gameline(doc) is True
+
+
+def test_live_odds_line_match_skips_unpriced_and_team_total():
+    """Kalshi Astros −1.5 must not inherit PLive Sox TT Over 2.5 = +325."""
+    from ev_calculator import american_to_decimal
+
+    tt = american_to_decimal(325)
+    plus15_home = american_to_decimal(-392)
+    plus15_away = american_to_decimal(266)
+    bks = {
+        "Kalshi": [
+            {"name": "Spread", "odds": [{"hdp": -1.5, "home": 1.80, "away": 2.10}]},
+        ],
+        "PLive": [
+            {
+                "name": "Spread",
+                "odds": [
+                    {
+                        "hdp": -1.5,
+                        "home": tt,
+                        "away": 1.14,
+                        "plive_market": 7,
+                        "market_type": "team_total",
+                    },
+                    {
+                        "hdp": 1.5,
+                        "home": plus15_home,
+                        "away": plus15_away,
+                        "plive_market": 6,
+                        "market_type": "run_line",
+                    },
+                ],
+            }
+        ],
+    }
+    lines = _live_collect_lines(bks, ["Kalshi", "PLive"], "Spread", "spread")
+    assert any(ln is not None and abs(float(ln) - 1.5) < 1e-9 for ln in lines)
+    minus = _live_prices_for_kind(bks, ["Kalshi", "PLive"], "Spread", "spread", line=-1.5)
+    assert minus["Kalshi"]["home_am"] is not None
+    assert minus["PLive"]["home_am"] is None
+    assert minus["PLive"]["away_am"] is None
+    plus = _live_prices_for_kind(bks, ["Kalshi", "PLive"], "Spread", "spread", line=1.5)
+    assert plus["PLive"]["home_am"] == decimal_to_american(plus15_home)
+    assert plus["PLive"]["away_am"] == decimal_to_american(plus15_away)
+    assert plus["PLive"]["home_am"] != 325
+    assert plus["PLive"]["away_am"] != 325

@@ -54,6 +54,7 @@ from kalshi_client import KalshiClient
 from odds_ev_monitor import (
     OddsEVMonitor as EvMonitorImpl,
     _market_names_match,
+    _numeric_close,
     _pick_matching_odds_row,
     _pick_qualifier_line_for_side,
     apply_betmgm_ml_grid_consensus_fix,
@@ -71,6 +72,8 @@ from odds_api_client import (
 from odds_api_ws import _ws_market_family, peek_shared_odds_ws_feed, resolve_odds_docs
 from plive_pandora import (
     extra_local_bookmakers,
+    is_run_line_spread_row,
+    is_team_total_market_id,
     merge_plive_into_docs,
     peek_shared_plive_feed,
     plive_wanted,
@@ -716,6 +719,70 @@ def _live_first_row(market: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return {}
 
 
+def _live_row_is_spread_paintable(row: Dict[str, Any]) -> bool:
+    if is_team_total_market_id(row.get("plive_market")):
+        return False
+    if row.get("plive_market") is not None:
+        return is_run_line_spread_row(row)
+    if row.get("over") is not None and row.get("home") is None:
+        return False
+    return True
+
+
+def _live_row_line(row: Dict[str, Any], kind: str) -> Optional[float]:
+    keys = ("hdp", "max", "line") if kind == "total" else ("hdp",)
+    for key in keys:
+        try:
+            if row.get(key) is not None:
+                return float(row[key])
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _live_row_for_kind(
+    market: Optional[Dict[str, Any]], kind: str, line: Optional[float] = None
+) -> Dict[str, Any]:
+    """Same-line only. Never take book A's first alt / team-total as book B's run line."""
+    if not market:
+        return {}
+    rows = [r for r in (market.get("odds") or []) if isinstance(r, dict)]
+    if kind == "spread":
+        rows = [r for r in rows if _live_row_is_spread_paintable(r)]
+    if kind == "ml" or line is None:
+        return rows[0] if rows else {}
+    for r in rows:
+        got = _live_row_line(r, kind)
+        if got is not None and _numeric_close(got, line):
+            return r
+    return {}
+
+
+def _live_collect_lines(
+    bks: Dict[str, Any], books: List[str], mname: str, kind: str
+) -> List[Optional[float]]:
+    if kind == "ml":
+        return [None]
+    seen: List[float] = []
+    prefs = ["Kalshi", "PLive", "FanDuel", "DraftKings"] + list(books)
+    for bk in prefs:
+        mk = _live_find_market(_live_mkts_for_book(bks, bk), mname)
+        for r in (mk or {}).get("odds") or []:
+            if not isinstance(r, dict):
+                continue
+            if kind == "spread" and not _live_row_is_spread_paintable(r):
+                continue
+            ln = _live_row_line(r, kind)
+            if ln is None:
+                continue
+            if any(_numeric_close(ln, x) for x in seen):
+                continue
+            seen.append(ln)
+            if len(seen) >= 8:
+                return seen
+    return seen or [None]
+
+
 def _live_float_dec(x: Any) -> Optional[float]:
     try:
         if x is None:
@@ -766,12 +833,16 @@ def _live_pick_ml_name(bks: Dict[str, Any]) -> str:
 
 
 def _live_prices_for_kind(
-    bks: Dict[str, Any], books: List[str], mname: str, kind: str
+    bks: Dict[str, Any],
+    books: List[str],
+    mname: str,
+    kind: str,
+    line: Optional[float] = None,
 ) -> Dict[str, Dict[str, Any]]:
     prices: Dict[str, Dict[str, Any]] = {}
     for bk in books:
         mk = _live_find_market(_live_mkts_for_book(bks, bk), mname)
-        row = _live_first_row(mk)
+        row = _live_row_for_kind(mk, kind, line)
         if kind == "total":
             d_over = _live_float_dec(row.get("over"))
             d_under = _live_float_dec(row.get("under"))
@@ -874,6 +945,8 @@ def _live_odds_line_prices(
                 "line": line,
             }
         else:
+            if picked and not _live_row_is_spread_paintable(picked):
+                picked = {}
             dh = _live_float_dec(picked.get("home"))
             da = _live_float_dec(picked.get("away"))
             prices[bk] = {
@@ -1006,6 +1079,8 @@ def live_odds_board_rows_from_bookmakers(
                         break
         for ref in ((sp_mk or {}).get("odds") or [])[:8]:
             if not isinstance(ref, dict):
+                continue
+            if not _live_row_is_spread_paintable(ref):
                 continue
             if ref.get("over") is not None and ref.get("home") is None:
                 continue
