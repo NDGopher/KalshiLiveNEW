@@ -110,7 +110,13 @@ def test_redact_api_key_in_url():
 
 
 def test_store_ml_only_update_keeps_totals():
+    """Merge-by-market-name: created/updated must not replace the whole list.
+
+    Subscribe ML,Spread,Totals is not this test. An ML-only updated payload
+    must leave the stored Totals/Spread blocks (same over/under) in the store.
+    """
     store = OddsWsStore()
+    totals_odds = [{"max": 11.5, "hdp": 11.5, "over": 1.892857, "under": 1.847458}]
     store.apply_message(
         {
             "type": "created",
@@ -123,10 +129,7 @@ def test_store_ml_only_update_keeps_totals():
                     "name": "Spread",
                     "odds": [{"hdp": -1.5, "home": 1.91, "away": 1.91}],
                 },
-                {
-                    "name": "Totals",
-                    "odds": [{"max": 11.5, "hdp": 11.5, "over": 1.892857, "under": 1.847458}],
-                },
+                {"name": "Totals", "odds": list(totals_odds)},
             ],
         }
     )
@@ -142,6 +145,7 @@ def test_store_ml_only_update_keeps_totals():
     doc = store.merged_doc(100)
     fd = doc["bookmakers"]["FanDuel"]
     names = [m["name"] for m in fd]
+    assert names.count("Totals") == 1
     assert "ML" in names
     assert "Totals" in names
     assert "Spread" in names
@@ -149,6 +153,7 @@ def test_store_ml_only_update_keeps_totals():
     tot = next(m for m in fd if m["name"] == "Totals")
     assert ml["odds"][0]["home"] == "1.8"
     assert tot["odds"][0]["over"] == 1.892857
+    assert tot["odds"][0]["under"] == 1.847458
     counts = store.market_family_counts()
     assert counts["ml"] == 1
     assert counts["totals"] == 1
@@ -156,6 +161,39 @@ def test_store_ml_only_update_keeps_totals():
     assert store.last_seq == 11
     assert "FanDuel" in doc["book_updated_at"]
     assert store.book_updated_at[(100, "FanDuel")] == doc["book_updated_at"]["FanDuel"]
+
+
+def test_same_family_alias_does_not_wipe_totals_name():
+    """Family merge would drop Totals when a later payload says Total Runs."""
+    store = OddsWsStore()
+    store.apply_message(
+        {
+            "type": "created",
+            "seq": 1,
+            "id": 44,
+            "bookie": "DraftKings",
+            "markets": [
+                {"name": "ML", "odds": [{"home": 1.9, "away": 2.0}]},
+                {"name": "Totals", "odds": [{"max": 8.5, "over": 1.91, "under": 1.91}]},
+            ],
+        }
+    )
+    store.apply_message(
+        {
+            "type": "updated",
+            "seq": 2,
+            "id": 44,
+            "bookie": "DraftKings",
+            "markets": [
+                {"name": "Total Runs", "odds": [{"max": 9.5, "over": 1.80, "under": 2.00}]},
+            ],
+        }
+    )
+    names = [m["name"] for m in store.merged_doc(44)["bookmakers"]["DraftKings"]]
+    assert "Totals" in names
+    assert "Total Runs" in names
+    tot = next(m for m in store.merged_doc(44)["bookmakers"]["DraftKings"] if m["name"] == "Totals")
+    assert tot["odds"][0]["max"] == 8.5
 
 
 def test_rest_ml_only_snapshot_keeps_totals():
@@ -193,6 +231,40 @@ def test_rest_ml_only_snapshot_keeps_totals():
     assert "Spread" in names
 
 
+def test_totals_name_in_payload_replaces_totals_only():
+    """Payload that includes Totals replaces Totals; ML/Spread stay."""
+    store = OddsWsStore()
+    store.apply_message(
+        {
+            "type": "created",
+            "seq": 1,
+            "id": 7,
+            "bookie": "Caesars",
+            "markets": [
+                {"name": "ML", "odds": [{"home": 1.9, "away": 2.0}]},
+                {"name": "Spread", "odds": [{"hdp": -1.5, "home": 1.91, "away": 1.91}]},
+                {"name": "Totals", "odds": [{"max": 8.5, "over": 1.91, "under": 1.91}]},
+            ],
+        }
+    )
+    store.apply_message(
+        {
+            "type": "updated",
+            "seq": 2,
+            "id": 7,
+            "bookie": "Caesars",
+            "markets": [
+                {"name": "Totals", "odds": [{"max": 9.5, "over": 1.80, "under": 2.05}]},
+            ],
+        }
+    )
+    names = [m["name"] for m in store.merged_doc(7)["bookmakers"]["Caesars"]]
+    assert names.count("Totals") == 1
+    assert "ML" in names and "Spread" in names
+    tot = next(m for m in store.merged_doc(7)["bookmakers"]["Caesars"] if m["name"] == "Totals")
+    assert tot["odds"][0]["max"] == 9.5
+
+
 def test_store_deleted_and_no_markets():
     store = OddsWsStore()
     store.apply_message(
@@ -213,8 +285,8 @@ def test_resync_required_and_welcome_mismatch():
     assert extra == []
 
 
-def test_rest_docs_merge_by_family_per_book():
-    """REST snapshot upserts by family. A Spread-only row must not wipe ML."""
+def test_rest_docs_merge_by_name_per_book():
+    """REST snapshot upserts by market name. A Spread-only row must not wipe ML."""
     store = OddsWsStore()
     store.apply_rest_docs(
         [

@@ -328,8 +328,9 @@ def test_ws_ml_only_update_keeps_totals_then_alert():
 
 
 def test_merged_doc_after_ml_only_update_emits_over_card():
-    """Full ML+Spread+Totals snapshot, then ML-only WS update: Totals survive
-    and an honest +EV Over card is built from the merged bookmakers.
+    """Required success test: full ML+Spread+Totals snapshot, then ML-only
+    ``updated``. Totals stay in the store; an Over/Under alert is still
+    buildable from merged bookmakers. Subscribe string is not this test.
     Rec O−110/U−110, take O +105 → Quant-3 +2.50% KEEP.
     """
     from ev_calculator import american_to_decimal, is_plus_print_ev

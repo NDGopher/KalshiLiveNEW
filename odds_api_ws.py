@@ -14,10 +14,12 @@ Official contract (do not invent):
 - ``leagues`` and ``eventIds`` are mutually exclusive (eventIds max 50).
 - Message types: welcome, created, updated, deleted, no_markets, score, status,
   resync_required.
-- Upsert markets per event+bookie by market family (ML / Spread / Totals).
-  An ML-only ``updated`` or ML-only REST snapshot must not wipe prior
-  Spread/Totals. ``no_markets`` and ``deleted`` still clear. A payload that
-  includes Totals replaces Totals.
+- Merge-by-market-name on ``created``/``updated`` (and REST snapshots).
+  Keep existing Totals/Spread unless THIS payload includes that market
+  name. Subscribe ``ML,Spread,Totals`` is not proof they survive — an
+  ML-only ``updated`` must not replace the whole list. ``no_markets``
+  and ``deleted`` still clear. A payload that includes Totals replaces
+  only Totals.
 - Track ``seq``; reconnect with ``lastSeq`` (compacted latest-state replay).
 - On ``resync_required``: REST snapshot with ``includeSeq=true``, then reconnect.
 - Process updates asynchronously; exponential backoff on reconnect.
@@ -420,8 +422,13 @@ class AppliedMessage:
     dirty: bool = False
 
 
+def _ws_market_name_key(name: Any) -> str:
+    """Stable market-name key. ``Totals`` ≠ ``Total Runs`` — do not merge by family."""
+    return str(name or "").strip().casefold()
+
+
 def _ws_market_family(name: Any) -> str:
-    """ML / Spread / Totals family. Team totals are not game Totals."""
+    """ML / Spread / Totals family (diagnostics only). Team totals are not game Totals."""
     u = str(name or "").strip().upper()
     if not u:
         return "other"
@@ -440,14 +447,14 @@ def _ws_market_family(name: Any) -> str:
 
 @dataclass
 class OddsWsStore:
-    """In-memory latest-state store. WS created/updated upsert by market family."""
+    """In-memory latest-state store. created/updated merge by market name."""
 
     last_seq: Optional[int] = None
     welcome: Optional[Dict[str, Any]] = None
     event_meta: Dict[int, Dict[str, Any]] = field(default_factory=dict)
-    # (event_id, canonical_bookie) -> markets list (WS upsert by family; REST full-replace)
+    # (event_id, canonical_bookie) -> markets list (merge-by-name; no_markets/deleted clear)
     books: Dict[Tuple[int, str], List[Dict[str, Any]]] = field(default_factory=dict)
-    # Last time we replaced that book's markets (WS created/updated or REST snapshot).
+    # Last time this book was touched (WS created/updated or REST snapshot).
     book_updated_at: Dict[Tuple[int, str], float] = field(default_factory=dict)
     # Rate-limit raw MLB clock/statusDetail samples so we can see if Odds-API
     # ever sends top/bottom or Break (docs only list "1st inning"…"9th inning").
@@ -497,9 +504,9 @@ class OddsWsStore:
             maybe_log_mlb_clock_sample(self, eid, meta, source="slate")
 
     def apply_rest_docs(self, docs: Iterable[Dict[str, Any]]) -> None:
-        """Ingest /odds or /odds/multi snapshots. Merge by family so ML-only
-        REST rows cannot wipe prior Spread/Totals (same rule as WS updated).
-        Empty markets list still clears that book.
+        """Ingest /odds or /odds/multi snapshots. Merge by market name so an
+        ML-only REST row cannot wipe prior Spread/Totals (same rule as WS).
+        Empty markets list still clears that book (REST equivalent of no_markets).
         """
         for doc in docs:
             if not isinstance(doc, dict) or doc.get("id") is None:
@@ -514,13 +521,13 @@ class OddsWsStore:
             for raw_k, markets in bks.items():
                 bookie = _canonical_odds_api_bookmaker(str(raw_k))
                 if isinstance(markets, list) and markets:
-                    self._upsert_markets_by_family(eid, bookie, markets)
+                    self._upsert_markets_by_name(eid, bookie, markets)
                 else:
                     self._replace_markets(eid, bookie, markets if isinstance(markets, list) else [])
             self.generation += 1
 
     def _replace_markets(self, eid: int, bookie: str, markets: Any) -> None:
-        """Full replace (``no_markets`` / REST). Empty list clears the book."""
+        """Full replace. Only ``no_markets`` / ``deleted`` / empty REST snapshot."""
         ck = _canonical_odds_api_bookmaker(bookie)
         if isinstance(markets, list):
             self.books[(eid, ck)] = list(markets)
@@ -528,31 +535,35 @@ class OddsWsStore:
             self.books[(eid, ck)] = []
         self.book_updated_at[(eid, ck)] = time.time()
 
-    def _upsert_markets_by_family(self, eid: int, bookie: str, markets: Any) -> None:
-        """Keep prior Spread/Totals when this payload is ML-only.
+    def _upsert_markets_by_name(self, eid: int, bookie: str, markets: Any) -> None:
+        """created/updated: replace only market names present in THIS payload.
 
-        Incoming markets replace the same family. Families not in the payload
-        stay. Empty ``markets`` on created/updated is a no-op (``no_markets``
-        still clears).
+        Keep existing Totals/Spread unless the payload includes that name.
+        Same-family aliases (``Total Runs`` vs ``Totals``) must not wipe.
+        Empty ``markets`` on created/updated is a no-op (``no_markets`` clears).
         """
         ck = _canonical_odds_api_bookmaker(bookie)
-        incoming = list(markets) if isinstance(markets, list) else []
+        incoming = [m for m in (markets if isinstance(markets, list) else []) if isinstance(m, dict)]
         if not incoming:
             self.book_updated_at[(eid, ck)] = time.time()
             return
-        incoming_fams = {
-            _ws_market_family(m.get("name"))
+        incoming_names = {
+            _ws_market_name_key(m.get("name"))
             for m in incoming
-            if isinstance(m, dict)
+            if _ws_market_name_key(m.get("name"))
         }
         prev = list(self.books.get((eid, ck)) or [])
         kept = [
             m
             for m in prev
-            if isinstance(m, dict) and _ws_market_family(m.get("name")) not in incoming_fams
+            if isinstance(m, dict) and _ws_market_name_key(m.get("name")) not in incoming_names
         ]
         self.books[(eid, ck)] = incoming + kept
         self.book_updated_at[(eid, ck)] = time.time()
+
+    def _upsert_markets_by_family(self, eid: int, bookie: str, markets: Any) -> None:
+        """Back-compat alias — ingest is merge-by-name, not family."""
+        self._upsert_markets_by_name(eid, bookie, markets)
 
     def market_family_counts(self) -> Dict[str, int]:
         """How many stored market blocks are ML / Spread / Totals."""
@@ -566,7 +577,7 @@ class OddsWsStore:
         return counts
 
     def apply_message(self, msg: Dict[str, Any]) -> AppliedMessage:
-        """Apply one official WS JSON object. Upsert by market family on created/updated."""
+        """Apply one official WS JSON object. created/updated merge by market name."""
         if not isinstance(msg, dict):
             return AppliedMessage(type="unknown")
         t = str(msg.get("type") or "").strip().lower()
@@ -609,7 +620,8 @@ class OddsWsStore:
         if t in ("created", "updated"):
             if eid is None or not bookie:
                 return AppliedMessage(type=t, event_id=eid, bookie=bookie, seq=seq)
-            self._upsert_markets_by_family(eid, bookie, msg.get("markets"))
+            # Do not replace the whole markets list. ML-only updated keeps Totals.
+            self._upsert_markets_by_name(eid, bookie, msg.get("markets"))
             meta = self.event_meta.setdefault(eid, {"id": eid})
             if msg.get("url"):
                 meta.setdefault("urls", {})
