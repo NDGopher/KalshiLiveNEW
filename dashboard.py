@@ -638,14 +638,25 @@ def _plive_status_payload() -> Dict[str, Any]:
         }
     snap = feed.status_snapshot()
     snap["wanted"] = True
-    if snap.get("receiving_prices"):
+    priced = (snap.get("mlb_with_prices") or 0) + (snap.get("soccer_with_prices") or 0)
+    age = snap.get("coeff_age_sec")
+    age_s = f"{age:.0f}s" if isinstance(age, (int, float)) else "none"
+    if snap.get("price_feed_ok") and snap.get("receiving_prices"):
         snap["message"] = (
             f"PLive connected and receiving events with prices "
-            f"({snap.get('mlb_with_prices') or 0} MLB)"
+            f"({snap.get('mlb_with_prices') or 0} MLB / "
+            f"{snap.get('soccer_with_prices') or 0} soccer, last_coeff={snap.get('last_coeff_at')})"
+        )
+    elif snap.get("connected") and not snap.get("price_feed_ok"):
+        snap["message"] = (
+            f"PLive connected but prices stale or missing — fail closed "
+            f"(mlb={snap.get('mlb_events') or 0} soccer={snap.get('soccer_events') or 0} "
+            f"priced={priced} coeff_age={age_s} last_coeff={snap.get('last_coeff_at') or 'none'})"
         )
     elif snap.get("connected"):
         snap["message"] = (
-            f"PLive connected · {snap.get('mlb_events') or 0} MLB events · waiting for prices"
+            f"PLive connected · {snap.get('mlb_events') or 0} MLB / "
+            f"{snap.get('soccer_events') or 0} soccer · waiting for prices"
         )
     else:
         snap["message"] = f"PLive disconnected ({snap.get('last_error') or 'not connected'})"
