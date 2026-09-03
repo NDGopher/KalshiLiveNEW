@@ -72,6 +72,7 @@ from odds_api_client import (
 )
 from odds_api_ws import (
     get_shared_odds_ws_feed,
+    live_events_from_ws_store,
     mlb_ws_slice_active,
     odds_api_ws_wanted,
     peek_shared_odds_ws_feed,
@@ -113,6 +114,67 @@ def _ws_event_meta(event_id: Any) -> Optional[Dict[str, Any]]:
         return feed.store.event_meta.get(int(event_id))
     except (TypeError, ValueError):
         return None
+
+
+def _merge_live_event_rows(*groups: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Deduplicate event rows by id. Later groups overwrite earlier metadata."""
+    merged: Dict[int, Dict[str, Any]] = {}
+    for rows in groups:
+        for ev in rows or []:
+            if not isinstance(ev, dict):
+                continue
+            eid = ev.get("id")
+            if eid is None:
+                continue
+            try:
+                ke = int(eid)
+            except (TypeError, ValueError):
+                continue
+            row = dict(ev)
+            row["id"] = ke
+            prev = merged.get(ke)
+            if prev is None:
+                merged[ke] = row
+                continue
+            for k, v in row.items():
+                if v is not None:
+                    prev[k] = v
+    return list(merged.values())
+
+
+async def _resolve_live_events_slate(
+    client: Any,
+    sport: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """REST ``/events/live`` with WS-store / stale-cache fallback.
+
+    A 429 or other REST failure must not abort the monitor loop or empty
+    the live scan when the WebSocket store (or a prior cached slate) still
+    has event IDs. Price recovery stays fail-closed in ``resolve_odds_docs``.
+    """
+    try:
+        liv = await client.list_live_events(sport)
+        if liv:
+            return list(liv)
+        return []
+    except Exception as ex:
+        print(f"[MONITOR] [WARN] /events/live failed: {ex}")
+    cached: List[Dict[str, Any]] = []
+    peek = getattr(client, "peek_cached_live_events", None)
+    if callable(peek):
+        try:
+            raw = await peek(sport)
+            if isinstance(raw, list):
+                cached = list(raw)
+        except Exception:
+            cached = []
+    ws_rows = live_events_from_ws_store()
+    merged = _merge_live_event_rows(ws_rows, cached)
+    print(
+        f"[MONITOR] live slate fallback: cached={len(cached)} ws={len(ws_rows)} "
+        f"merged={len(merged)} (no /odds/multi; WS-first prices)"
+    )
+    return merged
 
 
 def _clock_event_for_value_bet(
@@ -2543,7 +2605,7 @@ class OddsEVMonitor:
             mlb_lg = major_league_slug_for_events("baseball", "mlb") or (
                 os.getenv("ODDS_API_LEAGUE_MLB") or "usa-mlb"
             ).strip()
-            liv = await client.list_live_events("baseball")
+            liv = await _resolve_live_events_slate(client, "baseball")
             try:
                 pre_all = await client.list_events_for_sport("baseball", league=mlb_lg)
             except Exception as ex:
@@ -2555,11 +2617,11 @@ class OddsEVMonitor:
             )
         elif OddsEVMonitor.broad_scan_include_pregame:
             liv, pre_all = await asyncio.gather(
-                client.list_live_events(None),
+                _resolve_live_events_slate(client, None),
                 _diag_fetch_pregame_by_sports(client, pre_cap),
             )
         else:
-            liv = await client.list_live_events(None)
+            liv = await _resolve_live_events_slate(client, None)
             pre_all = []
         liv = list(liv or [])
         pre_all = list(pre_all or [])

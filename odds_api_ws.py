@@ -790,6 +790,20 @@ class OddsWsStore:
         }
         return meta
 
+    def slate_event_ids(self) -> List[int]:
+        """Event IDs known from REST slate metadata or WS book rows."""
+        ids = {eid for eid, _ in self.books.keys()} | set(self.event_meta.keys())
+        return sorted(eid for eid in ids if eid is not None)
+
+    def slate_events(self) -> List[Dict[str, Any]]:
+        """Event-list rows from the WS store (id + last known metadata)."""
+        out: List[Dict[str, Any]] = []
+        for eid in self.slate_event_ids():
+            meta = dict(self.event_meta.get(eid) or {"id": eid})
+            meta["id"] = eid
+            out.append(meta)
+        return out
+
     def merged_docs(self, event_ids: Optional[Sequence[int]] = None) -> List[Dict[str, Any]]:
         if event_ids is None:
             ids = sorted({eid for eid, _ in self.books.keys()} | set(self.event_meta.keys()))
@@ -1230,6 +1244,18 @@ async def get_shared_odds_ws_feed() -> Optional[OddsApiWsFeed]:
 
 def peek_shared_odds_ws_feed() -> Optional[OddsApiWsFeed]:
     return _shared_feed
+
+
+def live_events_from_ws_store() -> List[Dict[str, Any]]:
+    """Live-event list from the shared Odds-API WS store (no HTTP).
+
+    Used when REST ``/events/live`` 429s or fails. This is the event
+    *list* only — price recovery stays fail-closed in ``resolve_odds_docs``.
+    """
+    feed = peek_shared_odds_ws_feed()
+    if feed is None:
+        return []
+    return feed.store.slate_events()
 
 
 async def reset_shared_odds_ws_feed() -> None:
