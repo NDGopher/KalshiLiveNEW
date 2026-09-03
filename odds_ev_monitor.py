@@ -464,8 +464,8 @@ def _odds_doc_has_take_tradable_gameline(
 
 
 def _odds_doc_has_kalshi_tradable_gameline(doc: Any) -> bool:
-    """Kalshi-only. PLive-only Totals use ``_odds_doc_has_take_tradable_gameline``."""
-    return _odds_doc_has_take_tradable_gameline(doc, books=("Kalshi",))
+    """Kalshi or PLive priced gameline. PLive-only Totals still scan."""
+    return _odds_doc_has_take_tradable_gameline(doc)
 
 
 def _numeric_close(a: Any, b: Any, tol: float = 1e-5) -> bool:

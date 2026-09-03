@@ -46,7 +46,7 @@ def test_plive_only_totals_doc_is_tradable():
         }
     }
     assert _odds_doc_has_take_tradable_gameline(doc) is True
-    assert _odds_doc_has_kalshi_tradable_gameline(doc) is False
+    assert _odds_doc_has_kalshi_tradable_gameline(doc) is True
 
 
 def test_plive_market5_game_total_det_min():
@@ -123,7 +123,7 @@ def test_plive_take_totals_tradable_without_kalshi():
         }
     }
     assert _odds_doc_has_take_tradable_gameline(doc) is True
-    assert _odds_doc_has_kalshi_tradable_gameline(doc) is False
+    assert _odds_doc_has_kalshi_tradable_gameline(doc) is True
 
 
 def test_live_odds_line_match_skips_unpriced_and_team_total():
