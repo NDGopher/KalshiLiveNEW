@@ -65,6 +65,7 @@ from plive_pandora import (
     extra_local_bookmakers,
     get_shared_plive_feed,
     merge_plive_into_docs,
+    peek_shared_plive_feed,
     plive_wanted,
 )
 
@@ -116,6 +117,33 @@ def print_env_debug(*, standalone: bool = False) -> None:
 
 def _env_bool(name: str, default: str = "false") -> bool:
     return os.getenv(name, default).lower() in ("1", "true", "yes", "on")
+
+
+async def _wait_odds_or_plive(eval_interval: float, poll_interval: float, ws_on: bool) -> None:
+    """Wake on Odds-API WS or PLive dirty, same existing filter eval cadence."""
+    waits = []
+    ws_feed = peek_shared_odds_ws_feed()
+    pl_feed = peek_shared_plive_feed()
+    if ws_on and ws_feed is not None and ws_feed.healthy:
+        waits.append(ws_feed.wait_dirty_or_timeout(eval_interval))
+    if plive_wanted() and pl_feed is not None and pl_feed.healthy:
+        waits.append(pl_feed.wait_dirty_or_timeout(eval_interval))
+    if not waits:
+        await asyncio.sleep(poll_interval)
+        return
+    tasks = [asyncio.create_task(w) for w in waits]
+    try:
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for t in pending:
+            t.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        for t in done:
+            t.result()
+    except Exception:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
 
 
 def _diagnostic_mode() -> bool:
@@ -2687,11 +2715,7 @@ class OddsEVMonitor:
         while self.running:
             try:
                 await self.check_for_new_alerts()
-                feed = peek_shared_odds_ws_feed()
-                if ws_on and feed is not None and feed.healthy:
-                    await feed.wait_dirty_or_timeout(eval_interval)
-                else:
-                    await asyncio.sleep(self.poll_interval)
+                await _wait_odds_or_plive(eval_interval, self.poll_interval, ws_on)
             except Exception as e:
                 print(f"[ERR] Error in Odds-API monitor loop: {e}")
                 await asyncio.sleep(5)

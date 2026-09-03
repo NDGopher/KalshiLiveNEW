@@ -3,11 +3,18 @@ from __future__ import annotations
 
 from plive_pandora import (
     PLIVE_BOOK_NAME,
+    PLIVE_LINE_SET,
+    PLIVE_PARTNER_ID,
+    PLIVE_SPORT_CATALOG_FALLBACK,
     PliveStore,
+    coeff_room_for_event,
     event_id_from_channel,
+    handshake_emits,
     match_plive_event_to_odds_doc,
     parse_coeff_path,
+    parse_sport_hash,
     plive_wanted,
+    public_ui_subscribe_topics,
 )
 
 
@@ -96,3 +103,74 @@ def test_sport_1_filter_drops_other_sports():
     store.apply_meta("nba", {"sportId": 2, "home": "C", "away": "D"})
     assert "mlb" in store.mlb_events()
     assert "nba" not in store.mlb_events()
+
+
+def test_handshake_matches_public_ui():
+    emits = handshake_emits()
+    names = [e[0] for e in emits]
+    assert names == ["setSocketMetadata", "subscribeSystemEvents", "subscribe", "getCache"]
+    assert emits[0][1] == {"partnerId": PLIVE_PARTNER_ID, "flavor": "live"}
+    assert emits[1][1] == {"partnerId": 113}
+    topics = emits[2][1]
+    assert "live.sports" in topics
+    assert "sports" in topics
+    assert "live.events" in topics
+    assert f"live.main.{PLIVE_LINE_SET}" in topics
+    assert f"live.main.{PLIVE_LINE_SET}.eventData" in topics
+    assert f"live.main.{PLIVE_LINE_SET}.eventCoefficients" in topics
+    assert emits[3][1] == topics
+
+
+def test_sport_hash_top_soccer_is_220_not_mlb():
+    assert parse_sport_hash("#!/sport/220") == 220
+    assert parse_sport_hash("https://plive.becoms.co/live/?#!/sport/220") == 220
+    assert parse_sport_hash("#!/sport/1") == 1
+    assert PLIVE_SPORT_CATALOG_FALLBACK[1] == "Baseball"
+    assert PLIVE_SPORT_CATALOG_FALLBACK[220] == "Top Soccer"
+    # Live catalog, not the old Selenium nfl=2 / nba=3 map.
+    assert PLIVE_SPORT_CATALOG_FALLBACK[2] == "Basketball"
+    assert PLIVE_SPORT_CATALOG_FALLBACK[3] == "Football"
+
+
+def test_event_data_snapshot_extracts_teams(monkeypatch):
+    store = PliveStore()
+    store.apply_message(
+        {
+            "isDiff": False,
+            "payload": {
+                "1701": {
+                    "id": 1701,
+                    "si": 1,
+                    "p": {"1": {"n": "Boston Red Sox"}, "2": {"n": "New York Yankees"}},
+                },
+                "2209": {
+                    "id": 2209,
+                    "si": 220,
+                    "p": {"1": {"n": "Arsenal"}, "2": {"n": "Chelsea"}},
+                },
+            },
+        },
+        event_name=f"live.main.{PLIVE_LINE_SET}.eventData",
+    )
+    assert "1701" in store.mlb_events()
+    ev = store.events["1701"]
+    assert ev["away"] == "Boston Red Sox"
+    assert ev["home"] == "New York Yankees"
+    assert "2209" not in store.mlb_events()
+    assert coeff_room_for_event("1701").endswith(".eventCoefficients.1701")
+
+
+def test_live_sports_catalog_overrides_fallback():
+    store = PliveStore()
+    store.apply_message(
+        {"1": {"id": 1, "name": "Baseball"}, "2": {"id": 2, "name": "Basketball"}},
+        event_name="live.sports",
+    )
+    assert store.sport_catalog[1] == "Baseball"
+    assert store.sport_catalog[2] == "Basketball"
+
+
+def test_public_ui_topics_include_required_rooms():
+    topics = public_ui_subscribe_topics()
+    assert any(t.endswith(".eventData") for t in topics)
+    assert any(t.endswith(".eventCoefficients") for t in topics)

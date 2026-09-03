@@ -111,7 +111,7 @@ Change **one** setting, observe logs / rate-limit headers, then the next. **Live
 3. ~~**“Kalshi line required”**~~ — Done in broad-scan path: after `/odds/multi` merge, events with no Kalshi gameline decimals are dropped from the EV scan (batch HTTP unchanged); `[PIPELINE]` logs drop count.  
 4. ~~**Liquidity default sport list**~~ — Done: ``odds_api_sports_list()`` / ``LIQUIDITY_DEFAULT_ODDS_API_SPORTS`` in ``odds_api_client.py``; monitor pregame slugs aligned; pregame broad scan **off** by default.  
 5. ~~**Optional:** `.env.example`~~ — Done (no secrets).  
-6. ~~**WS client**~~ — `odds_api_ws.py` is the primary live path (MLB / `usa-mlb`, prematch+live, ML/Spread/Totals). REST is slate + `includeSeq` resync + `/odds/updated` fallback. PLive (`plive_pandora.py`) is a local sharp/display book.
+6. ~~**WS client**~~ — `odds_api_ws.py` is the primary live path (MLB / `usa-mlb`, prematch+live, ML/Spread/Totals). REST is slate + `includeSeq` resync + `/odds/updated` fallback. PLive (`plive_pandora.py`) uses the public Origin-only handshake (`setSocketMetadata` partner 113 + `subscribe`/`getCache` for `live.events` / `eventCoefficients`). Same existing EvAlert filters and dollar sizes; auto-bet OFF.
 
 ### WebSocket handoff (implemented)
 

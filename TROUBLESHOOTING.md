@@ -62,6 +62,7 @@ ufw reload
 - **Slate vs lines:** `ODDS_API_LIVE_EVENTS_TTL_SEC` (default long, ~20m) controls how often **which games are live** is re-fetched; `ODDS_API_LIVE_ODDS_TTL_SEC` (default **0**) controls caching of the **merged odds** snapshot for monitors. Lower the slate TTL temporarily (e.g. 90) when testing games **just** going live.
 - `ODDS_API_MAX_REQUESTS_PER_HOUR` defaults **5000** (Growth-style); set lower (e.g. 100) on strict free tiers.
 - Logs for HTTP 401/429 from Odds-API.io — fix key or slow polling.
+- PLive: look for `[PLIVE] handshake emitted` then `ack socketMetadataSet` / `subscribedSystemEvents`. Bare connect with no handshake is silent and will not yield MLB teams. Do not scrape BetBCK. Sport `#!/sport/220` is Top Soccer; MLB is `#!/sport/1`.
 
 ---
 

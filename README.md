@@ -21,6 +21,7 @@ That combination is enough:
 - The old per-poll `/odds/multi` hot loop is **not** the primary path when the WS is healthy (a 10-book REST poller will 429 a Growth WS account).
 - **Global auto-bet stays OFF** at startup. Same existing filter knobs and dollar sizes. Enable auto-bet from the dashboard when you trust the feed.
 - EvAlerts still come from `ev_calculator.py` (POWER / WORST_CASE / AVERAGE).
+- Default filter remains **Kalshi All Sports (3 Sharps Live)** (GAMELINES, minSharpBooks 3, POWER/AVERAGE vs Kalshi, bettingBooks=`[Kalshi]`). Auto-bet American band **-200..+200** (~30–70¢). CBB stays WORST_CASE / minSharp 2 / auto EV 10–25%. Dollar sizes stay `101 / 151 / 101 / 75 / 202 / 404`, `user_max_bet=100`, PX+Novig 2x. Persisted in `user_filters_state.json`.
 
 ## 10 bookmakers (Odds-API.io catalog names)
 
@@ -49,12 +50,19 @@ Docs: [WebSockets](https://docs.odds-api.io/guides/websockets) · [API](https://
 
 ## PLive (Pandora) — extra sharp/display book
 
-Port of `NDGopher/UnifiedBetting` `backend/pandora_odds_subscriber.py`:
+Origin-only Socket.IO. **No login. No cookies. No BetBCK. No BookieBeats DOM.**
 
-- Origin `https://plive.becoms.co`, URL `wss://pandora.ganchrow.com`, **no login**.
-- MLB is PLive `#!/sport/1`.
-- Lines are merged into the same EvAlert pipeline as book **`PLive`** (not sent to Odds-API.io).
-- **No BetBCK scrape. No BookieBeats DOM.**
+Public handshake (bare connect is silent):
+
+1. `wss://pandora.ganchrow.com/socket.io/?EIO=4&transport=websocket`
+2. Header `Origin: https://plive.becoms.co`
+3. After CONNECT emit `setSocketMetadata {partnerId: 113, flavor: "live"}`
+4. Then `subscribeSystemEvents` + `subscribe` / `getCache` for `live.sports`, `live.events`, `live.main.<LINE_SET>.eventData`, and per-event `eventCoefficients`
+
+- MLB is catalog **sport 1** (`#!/sport/1`). `https://plive.becoms.co/live/?#!/sport/220` is **Top Soccer**, not MLB.
+- Trust the `live.sports` catalog (1 Baseball, 2 Basketball, 3 Football, …). Do not use the old Selenium map that had nfl=2 / nba=3.
+- Lines merge into the same EvAlert / filter pipeline as book **`PLive`**. Kalshi stays the take venue (`bettingBooks=[Kalshi]`). Same filters and dollar sizes apply; PLive is not a new filter.
+- **No BetBCK scrape.**
 
 Disable with `PLIVE_ENABLED=false`.
 

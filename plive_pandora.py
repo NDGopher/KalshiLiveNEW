@@ -1,13 +1,24 @@
 """
-PLive (Pandora) odds subscriber — port of NDGopher/UnifiedBetting
-``backend/pandora_odds_subscriber.py``.
+PLive (Pandora) odds subscriber — Origin-only Socket.IO, no login.
 
-Connects directly to ``wss://pandora.ganchrow.com`` Socket.IO with
-``Origin: https://plive.becoms.co``. No login. No BetBCK scrape.
+Handshake matches the public live UI at https://plive.becoms.co/live/ :
 
-MLB on PLive is ``#!/sport/1``. This client keeps sport-1 events and converts
-ML / Spread / Totals into the same ``bookmakers["PLive"]`` market list shape
-used by Odds-API.io ``/odds`` so EvAlerts still come from ``ev_calculator.py``.
+  wss://pandora.ganchrow.com/socket.io/?EIO=4&transport=websocket
+  Header Origin: https://plive.becoms.co
+  After CONNECT:
+    1) setSocketMetadata {partnerId: 113, flavor: "live"}
+    2) subscribeSystemEvents {partnerId: 113}
+    3) subscribe + getCache for live.sports / live.events /
+       live.main.<LINE_SET> eventData + eventCoefficients
+
+Bare connect is silent. Do not scrape BetBCK. Do not send cookies.
+
+MLB is catalog sport 1 (hash ``#!/sport/1``). ``#!/sport/220`` is Top Soccer.
+Trust the live.sports catalog over any old Selenium sport map.
+
+Lines become ``bookmakers["PLive"]`` so EvAlerts still use the existing
+filter / dollar-size pipeline in ``ev_calculator.py`` (Kalshi remains the
+take venue).
 """
 from __future__ import annotations
 
@@ -16,7 +27,7 @@ import gzip
 import json
 import os
 import re
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from odds_api_client import _canonical_odds_api_bookmaker
 
@@ -24,8 +35,33 @@ PLIVE_BOOK_NAME = "PLive"
 PLIVE_ORIGIN = "https://plive.becoms.co"
 PLIVE_URL = "wss://pandora.ganchrow.com"
 PLIVE_SOCKETIO_PATH = "/socket.io/"
+PLIVE_PARTNER_ID = 113
+PLIVE_FLAVOR = "live"
+PLIVE_DISTRO = "main"
+# Public UI LINE_SET constant (live.main.<this>.eventData / eventCoefficients).
+PLIVE_LINE_SET = "U0VWU1NWUkJSMFU9"
 PLIVE_MLB_SPORT_ID = 1
 PLIVE_MLB_HASH = "#!/sport/1"
+PLIVE_TOP_SOCCER_SPORT_ID = 220
+PLIVE_TOP_SOCCER_HASH = "#!/sport/220"
+
+# Fallback only. Prefer names from the live.sports snapshot when present.
+# Do NOT use the old UnifiedBetting2 Selenium map (nfl=2 / nba=3) — that
+# conflicts with this live catalog (2=Basketball, 3=Football).
+PLIVE_SPORT_CATALOG_FALLBACK: Dict[int, str] = {
+    1: "Baseball",
+    2: "Basketball",
+    3: "Football",
+    4: "Hockey",
+    5: "Soccer",
+    8: "Tennis",
+    102: "College Basketball",
+    114: "E-Sports",
+    214: "FIFA World Cup 2026",
+    220: "Top Soccer",
+}
+
+_SPORT_HASH_RE = re.compile(r"#!?/sport/(\d+)", re.I)
 
 # Ganchrow coefficient tree (same parse as UnifiedBetting):
 #   /c/m/{market}/o/{outcome}/{index}
@@ -65,11 +101,97 @@ def _int_csv(name: str, default: Sequence[int]) -> Tuple[int, ...]:
     return tuple(out) if out else tuple(int(x) for x in default)
 
 
+def parse_sport_hash(value: str) -> Optional[int]:
+    """Parse ``#!/sport/220`` or a full PLive live URL into a catalog sport id."""
+    if not value:
+        return None
+    m = _SPORT_HASH_RE.search(str(value))
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
 def plive_sport_id() -> int:
+    page = (os.getenv("PLIVE_PAGE") or os.getenv("PLIVE_HASH") or "").strip()
+    hashed = parse_sport_hash(page)
+    if hashed is not None:
+        return hashed
     try:
         return int(os.getenv("PLIVE_SPORT_ID", str(PLIVE_MLB_SPORT_ID)))
     except ValueError:
         return PLIVE_MLB_SPORT_ID
+
+
+def plive_line_prefix() -> str:
+    line_set = (os.getenv("PLIVE_LINE_SET") or PLIVE_LINE_SET).strip() or PLIVE_LINE_SET
+    distro = (os.getenv("PLIVE_DISTRO") or PLIVE_DISTRO).strip() or PLIVE_DISTRO
+    flavor = (os.getenv("PLIVE_FLAVOR") or PLIVE_FLAVOR).strip() or PLIVE_FLAVOR
+    return f"{flavor}.{distro}.{line_set}"
+
+
+def plive_event_data_topic() -> str:
+    return f"{plive_line_prefix()}.eventData"
+
+
+def plive_event_coefficients_topic() -> str:
+    return f"{plive_line_prefix()}.eventCoefficients"
+
+
+def public_ui_subscribe_topics() -> List[str]:
+    """Rooms the public live UI subscribes after metadata (MLB-first set)."""
+    prefix = plive_line_prefix()
+    flavor = (os.getenv("PLIVE_FLAVOR") or PLIVE_FLAVOR).strip() or PLIVE_FLAVOR
+    return [
+        f"{flavor}.sports",
+        "sports",
+        f"{flavor}.events",
+        "live.events",
+        prefix,
+        plive_event_data_topic(),
+        plive_event_coefficients_topic(),
+        f"{flavor}.leagues",
+        f"{flavor}.wagerTypes",
+        f"{flavor}.sportPeriod",
+    ]
+
+
+def handshake_emits() -> List[Tuple[str, Any]]:
+    """Exact post-CONNECT emits. No cookies, no BetBCK."""
+    partner = int(os.getenv("PLIVE_PARTNER_ID", str(PLIVE_PARTNER_ID)) or PLIVE_PARTNER_ID)
+    flavor = (os.getenv("PLIVE_FLAVOR") or PLIVE_FLAVOR).strip() or PLIVE_FLAVOR
+    topics = public_ui_subscribe_topics()
+    return [
+        ("setSocketMetadata", {"partnerId": partner, "flavor": flavor}),
+        ("subscribeSystemEvents", {"partnerId": partner}),
+        ("subscribe", topics),
+        ("getCache", topics),
+    ]
+
+
+def coeff_room_for_event(event_id: str) -> str:
+    return f"{plive_event_coefficients_topic()}.{event_id}"
+
+
+def _is_sports_topic(event_name: Optional[str]) -> bool:
+    t = str(event_name or "").lower()
+    return t.endswith(".sports") or t == "sports" or t.endswith(".leagues")
+
+
+def _is_event_list_topic(event_name: Optional[str]) -> bool:
+    t = str(event_name or "")
+    if not t:
+        return False
+    if "eventCoefficients" in t:
+        return False
+    return (
+        t.endswith(".eventData")
+        or t.endswith(".events")
+        or t == "live.events"
+        or t == plive_line_prefix()
+    )
 
 
 def parse_coeff_path(path: str) -> Optional[Dict[str, Any]]:
@@ -118,7 +240,126 @@ def _decimal_from_slot(slots: Dict[int, Any]) -> Optional[float]:
     return None
 
 
-_EVENT_ID_RE = re.compile(r"(?:eventCoefficients|event)[./](\d+)", re.I)
+_EVENT_ID_RE = re.compile(r"(?:eventCoefficients|eventData|event)[./](\d+)", re.I)
+
+
+def _first_name(obj: Any) -> Optional[str]:
+    if isinstance(obj, str) and obj.strip():
+        return obj.strip()
+    if isinstance(obj, dict):
+        for k in ("name", "n", "shortName", "sn", "displayName", "teamName", "desc"):
+            v = obj.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    return None
+
+
+def _teams_from_event(data: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    home = data.get("home") or data.get("homeTeam") or data.get("home_name") or data.get("t2")
+    away = data.get("away") or data.get("awayTeam") or data.get("away_name") or data.get("t1")
+    home = _first_name(home) if not isinstance(home, str) else home
+    away = _first_name(away) if not isinstance(away, str) else away
+    participants = (
+        data.get("participants")
+        or data.get("teams")
+        or data.get("p")
+        or data.get("contestants")
+    )
+    names: List[str] = []
+    if isinstance(participants, list):
+        for p in participants:
+            n = _first_name(p) if not isinstance(p, str) else p.strip()
+            if n:
+                names.append(n)
+    elif isinstance(participants, dict):
+        for key in ("1", 1, "away", "a"):
+            n = _first_name(participants.get(key))
+            if n:
+                names.append(n)
+                break
+        for key in ("2", 2, "home", "h"):
+            n = _first_name(participants.get(key))
+            if n:
+                names.append(n)
+                break
+    if len(names) >= 2:
+        away = away or names[0]
+        home = home or names[1]
+    return (str(home) if home else None, str(away) if away else None)
+
+
+def _looks_like_event(rec: Dict[str, Any]) -> bool:
+    if not isinstance(rec, dict):
+        return False
+    if rec.get("id") or rec.get("eventId") or rec.get("ei"):
+        if rec.get("sportId") or rec.get("si") or rec.get("s") or rec.get("home") or rec.get("p") or rec.get("participants"):
+            return True
+    home, away = _teams_from_event(rec)
+    return bool(home and away)
+
+
+def iter_event_records(data: Any, *, _depth: int = 0) -> Iterable[Tuple[str, Dict[str, Any]]]:
+    """Walk an eventData / live.events snapshot for id + team records."""
+    if _depth > 6 or data is None:
+        return
+    if isinstance(data, list):
+        for item in data:
+            yield from iter_event_records(item, _depth=_depth + 1)
+        return
+    if not isinstance(data, dict):
+        return
+    inner = data.get("payload") if "payload" in data and data.get("isDiff") is not True else None
+    if inner is not None and inner is not data:
+        yield from iter_event_records(inner, _depth=_depth + 1)
+        return
+    if data.get("isDiff") and isinstance(data.get("payload"), list):
+        # Diff of event list: only apply replace/add objects that look like events.
+        for op in data["payload"]:
+            if not isinstance(op, dict):
+                continue
+            val = op.get("value")
+            if isinstance(val, dict) and _looks_like_event(val):
+                eid = str(val.get("id") or val.get("eventId") or val.get("ei") or "")
+                if eid:
+                    yield eid, val
+        return
+    if _looks_like_event(data):
+        eid = str(data.get("id") or data.get("eventId") or data.get("ei") or "")
+        if eid:
+            yield eid, data
+            return
+    for key, val in data.items():
+        if key in ("payload", "parsedPayload", "topicInfo", "ti"):
+            yield from iter_event_records(val, _depth=_depth + 1)
+            continue
+        if isinstance(val, dict) and _looks_like_event(val):
+            eid = str(val.get("id") or val.get("eventId") or val.get("ei") or key)
+            if eid and eid not in ("payload", "c", "m"):
+                yield eid, val
+        elif isinstance(val, (dict, list)):
+            yield from iter_event_records(val, _depth=_depth + 1)
+
+
+def _unwrap_catalog(data: Any) -> List[Tuple[str, Dict[str, Any]]]:
+    out: List[Tuple[str, Dict[str, Any]]] = []
+    if isinstance(data, dict) and data.get("payload") is not None and not data.get("isDiff"):
+        data = data["payload"]
+    if isinstance(data, dict):
+        for key in ("sports", "leagues", "value"):
+            if isinstance(data.get(key), (dict, list)):
+                data = data[key]
+                break
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                out.append((str(item.get("id") or ""), item))
+    elif isinstance(data, dict):
+        for key, val in data.items():
+            if isinstance(val, dict):
+                out.append((str(key), val))
+            elif isinstance(val, str) and str(key).isdigit():
+                out.append((str(key), {"id": key, "name": val}))
+    return out
 
 
 def event_id_from_channel(event_name: Optional[str]) -> Optional[str]:
@@ -195,6 +436,7 @@ class PliveStore:
         self.spread_markets = _int_csv("PLIVE_MARKET_SPREAD", _DEFAULT_SPREAD_MARKETS)
         self.total_markets = _int_csv("PLIVE_MARKET_TOTALS", _DEFAULT_TOTAL_MARKETS)
         self.sport_id = plive_sport_id()
+        self.sport_catalog: Dict[int, str] = dict(PLIVE_SPORT_CATALOG_FALLBACK)
 
     def _event(self, eid: str) -> Dict[str, Any]:
         ev = self.events.get(eid)
@@ -209,38 +451,57 @@ class PliveStore:
             self.events[eid] = ev
         return ev
 
+    def apply_sports_catalog(self, data: Any) -> None:
+        """Merge live.sports snapshot. Trust this over the old Selenium map."""
+        records = _unwrap_catalog(data)
+        changed = False
+        for key, rec in records:
+            try:
+                sid = int(rec.get("id") or rec.get("sportId") or rec.get("si") or key)
+            except (TypeError, ValueError):
+                continue
+            name = _first_name(rec) or rec.get("n") or rec.get("name") or rec.get("displayName")
+            if name:
+                self.sport_catalog[sid] = str(name)
+                changed = True
+        if changed:
+            self.generation += 1
+
+    def apply_event_catalog(self, data: Any) -> List[str]:
+        """Ingest eventData / live.events snapshot. Returns event ids seen."""
+        seen: List[str] = []
+        for eid, rec in iter_event_records(data):
+            self.apply_meta(eid, rec)
+            seen.append(eid)
+        return seen
+
     def apply_meta(self, eid: str, data: Dict[str, Any]) -> None:
         ev = self._event(eid)
-        sport = data.get("sportId") or data.get("sport_id") or data.get("sport")
+        sport = (
+            data.get("sportId")
+            or data.get("sport_id")
+            or data.get("si")
+            or data.get("s")
+            or data.get("sport")
+        )
         if isinstance(sport, dict):
-            sport = sport.get("id") or sport.get("sportId")
+            sport = sport.get("id") or sport.get("sportId") or sport.get("si")
         if sport is not None:
             try:
                 ev["sport_id"] = int(sport)
             except (TypeError, ValueError):
-                if str(sport).lower() in ("baseball", "mlb"):
-                    ev["sport_id"] = self.sport_id
-        home = data.get("home") or data.get("homeTeam") or data.get("home_name")
-        away = data.get("away") or data.get("awayTeam") or data.get("away_name")
-        if isinstance(home, dict):
-            home = home.get("name") or home.get("shortName")
-        if isinstance(away, dict):
-            away = away.get("name") or away.get("shortName")
+                name = str(sport).lower()
+                if name in ("baseball", "mlb"):
+                    ev["sport_id"] = 1
+                elif name in ("basketball", "nba"):
+                    ev["sport_id"] = 2
+                elif name in ("football", "nfl"):
+                    ev["sport_id"] = 3
+        home, away = _teams_from_event(data)
         if home:
-            ev["home"] = str(home)
+            ev["home"] = home
         if away:
-            ev["away"] = str(away)
-        participants = data.get("participants") or data.get("teams")
-        if isinstance(participants, list) and len(participants) >= 2 and not (ev.get("home") and ev.get("away")):
-            names = []
-            for p in participants:
-                if isinstance(p, dict):
-                    names.append(str(p.get("name") or p.get("shortName") or ""))
-                else:
-                    names.append(str(p))
-            if len(names) >= 2:
-                ev["away"] = ev.get("away") or names[0]
-                ev["home"] = ev.get("home") or names[1]
+            ev["away"] = away
         self.generation += 1
 
     def set_coeff(self, eid: str, market: int, outcome: str, index: Optional[int], value: Any) -> None:
@@ -301,6 +562,12 @@ class PliveStore:
     def apply_message(self, data: Any, event_name: Optional[str] = None) -> bool:
         """Apply one Pandora payload. Returns True if state changed."""
         before = self.generation
+        if _is_sports_topic(event_name):
+            self.apply_sports_catalog(data)
+            return self.generation != before
+        if _is_event_list_topic(event_name):
+            self.apply_event_catalog(data)
+            return self.generation != before
         eid = event_id_from_channel(event_name)
         if isinstance(data, dict):
             if data.get("id") is not None and eid is None:
@@ -314,6 +581,10 @@ class PliveStore:
                 tree = data.get("payload") if isinstance(data.get("payload"), dict) else data
                 if isinstance(tree, dict) and ("c" in tree or "m" in tree):
                     self.apply_coeff_tree(eid, tree)
+            elif _looks_like_event(data) or (isinstance(data.get("payload"), (dict, list))):
+                self.apply_event_catalog(data)
+        elif isinstance(data, list):
+            self.apply_event_catalog(data)
         return self.generation != before
 
     def is_mlb_event(self, ev: Dict[str, Any]) -> bool:
@@ -456,6 +727,8 @@ class PlivePandoraFeed:
         self._reconnect_attempts = 0
         self._dirty = asyncio.Event()
         self.generation = 0
+        self._coeff_subscribed: Set[str] = set()
+        self._ack_names: Set[str] = set()
 
     @property
     def healthy(self) -> bool:
@@ -464,6 +737,17 @@ class PlivePandoraFeed:
     def _mark_dirty(self) -> None:
         self.generation = self.store.generation
         self._dirty.set()
+
+    async def wait_dirty_or_timeout(self, timeout: float) -> bool:
+        try:
+            await asyncio.wait_for(self._dirty.wait(), timeout=max(0.05, float(timeout)))
+        except asyncio.TimeoutError:
+            return False
+        debounce = float(os.getenv("PLIVE_DEBOUNCE_SEC", "0.25"))
+        if debounce > 0:
+            await asyncio.sleep(debounce)
+        self._dirty.clear()
+        return True
 
     def handle_payload(self, data: Any, event_name: Optional[str] = None) -> None:
         if self.store.apply_message(data, event_name):
@@ -499,6 +783,43 @@ class PlivePandoraFeed:
             return []
         return self.store.markets_for_event(eid)
 
+    async def _emit_public_handshake(self, sio: Any) -> None:
+        for event, payload in handshake_emits():
+            try:
+                await sio.emit(event, payload)
+            except Exception as ex:
+                print(f"[PLIVE] [WARN] emit {event} failed: {ex}")
+        topics = public_ui_subscribe_topics()
+        print(f"[PLIVE] handshake emitted setSocketMetadata + subscribe/getCache ({len(topics)} rooms)")
+
+    async def _subscribe_mlb_coefficients(self, sio: Any) -> None:
+        """Per-event coeff rooms — required for team names + live game lines."""
+        want = int(self.store.sport_id)
+        new_rooms: List[str] = []
+        for eid, ev in self.store.events.items():
+            sid = ev.get("sport_id")
+            if sid is not None:
+                try:
+                    if int(sid) != want:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+            room = coeff_room_for_event(str(eid))
+            if room in self._coeff_subscribed:
+                continue
+            self._coeff_subscribed.add(room)
+            new_rooms.append(room)
+        if not new_rooms:
+            return
+        # Cap so we stay on MLB first and do not flood soccer/NFL rooms.
+        batch = new_rooms[:80]
+        try:
+            await sio.emit("subscribe", batch)
+            await sio.emit("getCache", batch)
+            print(f"[PLIVE] subscribed eventCoefficients for {len(batch)} events (sport {want})")
+        except Exception as ex:
+            print(f"[PLIVE] [WARN] coeff subscribe failed: {ex}")
+
     async def start(self) -> None:
         if self._running:
             return
@@ -507,7 +828,8 @@ class PlivePandoraFeed:
             self._task = asyncio.create_task(self._run_loop(), name="plive-pandora")
         print(
             f"[PLIVE] starting Pandora Socket.IO ({PLIVE_URL}) origin={PLIVE_ORIGIN} "
-            f"MLB {PLIVE_MLB_HASH} sportId={plive_sport_id()} (no login)"
+            f"partner={PLIVE_PARTNER_ID} flavor={PLIVE_FLAVOR} MLB {PLIVE_MLB_HASH} "
+            f"sportId={plive_sport_id()} (no login, no cookies)"
         )
 
     async def stop(self) -> None:
@@ -560,27 +882,49 @@ class PlivePandoraFeed:
 
         sio = socketio.AsyncClient(reconnection=False, logger=False, engineio_logger=False)
         self._sio = sio
+        self._coeff_subscribed = set()
+        self._ack_names = set()
 
         @sio.on("connect")
         async def _on_connect() -> None:
             self.connected = True
-            print(f"[PLIVE] connected sid={getattr(sio, 'sid', None)} — filter MLB {PLIVE_MLB_HASH}")
-            # Best-effort subscribe; the UnifiedBetting client also received a broadcast without this.
-            for payload in (PLIVE_MLB_HASH, {"sport": plive_sport_id()}, f"sport/{plive_sport_id()}"):
-                try:
-                    await sio.emit("subscribe", payload)
-                except Exception:
-                    pass
+            print(
+                f"[PLIVE] connected sid={getattr(sio, 'sid', None)} — "
+                f"public-UI handshake partner={PLIVE_PARTNER_ID} MLB {PLIVE_MLB_HASH}"
+            )
+            await self._emit_public_handshake(sio)
 
         @sio.on("disconnect")
         async def _on_disconnect() -> None:
             self.connected = False
             print("[PLIVE] disconnected from pandora.ganchrow.com")
 
+        @sio.on("socketMetadataSet")
+        async def _on_meta(data: Any = None) -> None:
+            self._ack_names.add("socketMetadataSet")
+            print("[PLIVE] ack socketMetadataSet")
+
+        @sio.on("subscribedSystemEvents")
+        async def _on_sys(data: Any = None) -> None:
+            self._ack_names.add("subscribedSystemEvents")
+            rooms = []
+            if isinstance(data, dict):
+                if data.get("room"):
+                    rooms.append(str(data["room"]))
+                rooms.extend(str(r) for r in (data.get("rooms") or []) if r)
+            print(f"[PLIVE] ack subscribedSystemEvents rooms={rooms}")
+
+        @sio.on("subscribed")
+        async def _on_sub(data: Any = None) -> None:
+            self._ack_names.add("subscribed")
+            print(f"[PLIVE] ack subscribed {data!r}"[:240])
+
         @sio.on("*")
         async def _on_any(event_name: str, *args: Any) -> None:
             for arg in args:
                 self.ingest_raw(arg, event_name)
+            if _is_event_list_topic(event_name) or event_name in ("live.events", "sports"):
+                await self._subscribe_mlb_coefficients(sio)
 
         origin = (os.getenv("PLIVE_ORIGIN") or PLIVE_ORIGIN).strip()
         url = (os.getenv("PLIVE_URL") or PLIVE_URL).strip()
@@ -594,8 +938,21 @@ class PlivePandoraFeed:
             },
             wait_timeout=10,
         )
+        ping_every = 4 * 60
+        last_ping = asyncio.get_event_loop().time()
+        last_coeff = 0.0
         try:
             while self._running and sio.connected:
+                now = asyncio.get_event_loop().time()
+                if now - last_ping >= ping_every:
+                    try:
+                        await sio.emit("ping")
+                    except Exception:
+                        pass
+                    last_ping = now
+                if now - last_coeff >= 2.0:
+                    await self._subscribe_mlb_coefficients(sio)
+                    last_coeff = now
                 await asyncio.sleep(0.5)
         finally:
             if sio.connected:
