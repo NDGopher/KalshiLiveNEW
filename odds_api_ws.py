@@ -41,10 +41,14 @@ from odds_api_client import (
     api_wire_bookmakers,
     get_shared_odds_client,
     odds_api_master_bookmakers,
+    sport_slug_query_for_api,
 )
 
 WS_DEFAULT_URL = "wss://api.odds-api.io/v3/ws"
 DEFAULT_WS_MARKETS = ("ML", "Spread", "Totals")
+# Official Odds-API slugs. football = soccer; american-football = NFL/CFB.
+# Do not pin usa-mlb when this set is active — that would drop soccer/CFB.
+DEFAULT_WS_SPORTS = ("baseball", "football", "american-football")
 MAX_MARKETS = 20
 MAX_SPORTS = 10
 MAX_LEAGUES = 20
@@ -208,12 +212,36 @@ def parse_ws_status(raw: Any = None) -> Optional[str]:
     return s
 
 
+def _normalize_ws_sports(values: Sequence[str]) -> List[str]:
+    """Map UI / env aliases to Odds-API sport slugs (soccer → football)."""
+    seen: Set[str] = set()
+    out: List[str] = []
+    for raw in values:
+        q = sport_slug_query_for_api(str(raw))
+        k = q.lower()
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        out.append(q)
+    return out
+
+
 def mlb_ws_slice_active() -> bool:
-    """True when this process is the baseball / usa-mlb WS slice (default)."""
-    sports = _parse_csv_values(os.getenv("ODDS_API_WS_SPORT") or os.getenv("ODDS_API_WS_SPORTS") or os.getenv("ODDS_API_SPORTS"))
-    if not sports or (len(sports) == 1 and sports[0].lower() in ("baseball", "all", "*", "everything")):
-        return True
-    return len(sports) == 1 and sports[0].lower() == "baseball"
+    """True only when this process is an explicit baseball-only WS slice.
+
+    Unset / ``all`` is multi-sport (baseball + soccer + American football).
+    Pinning ``usa-mlb`` happens only for this baseball-only slice so soccer
+    and CFB/NFL event IDs are not dropped from the same connection.
+    """
+    sports = _parse_csv_values(
+        os.getenv("ODDS_API_WS_SPORT") or os.getenv("ODDS_API_WS_SPORTS") or os.getenv("ODDS_API_SPORTS")
+    )
+    if not sports:
+        return False
+    if len(sports) == 1 and sports[0].lower() in ("all", "*", "everything"):
+        return False
+    mapped = _normalize_ws_sports(sports)
+    return mapped == ["baseball"]
 
 
 def _bounded_csv(values: Sequence[str], *, max_n: int, kind: str) -> List[str]:
@@ -277,12 +305,16 @@ def ws_filters_from_env(
     elif env_rest_sports and env_rest_sports[0].lower() not in ("all", "*", "everything"):
         use_sports = env_rest_sports
     else:
-        # MLB-first default — do not fan out soccer/NFL on the single WS connection.
-        use_sports = ["baseball"]
+        # Multi-sport default: baseball + soccer (football) + NFL/CFB.
+        # One WS connection; event IDs stay Odds-API ids. Do not pin usa-mlb here.
+        use_sports = list(DEFAULT_WS_SPORTS)
+    use_sports = _normalize_ws_sports(use_sports)
 
     if not use_leagues and not use_eids and scope not in ("events", "eventids", "event_ids"):
         sport_keys = {s.lower().replace("_", "-") for s in use_sports}
-        if sport_keys == {"baseball"} or mlb_ws_slice_active():
+        # Pin usa-mlb only on an explicit baseball-only slice. A multi-sport
+        # leagues=usa-mlb filter would drop soccer and CFB/NFL from the wire.
+        if sport_keys == {"baseball"}:
             mlb_lg = (os.getenv("ODDS_API_LEAGUE_MLB") or "usa-mlb").strip()
             if mlb_lg:
                 use_leagues = [mlb_lg]

@@ -506,8 +506,51 @@ def _merge_min_sharp_limits(payload: dict, sharp_names: List[str]) -> None:
 
 _merge_min_sharp_limits(DEFAULT_FILTER_PAYLOAD, sharps_list)
 _merge_min_sharp_limits(CBB_FILTER_PAYLOAD, cbb_sharps)
-# By default, both filters should be selected for both dashboard and auto-bettor
-selected_dashboard_filters = [DEFAULT_FILTER_NAME, CBB_FILTER_NAME]
+
+# Soccer live filter: minSharp 2, GAMELINES only. BetMGM is a poor soccer
+# source — drop it from the soccer sharp pack only (tiles / account list stay).
+# Auto-bet stays OFF. Do not add LowVig. Do not change DEFAULT minSharp 3.
+SOCCER_FILTER_NAME = "Soccer Live (2 Sharps)"
+soccer_sharps = [b for b in sharps_list if _dnorm(b) != "betmgm"]
+SOCCER_FILTER_PAYLOAD = {
+    "state": "ND",
+    "bettingBooks": ["Kalshi"],
+    "displayBooks": list(display_books_list),
+    "leagues": ["SOCCER_ALL"],
+    "excludedCategories": [
+        "1st Quarter",
+        "2nd Quarter",
+        "3rd Quarter",
+        "4th Quarter",
+        "1st Half",
+        "2nd Half",
+        "Team Total",
+        "Team Totals",
+    ],
+    "betTypes": ["GAMELINES"],
+    "minRoi": 0,
+    "middleStatus": "INCLUDE",
+    "middleFilters": [{"sport": "Any", "minHold": 0, "minMiddle": 0}],
+    "sortOrder": "ROI",
+    "devigFilter": {
+        "sharps": list(soccer_sharps),
+        "method": "POWER",
+        "type": "AVERAGE",
+        "minEv": 0,
+        "minLimit": 0,
+        "minSharpBooks": 2,
+        "hold": [{"book": "Any", "max": 8}],
+    },
+    "oddsRanges": [{"book": "Any", "min": -500, "max": 500}],
+    "minLimits": [{"book": "Kalshi", "min": 75}],
+    "minSharpLimits": [],
+    "linkType": "DESKTOP_BETSLIP",
+}
+_merge_min_sharp_limits(SOCCER_FILTER_PAYLOAD, soccer_sharps)
+saved_filters[SOCCER_FILTER_NAME] = SOCCER_FILTER_PAYLOAD
+
+# Dashboard shows the three product filters. Auto-bettor stays empty (OFF).
+selected_dashboard_filters = [DEFAULT_FILTER_NAME, CBB_FILTER_NAME, SOCCER_FILTER_NAME]
 selected_auto_bettor_filters = []
 
 
@@ -561,6 +604,10 @@ def _load_filters_state() -> None:
 
 
 _load_filters_state()
+# Disk overlay cannot drop or weaken the soccer live filter.
+saved_filters[SOCCER_FILTER_NAME] = SOCCER_FILTER_PAYLOAD
+if SOCCER_FILTER_NAME not in selected_dashboard_filters:
+    selected_dashboard_filters.append(SOCCER_FILTER_NAME)
 
 
 def _live_odds_display_books() -> List[str]:
@@ -1573,7 +1620,9 @@ async def _live_odds_build_snapshot_with_client(
             )
         )
     _log_live_odds_book_flow_and_pipeline(books, rows_out, timing_l, sport_l)
-    sport_wants_plive = sport_l in ("all", "baseball") or lf in ("all", "mlb")
+    sport_wants_plive = (
+        sport_l in ("all", "baseball", "football", "soccer") or lf in ("all", "mlb")
+    )
     if sport_wants_plive:
         _merge_plive_into_live_odds_rows(rows_out, _plive_board_rows())
     return {
@@ -1631,6 +1680,14 @@ auto_bet_settings_by_filter[DEFAULT_FILTER_NAME] = {
 }
 auto_bet_settings_by_filter[CBB_FILTER_NAME] = {
     'ev_min': 10.0,
+    'ev_max': 25.0,
+    'odds_min': -200,
+    'odds_max': 200,
+    'amount': 101.0,
+    'enabled': False,
+}
+auto_bet_settings_by_filter[SOCCER_FILTER_NAME] = {
+    'ev_min': 5.0,
     'ev_max': 25.0,
     'odds_min': -200,
     'odds_max': 200,
@@ -9051,7 +9108,7 @@ def delete_filter():
     if not filter_name:
         return jsonify({'error': 'Filter name required'}), 400
 
-    if filter_name == DEFAULT_FILTER_NAME or filter_name == CBB_FILTER_NAME:
+    if filter_name in (DEFAULT_FILTER_NAME, CBB_FILTER_NAME, SOCCER_FILTER_NAME):
         return jsonify({'error': 'Cannot delete default filters'}), 400
     
     if filter_name in saved_filters:

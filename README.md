@@ -13,7 +13,22 @@ ODDS_API_SPORTS=baseball
 ODDS_API_LEAGUE_MLB=usa-mlb
 ```
 
-That combination is enough:
+That combination is the **baseball-only** slice (`leagues=usa-mlb` is pinned only then).
+
+Default / recommended multi-sport WS (keep MLB; add soccer + NFL/CFB):
+
+```bash
+ODDS_API_SPORTS=baseball,football,american-football
+# Do not set ODDS_API_WS_LEAGUES=usa-mlb here — that would drop soccer and CFB/NFL.
+```
+
+- Unset / `all` sports also use `baseball,football,american-football` on the WS (no `usa-mlb` pin).
+- Official soccer slug is **`football`**. American football (NFL/CFB) is **`american-football`**.
+- WebSocket connects to `wss://api.odds-api.io/v3/ws?apiKey=...` with those sports, `markets=ML,Spread,Totals`, and **no `leagues=`** unless you are on the baseball-only slice.
+- One connection per key. `leagues` and `eventIds` are mutually exclusive (`eventIds` max 50) — do not use eventIds for the multi-sport slate.
+- Selected books ≠ books that actually return soccer prices. This repo does not invent Circa/Kalshi/Polymarket/NoVig/BetMGM soccer coverage.
+
+That combination is enough for the baseball-only pin:
 
 - WebSocket connects to `wss://api.odds-api.io/v3/ws?apiKey=...` with `sport=baseball`, `leagues=usa-mlb`, `markets=ML,Spread,Totals`.
 - **No `status=` param** so you get **prematch + live** on the one connection (the API allows only `live` *or* `prematch`, not both).
@@ -21,7 +36,7 @@ That combination is enough:
 - The old per-poll `/odds/multi` hot loop is **not** the primary path when the WS is healthy (a 10-book REST poller will 429 a Growth WS account).
 - **Global auto-bet stays OFF** at startup. Same existing filter knobs and dollar sizes. Enable auto-bet from the dashboard when you trust the feed.
 - EvAlerts still come from `ev_calculator.py` (POWER / WORST_CASE / AVERAGE).
-- Default filter remains **Kalshi All Sports (3 Sharps Live)** (GAMELINES, minSharpBooks 3, POWER/AVERAGE vs Kalshi, bettingBooks=`[Kalshi]`). Auto-bet American band **-200..+200** (~30–70¢). CBB stays WORST_CASE / minSharp 2 / auto EV 10–25%. Dollar sizes stay `101 / 151 / 101 / 75 / 202 / 404`, `user_max_bet=100`, PX+Novig 2x. Persisted in `user_filters_state.json`.
+- Default filter remains **Kalshi All Sports (3 Sharps Live)** (GAMELINES, minSharpBooks 3, POWER/AVERAGE vs Kalshi, bettingBooks=`[Kalshi]`). Auto-bet American band **-200..+200** (~30–70¢). CBB stays WORST_CASE / minSharp 2 / auto EV 10–25%. **Soccer Live (2 Sharps)** is a third dashboard filter (SOCCER_ALL, GAMELINES, minSharp 2, POWER/AVERAGE). BetMGM is excluded from the soccer **sharp pack only** (tiles / account selection stay). 1H / team totals are excluded. Soccer auto-bet stays OFF. Dollar sizes stay `101 / 151 / 101 / 75 / 202 / 404`, `user_max_bet=100`, PX+Novig 2x. Persisted in `user_filters_state.json`.
 
 ## 10 bookmakers (Odds-API.io catalog names)
 
@@ -59,9 +74,10 @@ Public handshake (bare connect is silent):
 1. `wss://pandora.ganchrow.com/socket.io/?EIO=4&transport=websocket`
 2. Header `Origin: https://plive.becoms.co`
 3. After CONNECT emit `setSocketMetadata {partnerId: 113, flavor: "live"}`
-4. Then `subscribeSystemEvents` + `subscribe` / `getCache` once for `live.sports` (names) and `live.main.<LINE_SET>.eventData` (directory). For each live MLB id (sport 1, league 8) subscribe `eventCoefficients.{id}` (click-in full book: run lines, team totals, margins) and unsubscribe when finished. `live.events` is dead. `#!/event/{id}` is a client-side route — do not scrape the HTML.
+4. Then `subscribeSystemEvents` + `subscribe` / `getCache` once for `live.sports` (names) and `live.main.<LINE_SET>.eventData` (directory). For each wanted live id (MLB sport 1 / league 8, soccer sport 5, Top Soccer 220) subscribe `eventCoefficients.{id}` and unsubscribe when finished. `live.events` is dead. `#!/event/{id}` is a client-side route — do not scrape the HTML.
 
-- MLB is catalog **sport 1** (`#!/sport/1`). `https://plive.becoms.co/live/?#!/sport/220` is **Top Soccer**, not MLB.
+- MLB is catalog **sport 1** (`#!/sport/1`). Soccer is native **sport 5** (`#!/sport/5`). `https://plive.becoms.co/live/?#!/sport/220` is the public-UI **Top Soccer** bucket. `live.sports` names both on the same connection. They appear as `s[5]` / `s[220]` on the **same** `eventData` tree — no extra sport-room. `s[220]` can be empty while native 5 still has live soccer.
+- **Mapping boundary:** Odds-API event IDs already join Odds-API books. PLive uses Pandora ids and needs a **separate** join. Soccer matching requires normalized competition (when both sides publish a name), same-orientation home+away token identity (never a swap), and a start-time window (Odds-API `startTime`/`startsAt`/`commence_time`/`date` vs PLive eventData unix / `ip`) or both live. Stale `coeff_updated_at` is rejected. Zero or two-plus survivors emit **no** PLive markets and **no** EV. Team-name fuzzy-only is forbidden. MLB still uses the older swap-tolerant matcher.
 - `eventData` list is **[home, away]** (stadium home first). Market 6 `[idx0, idx1]` is a 2-way decimal pair, not money/decimal.
 - PLive run-line name/ticker: away keeps the **slot sign** (`line_style=american`) so a −1.5 slot is not painted as Sox +1.5. Kalshi/Odds-API still negate home `hdp` for away.
 - Trust the `live.sports` catalog (1 Baseball, 2 Basketball, 3 Football, …). Do not use the old Selenium map that had nfl=2 / nba=3.
