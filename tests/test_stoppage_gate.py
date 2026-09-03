@@ -66,16 +66,8 @@ def test_live_odds_forwards_clock_and_status_detail():
     assert fields["clock_running"] is False
     assert fields["statusDetail"] == "Halftime"
     dash = (REPO / "dashboard.py").read_text(encoding="utf-8")
-<<<<<<< HEAD
     assert "clock=clock_fields[\"clock\"]" in dash
     assert "status_detail=clock_fields[\"statusDetail\"]" in dash
-=======
-    assert "clock_fields[\"clock\"]" in dash or "clock=clock_fields[\"clock\"]" in dash
-    assert (
-        "clock_fields[\"statusDetail\"]" in dash
-        or "status_detail=clock_fields[\"statusDetail\"]" in dash
-    )
->>>>>>> e9cc1c9 (Keep PLive-take totals listing after the market-key lock.)
 
 
 def test_ws_persists_raw_clock_and_status_detail():
