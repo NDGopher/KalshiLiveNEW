@@ -1,9 +1,16 @@
-"""P0: +0.00% totals flood. Zero is not a KEEP. Auto-bet stays OFF."""
+"""P0: +0.00% totals flood. Zero is not a KEEP. Auto-bet stays OFF.
+
+minSharp is 3 for display and auto-bet. Alts are valid markets but still
+need 3 on-pack sharps on that exact strike.
+"""
 from __future__ import annotations
 
-from ev_calculator import american_to_decimal, is_plus_print_ev
+from pathlib import Path
+
+from ev_calculator import LIVE_REC_POWER_MAX_AGE_SEC, american_to_decimal, is_plus_print_ev
 from odds_ev_monitor import (
     OddsEVMonitor,
+    _scan_strike_key,
     drop_both_plus_total_alerts,
 )
 from tests.test_plive_totals_alerts import _totals_monitor
@@ -363,3 +370,157 @@ def test_mlb_stale_rec_out_of_power_no_certified_break():
         "clock": {"running": True},
     }
     assert _rec_quote_in_power(stale, nba_live, now) is False
+    assert 30.0 <= float(LIVE_REC_POWER_MAX_AGE_SEC) <= 60.0
+
+
+def test_scan_strike_key_keeps_alts_independent():
+    """O7 and O10.5 are different seen_sides keys. Run-line alts too."""
+    assert _scan_strike_key({"hdp": 7, "max": 7, "line": 7}, "Totals") == 7.0
+    assert _scan_strike_key({"hdp": 10.5, "max": 10.5}, "Totals") == 10.5
+    assert _scan_strike_key({"hdp": 7}, "Totals") != _scan_strike_key({"hdp": 10.5}, "Totals")
+    assert _scan_strike_key({"hdp": -1.5}, "Spread") != _scan_strike_key({"hdp": -2.5}, "Spread")
+
+
+def test_scan_walks_every_totals_hdp_not_first_row_only():
+    """Kalshi Over 7 with a ticker must not skip PLive Over 10.5 / 11.5."""
+    mon = _ou_monitor()
+    href = "https://kalshi.com/markets/KXMLBTOTAL-STL7"
+    doc = {
+        "id": STL_LAD_EID,
+        "home": "Los Angeles Dodgers",
+        "away": "St. Louis Cardinals",
+        "league": "MLB",
+        "bookmakers": {
+            "Kalshi": [
+                {
+                    "name": "Totals",
+                    "odds": [
+                        {
+                            **_totals_row(7.0, -110, -110),
+                            "href": href,
+                        }
+                    ],
+                }
+            ],
+            "PLive": [
+                {
+                    "name": "Totals",
+                    "odds": [
+                        _totals_row(7.0, 105, -120),
+                        _totals_row(10.5, 105, -120),
+                        _totals_row(11.5, 130, -160),
+                    ],
+                }
+            ],
+        },
+    }
+    rows = mon.live_scan_value_bets_from_docs({STL_LAD_EID: doc})
+    overs = [
+        (r.get("_take_only") or "Kalshi", _scan_strike_key(r.get("market") or {}, "Totals"))
+        for r in rows
+        if str(r.get("betSide") or "").lower() == "over"
+        and str(r.get("_scan_mname") or "").upper() == "TOTALS"
+    ]
+    strikes = {ln for _take, ln in overs}
+    assert 7.0 in strikes
+    assert 10.5 in strikes
+    assert 11.5 in strikes
+    plive_alts = {ln for take, ln in overs if take == "PLive"}
+    assert 10.5 in plive_alts
+    assert 11.5 in plive_alts
+
+
+def test_scan_walks_every_run_line_hdp():
+    mon = _ou_monitor()
+    doc = {
+        "id": STL_LAD_EID,
+        "home": "Los Angeles Dodgers",
+        "away": "St. Louis Cardinals",
+        "league": "MLB",
+        "bookmakers": {
+            "PLive": [
+                {
+                    "name": "Spread",
+                    "odds": [
+                        {"hdp": -1.5, "home": _am(-110), "away": _am(-110), "plive_market": 6},
+                        {"hdp": -2.5, "home": _am(130), "away": _am(-160), "plive_market": 6},
+                    ],
+                }
+            ],
+        },
+    }
+    rows = mon.live_scan_value_bets_from_docs({STL_LAD_EID: doc})
+    hdps = {
+        _scan_strike_key(r.get("market") or {}, "Spread")
+        for r in rows
+        if "SPREAD" in str(r.get("_scan_mname") or "").upper()
+    }
+    assert -1.5 in hdps
+    assert -2.5 in hdps
+
+
+def _fd_only_alt_take_best_doc() -> dict:
+    """O10.5 take is best vs FD only. Main o7 is fully packed. 1/3 on the alt."""
+    rec_7 = _totals_row(7.0, -110, -110)
+    return {
+        "id": STL_LAD_EID,
+        "home": "Los Angeles Dodgers",
+        "away": "St. Louis Cardinals",
+        "league": "MLB",
+        "bookmakers": {
+            "PLive": [
+                {
+                    "name": "Totals",
+                    "odds": [_totals_row(7.0, 105, -120), _totals_row(10.5, 105, -120)],
+                }
+            ],
+            "FanDuel": [{"name": "Totals", "odds": [rec_7, _totals_row(10.5, -110, -110)]}],
+            "DraftKings": [{"name": "Totals", "odds": [rec_7]}],
+            "NoVig": [{"name": "Totals", "odds": [rec_7]}],
+            "Caesars": [{"name": "Totals", "odds": [rec_7]}],
+        },
+    }
+
+
+def test_fd_only_alt_does_not_list_needs_three_sharps():
+    """Dodgers Over 10.5 vs FD-only: honest few-percent POWER, but 1/3 does not list."""
+    doc = _fd_only_alt_take_best_doc()
+    mon = _ou_monitor()
+    vb = {
+        "event": {
+            "home": "Los Angeles Dodgers",
+            "away": "St. Louis Cardinals",
+            "league": "MLB",
+        },
+        "market": {"name": "Totals", **_totals_row(10.5, 105, -120)},
+        "betSide": "over",
+        "bookmakerOdds": {"over": _am(105), "under": _am(-120)},
+        "expectedValue": 0.0,
+        "_live_broad_scan": True,
+        "_take_only": "PLive",
+        "_scan_teams": "St. Louis Cardinals @ Los Angeles Dodgers",
+        "_scan_mname": "Totals",
+        "_canonical_kalshi_row": _totals_row(10.5, 105, -120),
+    }
+    assert mon._value_bet_to_normalized_bet(vb, doc, take_book="PLive") is None
+    alerts = _built_evs(doc)
+    over_10 = [
+        a
+        for a in alerts
+        if str(getattr(a, "pick", "")).lower() == "over"
+        and abs(float(getattr(a, "qualifier", 0) or 0) - 10.5) < 1e-9
+    ]
+    assert over_10 == [], [(a.pick, a.qualifier, a.ev_percent) for a in over_10]
+
+
+def test_minsharp_stays_three_display_and_autobet_off():
+    """minSharp=3 is the display and auto-bet floor. Switch stays OFF."""
+    dash = Path(__file__).resolve().parents[1] / "dashboard.py"
+    src = dash.read_text(encoding="utf-8")
+    assert "auto_bet_enabled = False" in src
+    assert '"minSharpBooks": 3' in src
+    mon = _ou_monitor()
+    assert int((mon.filter_payload.get("devigFilter") or {}).get("minSharpBooks")) == 3
+    import dashboard as dash_mod
+
+    assert dash_mod.auto_bet_enabled is False

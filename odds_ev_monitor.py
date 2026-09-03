@@ -2202,7 +2202,7 @@ class OddsEVMonitor:
                             if k_row.get(kk) is not None:
                                 mk_payload[kk] = k_row.get(kk)
                         bo: Dict[str, Any] = {
-                            "href": "",
+                            "href": str(k_row.get("href") or ""),
                             "home": k_row.get("home"),
                             "away": k_row.get("away"),
                         }
@@ -2224,6 +2224,8 @@ class OddsEVMonitor:
                                 "_canonical_kalshi_row": canon,
                             }
                         )
+            # Strike (hdp/max/line) is required. Kalshi Over 7 must not
+            # skip PLive Over 10.5 as a duplicate Over.
             seen_sides = {
                 (
                     str(r.get("eventId")),
@@ -2839,21 +2841,16 @@ class OddsEVMonitor:
             fd_mk = _find_market_block(_markets_list_for_book(bks, self._reference_book), mname)
             if canon_vb and kalshi_mk:
                 k_row = _sharp_row_for_market(kalshi_mk, mname, canon_vb)
-            else:
-                k_row = _first_odds_row(kalshi_mk or {}) or {}
-            if not k_row and kalshi_mk:
+            elif kalshi_mk and not _market_is_spread_or_total(mname):
                 k_row = _first_odds_row(kalshi_mk) or {}
+            # Totals/spreads: never inherit row[0] (main o7) for an alt 10.5.
             _line_ref = canon_vb or (k_row if k_row else None)
             f_row = _sharp_row_for_market(fd_mk, mname, _line_ref) if fd_mk else {}
-            if not f_row and fd_mk:
-                f_row = _first_odds_row(fd_mk) or {}
             if take_canon.lower() == "plive":
                 plive_mk = _find_market_block(_markets_list_for_book(bks, "PLive"), mname)
                 if canon_vb and plive_mk:
                     k_row = _sharp_row_for_market(plive_mk, mname, canon_vb)
-                else:
-                    k_row = _first_odds_row(plive_mk or {}) or {}
-                if not k_row and plive_mk:
+                elif plive_mk and not _market_is_spread_or_total(mname):
                     k_row = _first_odds_row(plive_mk) or {}
                 k_dec = _decimal_for_side(k_row, bet_side)
                 if k_dec is None or k_dec <= 1.0:
@@ -2892,7 +2889,6 @@ class OddsEVMonitor:
         ):
             sharp_names = ["Kalshi", *sharp_names]
         min_sharp = max(1, int(df.get("minSharpBooks", 1)))
-        min_sharp_eff = 1 if vb.get("_live_broad_scan") else min_sharp
         min_sharp_rules = self.filter_payload.get("minSharpLimits") or []
         hold_rules = df.get("hold") or []
 
@@ -2929,7 +2925,7 @@ class OddsEVMonitor:
                     if not _row_passes_sharp_limit(row, sn, min_sharp_rules):
                         continue
                     triples.append((dh, dd, da, sn))
-                if len(triples) >= min_sharp_eff:
+                if len(triples) >= min_sharp:
                     draw_probs: List[float] = []
                     for dh, dd, da, _sn in triples:
                         if (method or "POWER").upper() == "POWER":
@@ -2990,7 +2986,8 @@ class OddsEVMonitor:
                     panel_books, kalshi_american=decimal_to_american(k_dec)
                 )
                 fair_eligible = fair_books_excluding_take(surviving_books, take_canon)
-                # minSharp is the filter floor — do not lower it for live scan.
+                # minSharp is 3 for display and auto-bet. One rec on an alt
+                # (FD-only O10.5) is `insufficient sharp quotes (1/3)` — correct.
                 # PLive never counts toward minSharp or fair. Kalshi may on a PLive card.
                 if len(fair_eligible) >= min_sharp:
                     fair_src = fair_books_for_panel(
@@ -3176,8 +3173,6 @@ class OddsEVMonitor:
         relaxed_fp["minRoi"] = -1e9
         relaxed_fp.setdefault("devigFilter", {})["minEv"] = -1e9
         relaxed_fp.setdefault("devigFilter", {})["minLimit"] = -1e9
-        if vb.get("_live_broad_scan"):
-            relaxed_fp.setdefault("devigFilter", {})["minSharpBooks"] = 1
         calc_relaxed = EVCalculator(relaxed_fp)
         decs_for_devig = sharp_decimals if len(sharp_decimals) >= 2 else [k_dec, max(1.02, k_dec)]
 
