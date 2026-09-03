@@ -527,19 +527,124 @@ function renderAlerts() {
     });
 }
 
-// Book logo mapping (for display) - maps book names to logo file paths
-const bookLogos = {
-    'Kalshi': '/logos/Kalshi.png',
-    'Pinnacle': '/logos/Pinnacle.png',
-    'SportTrade': '/logos/Sporttrade.png',
-    'Novig': '/logos/NV.png',
-    'ProphetX': '/logos/PX.png',
-    'BookMaker': '/logos/BM.png',
-    'FanDuel': '/logos/FD.png',
-    'DraftKings': '/logos/DK.png',
-    'Circa': '/logos/Circa.png',
-    'Polymarket': '/logos/poly.png'  // For future use
-};
+function normalizeBookKey(name) {
+    return String(name || '').toLowerCase().replace(/[\s._-]+/g, '');
+}
+
+/** Ordered image candidates. BetMGM never uses BM.png (BookMaker). */
+function resolveBookLogoPaths(name) {
+    const key = normalizeBookKey(name);
+    const table = {
+        kalshi: ['/logos/Kalshi.png'],
+        pinnacle: ['/logos/Pinnacle.png'],
+        sporttrade: ['/logos/Sporttrade.png'],
+        novig: ['/logos/NV.png'],
+        prophetx: ['/logos/PX.png'],
+        bookmaker: ['/logos/BM.png'],
+        'bookmaker.eu': ['/logos/BM.png'],
+        bookmakereu: ['/logos/BM.png'],
+        fanduel: ['/logos/FD.png'],
+        draftkings: ['/logos/DK.png'],
+        circa: ['/logos/Circa.png'],
+        circasports: ['/logos/Circa.png'],
+        polymarket: ['/logos/poly.png'],
+        bet365: ['/logos/Bet365.png'],
+        betfair: ['/logos/Betfair.png'],
+        betfairexchange: ['/logos/Betfair.png'],
+        betmgm: ['/logos/BetMGM.png', '/logos/MGM.png'],
+        mgm: ['/logos/BetMGM.png', '/logos/MGM.png'],
+        caesars: ['/logos/Caesars.png'],
+        plive: ['/logos/PL.png']
+    };
+    if (table[key]) return table[key];
+    if (key.includes('bet365')) return table.bet365;
+    if (key.includes('betfair')) return table.betfair;
+    if (key.includes('betmgm')) return table.betmgm;
+    if (key.includes('caesar')) return table.caesars;
+    if (key.includes('novig')) return table.novig;
+    if (key.startsWith('circa')) return table.circa;
+    return [];
+}
+
+/**
+ * Missing-image text only. Never first-two-letters (Bet365 and Betfair Exchange
+ * are never both "BE"). Allowed collision-prone fallbacks: B365, BFX, MGM, CZ, NV.
+ */
+function uniqueBookAbbrev(name) {
+    const key = normalizeBookKey(name);
+    if (key.includes('bet365')) return 'B365';
+    if (key.includes('betfair')) return 'BFX';
+    if (key.includes('betmgm') || key === 'mgm') return 'MGM';
+    if (key.includes('caesar')) return 'CZ';
+    if (key.includes('novig')) return 'NV';
+    const map = {
+        kalshi: 'KS',
+        fanduel: 'FD',
+        draftkings: 'DK',
+        circa: 'CI',
+        circasports: 'CI',
+        bookmaker: 'BM',
+        bookmakereu: 'BM',
+        prophetx: 'PX',
+        sporttrade: 'ST',
+        polymarket: 'PM',
+        pinnacle: 'PN',
+        plive: 'PL'
+    };
+    if (map[key]) return map[key];
+    const alnum = key.replace(/[^a-z0-9]/g, '');
+    if (alnum.slice(0, 2) === 'be') {
+        return (alnum.slice(0, 4) || 'BK').toUpperCase();
+    }
+    if (alnum.length <= 4) return alnum.toUpperCase();
+    return alnum.slice(0, 4).toUpperCase() || 'BK';
+}
+
+function isCircaBook(name) {
+    return normalizeBookKey(name).startsWith('circa');
+}
+
+function bookTileHasLine(odds) {
+    if (odds === null || odds === undefined || odds === '') return false;
+    if (odds === 0 || odds === '0') return false;
+    const s = String(odds).replace(/\s/g, '');
+    if (!s || s === '—' || s === '-' || s === 'N/A' || s === 'n/a') return false;
+    return true;
+}
+
+function handleBookLogoError(img) {
+    let next = [];
+    try {
+        next = JSON.parse(img.getAttribute('data-logo-fallbacks') || '[]');
+    } catch (e) {
+        next = [];
+    }
+    if (next.length) {
+        img.setAttribute('data-logo-fallbacks', JSON.stringify(next.slice(1)));
+        img.src = next[0];
+        return;
+    }
+    const name = img.getAttribute('alt') || '';
+    const div = document.createElement('div');
+    div.className = 'book-logo-text';
+    div.textContent = uniqueBookAbbrev(name);
+    div.title = name;
+    img.replaceWith(div);
+}
+
+function bookLogoHtml(bookName) {
+    const paths = resolveBookLogoPaths(bookName);
+    const safe = escapeHtml(bookName);
+    const abbrev = uniqueBookAbbrev(bookName);
+    if (!paths.length) {
+        return `<div class="book-logo-text" title="${safe}">${abbrev}</div>`;
+    }
+    const rest = JSON.stringify(paths.slice(1)).replace(/'/g, '&#39;');
+    return (
+        `<img src="${paths[0]}" alt="${safe}" title="${safe}" class="book-logo-img" ` +
+        `data-logo-fallbacks='${rest}' onerror="handleBookLogoError(this)" />`
+    );
+}
 
 /** Loose match so API keys like "Circa Sports" align with devig list "Circa". */
 function bookMatchesDevigOrSharp(bookName, devigList, sharpList) {
@@ -608,10 +713,12 @@ function createAlertCard(alert) {
             booksToShow.forEach(book => {
                 const bookName = book.book || 'Unknown';
                 const bookOdds = book.odds || 0;
+                // Circa often has no MLB line — do not paint an empty tile.
+                if (isCircaBook(bookName) && !bookTileHasLine(book.odds)) {
+                    return;
+                }
                 const bookLimit = book.limit || 0;
                 const bookLimitDisplay = bookLimit ? formatLiquidityUsd(bookLimit) : '';
-                const bookLogoPath = bookLogos[bookName];
-                const bookLogoText = bookName.substring(0, 2).toUpperCase();  // Fallback text if no logo
                 const isKalshi = bookName === 'Kalshi';
                 const usedForLine =
                     isKalshi || bookMatchesDevigOrSharp(bookName, alert.devig_books, alert.sharp_books);
@@ -637,13 +744,10 @@ function createAlertCard(alert) {
                     }
                 }
                 
-                // Use image if logo path exists, otherwise use text
-                const logoHtml = bookLogoPath 
-                    ? `<img src="${bookLogoPath}" alt="${bookName}" class="book-logo-img" />`
-                    : `<div class="book-logo-text">${bookLogoText}</div>`;
+                const logoHtml = bookLogoHtml(bookName);
                 
                 booksTableHtml += `
-                    <div class="book-cell ${isKalshi ? 'kalshi-book' : ''} ${isGrayedOut ? 'grayed-out' : ''} ${hasBetterOdds ? 'better-than-kalshi' : ''}" data-book-name="${escapeHtml(bookName)}">
+                    <div class="book-cell ${isKalshi ? 'kalshi-book' : ''} ${isGrayedOut ? 'grayed-out' : ''} ${hasBetterOdds ? 'better-than-kalshi' : ''}" data-book-name="${escapeHtml(bookName)}" title="${escapeHtml(bookName)}">
                         <div class="book-logo">${logoHtml}</div>
                         <div class="book-odds" data-book-odds="${bookOdds}">${bookOdds > 0 ? '+' : ''}${bookOdds}</div>
                         ${bookLimitDisplay ? `<div class="book-limit" data-book-limit="${bookLimit}">${bookLimitDisplay}</div>` : ''}
@@ -1630,30 +1734,7 @@ if (broadScanPregameCb) {
     }
 
     function abbrevBook(name) {
-        const n = String(name || '');
-        const map = {
-            Kalshi: 'KS',
-            FanDuel: 'FD',
-            DraftKings: 'DK',
-            Circa: 'CI',
-            BookMaker: 'BM',
-            'BookMaker.eu': 'BM',
-            Novig: 'NV',
-            NoVig: 'NV',
-            ProphetX: 'PX',
-            SportTrade: 'ST',
-            Polymarket: 'PM',
-            Betfair: 'BF',
-            'Betfair Exchange': 'BFX',
-            BetMGM: 'MGM',
-            Caesars: 'CZ',
-            PointsBet: 'PB',
-            Pinnacle: 'PN',
-            EspnBet: 'ES',
-            Fanatics: 'FN',
-        };
-        if (map[n]) return map[n];
-        return n.length <= 4 ? n.toUpperCase() : n.slice(0, 3).toUpperCase();
+        return uniqueBookAbbrev(name);
     }
 
     function renderOddsTable(data) {
