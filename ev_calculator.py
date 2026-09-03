@@ -787,9 +787,10 @@ def power_average_fair_prob(
         _fair_prob_power_relaxed_two_way(c, float(b["decimal_pick"]), float(b["decimal_opp"]))
         for b in rows
     ]
-    raw = [_book_implied(b) for b in rows]
+    fairs = [float(f) for f in fairs if f is not None and 0.0 < float(f) < 1.0]
     if not fairs:
-        return sum(raw) / float(len(raw)) if raw else None
+        # Missing sister / failed POWER → no EV. Plus-only mean implied is forbidden.
+        return None
     return sum(fairs) / float(len(fairs))
 
 
