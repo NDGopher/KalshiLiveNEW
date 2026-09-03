@@ -1,4 +1,19 @@
-"""KEEP vs DROP sharp-panel rules — anonymous boards, no ticker allowlists."""
+"""KEEP vs DROP sharp-panel rules — anonymous boards, no ticker allowlists.
+
+Labeled live fixtures (pattern boards only; do not pin tickers):
+
+- DROP (image 1): SF @ PIT Giants +1.5. Kalshi +186 vs Poly/DK/FD/BE/CA
+  +145..+188, NoVig -154. UI printed +13.51% off the stale sign-flip.
+  After NV is dropped this must not print +13%. A leftover small plus
+  vs the plus-money pack is allowed — do not add filters just to kill it.
+
+- KEEP (image 2): CWS @ HOU Astros ML. Kalshi -133 best (0 red boxes).
+  FD -142 / CA -141 / NV -139 tight rec cluster; DK/BE juice -170..-185.
+  UI +2.33%. Filters MUST still allow this small plus. Do not over-filter.
+
+Prior Cubs 3-better kill and Houston/Rays wrong-line drop still stand.
+Auto-bet stays OFF. No SharpMoney.
+"""
 from __future__ import annotations
 
 from ev_calculator import (
@@ -65,7 +80,7 @@ def _plus_money_offsign_drop_board():
 
 
 def _plus_pack_wrong_line_drop_board():
-    """Underdog pack with two heavy-favorite spikes in the mean."""
+    """Prior Houston/Rays-style DROP: underdog pack + two favorite spikes."""
     return 156, [
         _book("X1", -233),
         _book("X2", -217),
@@ -78,7 +93,7 @@ def _plus_pack_wrong_line_drop_board():
 
 
 def _three_better_minus_drop_board():
-    """Favorite take-venue worse than three survivors after a plus-money spike drops."""
+    """Prior Cubs-style 3-better kill: favorite worse than three survivors."""
     return -127, [
         _book("T1", -117),
         _book("T2", -147),
@@ -270,10 +285,11 @@ def test_american_helper_roundtrip_used_by_filter():
 # --- Labeled live fixtures (pattern boards; names are labels only) ---
 
 
-def _fixture_drop_plus15_signflip_novig():
-    """DROP label: SF @ PIT Giants +1.5. UI printed +13.51% off stale NoVig -154.
+def _fixture_drop_sf_pit_giants_plus15():
+    """DROP (image 1): SF @ PIT Giants +1.5. Kalshi +186, NoVig -154 sign-flip.
 
-    Kalshi +186 vs plus-money recs +145..+188. NV -154 is the wrong-sign outlier.
+    Plus-money cluster Poly/DK/FD/BE/CA around +145..+188. UI +13.51% was
+    not +EV — it only beat stale NV. Drop NV as off-market (wrong sign).
     """
     return 186, [
         _book("Poly", 170),
@@ -285,11 +301,12 @@ def _fixture_drop_plus15_signflip_novig():
     ]
 
 
-def _fixture_keep_ml_kalshi_best_close_recs():
-    """KEEP label: CWS @ HOU Astros ML. UI +2.33%, Kalshi -133 best, no red boxes.
+def _fixture_keep_cws_hou_astros_ml():
+    """KEEP (image 2): CWS @ HOU Astros ML. Kalshi -133 best, no red boxes.
 
-    Close recs FD -142 / CA -141 / NV -139; same-sign juice -170..-185 stays
-    off fair (second cluster) but must not kill the small plus.
+    Tight rec cluster FD -142 / CA -141 / NV -139. Same-sign juice DK/BE
+    -170..-185 stays off fair. UI +2.33% is a real small plus — do not
+    over-filter this board.
     """
     return -133, [
         _book("Wynn", -163),
@@ -302,21 +319,24 @@ def _fixture_keep_ml_kalshi_best_close_recs():
     ]
 
 
-def test_fixture_drop_giants_plus15_novig_signflip():
-    kalshi, books = _fixture_drop_plus15_signflip_novig()
+def test_drop_sf_pit_giants_plus15_novig_signflip():
+    """DROP: after NV -154 is removed this must not print +13%."""
+    kalshi, books = _fixture_drop_sf_pit_giants_plus15()
     surviving = filter_sharp_panel(books, kalshi_american=kalshi)
     names = {b["name"] for b in surviving}
     assert "NV" not in names
     assert {"Poly", "DK", "FD"}.issubset(names)
     out = evaluate_sharp_panel_ev(books, kalshi, min_sharp_books=3)
+    # Fat plus was NV in the average. Residual vs the plus-money pack
+    # may still be a small plus; it cannot reprint the UI +13.51% lie.
     assert out["ev_percent"] < 8.0
     assert out["ev_percent"] < 13.0
-    # Fat plus was NV in the average; after the drop it cannot reprint +13%.
     assert out["raw_ev_percent"] < 13.0
 
 
-def test_fixture_keep_astros_ml_still_small_plus():
-    kalshi, books = _fixture_keep_ml_kalshi_best_close_recs()
+def test_keep_cws_hou_astros_ml_still_small_plus():
+    """KEEP: Kalshi best vs a tight rec cluster must still print a small plus."""
+    kalshi, books = _fixture_keep_cws_hou_astros_ml()
     out = evaluate_sharp_panel_ev(books, kalshi, min_sharp_books=3)
     names = set(out["surviving_names"])
     assert {"FD", "CA", "NV"}.issubset(names)
