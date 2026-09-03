@@ -25,6 +25,26 @@ from typing import Any, Dict, List, Optional, Tuple
 _POWER_FAIR_CLIP_HI = 0.99
 _POWER_FAIR_CLIP_LO = 0.01
 
+# Sharp-panel screen (Kalshi All Sports POWER+AVERAGE). Applied to every non-Kalshi
+# book dict, including a future PLive row — name is not special-cased.
+SHARP_ABS_AMERICAN_CAP = 1000
+SHARP_OUTLIER_IMPLIED_FLOOR = 0.08
+SHARP_OUTLIER_MAD_MULT = 2.5
+# Cluster is sided (not a pick'em) when |median implied - 0.5| is at least this.
+# Opposite-side books are off-market / sign-flips (NV -154 on a +170 pack).
+SHARP_SIGN_FLIP_CLUSTER = 0.04
+# Kalshi-adjacent pack: seed within this of Kalshi, grow by this gap. Do not
+# use a global median on a bimodal board (that drops the close rec).
+SHARP_ADJACENT_SEED = 0.04
+SHARP_ADJACENT_GROW = 0.03
+# Far cluster / 10c+ vs the Kalshi-adjacent pack (egregious, not DK +228 vs +245).
+SHARP_EGREGIOUS_GAP = 0.10
+BETTER_BOOKS_KILL = 3
+MEDIAN_GATE_TOL = 0.005
+# Identity band. KEEP boards with ~8c of juice (57c vs 65c) must not match this.
+TIGHT_CLUSTER_BAND = 0.04
+TIGHT_CLUSTER_EV_ABS = 2.0
+
 
 def decimal_to_american(d: float) -> int:
     if d <= 1.0:
@@ -104,6 +124,353 @@ def _passes_hold(decimals: List[float], hold_rules: List[Dict[str, Any]]) -> boo
         if h * 100.0 > mx + 1e-9:
             return False
     return True
+
+
+def _median_floats(xs: List[float]) -> float:
+    s = sorted(xs)
+    n = len(s)
+    if n == 0:
+        return 0.0
+    if n % 2:
+        return s[n // 2]
+    return 0.5 * (s[n // 2 - 1] + s[n // 2])
+
+
+def _coerce_book_american(book: Dict[str, Any], decimal_pick: float) -> Optional[int]:
+    raw = book.get("american")
+    if raw is not None and raw != "":
+        try:
+            return int(round(float(raw)))
+        except (TypeError, ValueError):
+            pass
+    if decimal_pick > 1.0:
+        return decimal_to_american(decimal_pick)
+    return None
+
+
+def american_is_strictly_better(book_american: int, kalshi_american: int) -> bool:
+    """Bettor-favorable: higher decimal. -117 > -127, +192 > +122, +107 > -127."""
+    return american_to_decimal(int(book_american)) > american_to_decimal(int(kalshi_american)) + 1e-12
+
+
+def _book_implied(book: Dict[str, Any]) -> float:
+    return 1.0 / float(book["decimal_pick"])
+
+
+def kalshi_adjacent_pack(
+    books: List[Dict[str, Any]],
+    kalshi_american: int,
+    *,
+    seed: float = SHARP_ADJACENT_SEED,
+    grow: float = SHARP_ADJACENT_GROW,
+) -> List[Dict[str, Any]]:
+    """Consensus recs next to Kalshi. Does not use a global all-book median.
+
+    Seed = books within ``seed`` of Kalshi implied (same side of 0.50).
+    Grow by attaching books within ``grow`` of someone already in the pack.
+    A far steam cluster is a second mode and stays out.
+    """
+    rows = [b for b in (books or []) if float(b.get("decimal_pick") or 0) > 1.0]
+    if not rows:
+        return []
+    k_dec = american_to_decimal(int(kalshi_american))
+    k_imp = (1.0 / k_dec) if k_dec > 1.0 else 0.5
+    scored = [(b, _book_implied(b)) for b in rows]
+    pack = [
+        b
+        for b, p in scored
+        if abs(p - k_imp) <= seed and (p - 0.5) * (k_imp - 0.5) >= 0
+    ]
+    if not pack:
+        same = [(b, p) for b, p in scored if (p - 0.5) * (k_imp - 0.5) >= 0]
+        same.sort(key=lambda t: abs(t[1] - k_imp))
+        pack = [b for b, _ in same[:1]] if same else []
+    if not pack:
+        return []
+    pack_imps = [_book_implied(b) for b in pack]
+    changed = True
+    while changed:
+        changed = False
+        for b, p in scored:
+            if any(b is x for x in pack):
+                continue
+            if abs(p - k_imp) > seed:
+                continue
+            if min(abs(p - q) for q in pack_imps) <= grow:
+                pack.append(b)
+                pack_imps.append(p)
+                changed = True
+    return pack
+
+
+def _eligible_sharp_books(books: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    eligible: List[Dict[str, Any]] = []
+    for raw in books or []:
+        if not isinstance(raw, dict):
+            continue
+        if raw.get("match_failed") is True:
+            continue
+        try:
+            d_pick = float(raw.get("decimal_pick") or 0.0)
+            d_opp = float(raw.get("decimal_opp") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if d_pick <= 1.0 or d_opp <= 1.0:
+            continue
+        am = _coerce_book_american(raw, d_pick)
+        if am is None:
+            continue
+        if abs(am) >= SHARP_ABS_AMERICAN_CAP:
+            continue
+        row = dict(raw)
+        row["american"] = am
+        row["decimal_pick"] = d_pick
+        row["decimal_opp"] = d_opp
+        eligible.append(row)
+    return eligible
+
+
+def filter_sharp_panel(
+    books: List[Dict[str, Any]],
+    kalshi_american: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Drop unmatched, incomplete, spiked, off-market, and sign-flipped quotes.
+
+    Each book is ``{name, american, decimal_pick, decimal_opp, match_failed?}``.
+    Name is ignored (PLive / NV / DK use the same screen). Surviving rows keep
+    their original keys so the caller can still read decimals / american.
+
+    When ``kalshi_american`` is set, outliers are judged vs the Kalshi-adjacent
+    pack — not a global median (a steam cluster must not eat the close rec).
+    """
+    eligible = _eligible_sharp_books(books)
+    if not eligible:
+        return []
+
+    if kalshi_american is not None:
+        pack = kalshi_adjacent_pack(eligible, int(kalshi_american))
+        pack_imps = [_book_implied(b) for b in pack]
+        pack_med = _median_floats(pack_imps) if pack_imps else None
+        kd = american_to_decimal(int(kalshi_american))
+        k_imp = (1.0 / kd) if kd > 1.0 else None
+        ref = pack_med if pack_med is not None else k_imp
+        sided = k_imp is not None and abs(k_imp - 0.5) >= SHARP_SIGN_FLIP_CLUSTER
+        surviving: List[Dict[str, Any]] = []
+        for book in eligible:
+            p = _book_implied(book)
+            # Wrong sign vs Kalshi on a sided board (NV -154 on a +186 pack).
+            if sided and k_imp is not None and (p - 0.5) * (k_imp - 0.5) < 0:
+                continue
+            # Stale/wrong-line favorite spike: implied 10c+ above the close pack.
+            # Do not drop better (lower-implied) books — those feed the 3-better kill.
+            if ref is not None and p > ref + SHARP_EGREGIOUS_GAP:
+                continue
+            surviving.append(book)
+        return surviving
+
+    implied = [_book_implied(b) for b in eligible]
+    med = _median_floats(implied)
+    mad = _median_floats([abs(p - med) for p in implied])
+    thresh = max(SHARP_OUTLIER_IMPLIED_FLOOR, SHARP_OUTLIER_MAD_MULT * mad)
+    surviving = []
+    sided = abs(med - 0.5) >= SHARP_SIGN_FLIP_CLUSTER
+    for book, p in zip(eligible, implied):
+        if abs(p - med) > thresh:
+            continue
+        if sided and (p - 0.5) * (med - 0.5) < 0:
+            continue
+        surviving.append(book)
+    return surviving
+
+
+def _american_sign(am: int) -> int:
+    if am > 0:
+        return 1
+    if am < 0:
+        return -1
+    return 0
+
+
+def fair_books_for_panel(survivors: List[Dict[str, Any]], kalshi_american: int) -> List[Dict[str, Any]]:
+    """POWER/AVERAGE uses the Kalshi-adjacent pack, never a far second cluster.
+
+    Same-sign juice that is not egregious may remain in ``survivors`` (minSharp /
+    3-better). It must not pull fair. If no adjacent pack exists, fall back to
+    same-sign survivors, then the full set.
+    """
+    rows = list(survivors or [])
+    if not rows:
+        return []
+    pack = kalshi_adjacent_pack(rows, int(kalshi_american))
+    if pack:
+        return pack
+    k_sign = _american_sign(int(kalshi_american))
+    same = [b for b in rows if _american_sign(int(b.get("american") or 0)) == k_sign]
+    if same:
+        return same
+    return rows
+
+
+def count_better_than_kalshi(survivors: List[Dict[str, Any]], kalshi_american: int) -> int:
+    n = 0
+    for book in survivors or []:
+        try:
+            am = int(book.get("american"))
+        except (TypeError, ValueError):
+            continue
+        if american_is_strictly_better(am, int(kalshi_american)):
+            n += 1
+    return n
+
+
+def power_average_fair_prob(survivors: List[Dict[str, Any]], calc: Optional[EVCalculator] = None) -> Optional[float]:
+    """Mean of per-book POWER fairs. Same as type=AVERAGE over method=POWER.
+
+    Floor at the pack's mean pick implied. POWER relaxation can collapse a
+    two-way onto AVERAGE and erase a real best-price edge vs close recs
+    (KEEP ~+2% vs -139/-141/-142).
+    """
+    rows = [b for b in (survivors or []) if float(b.get("decimal_pick") or 0) > 1.0 and float(b.get("decimal_opp") or 0) > 1.0]
+    if not rows:
+        return None
+    c = calc or EVCalculator({})
+    fairs = [
+        _fair_prob_power_relaxed_two_way(c, float(b["decimal_pick"]), float(b["decimal_opp"]))
+        for b in rows
+    ]
+    raw = [_book_implied(b) for b in rows]
+    if not fairs:
+        return sum(raw) / float(len(raw)) if raw else None
+    pwr = sum(fairs) / float(len(fairs))
+    raw_mean = sum(raw) / float(len(raw))
+    return max(pwr, raw_mean)
+
+
+def apply_ev_hard_gates(
+    ev_percent: float,
+    kalshi_american: int,
+    survivors: List[Dict[str, Any]],
+    *,
+    used_fallback: bool = False,
+    min_sharp_books: int = 3,
+) -> Dict[str, Any]:
+    """Median / tight-cluster / 3-better / fallback gates. Math, not UI hide."""
+    reasons: List[str] = []
+    ev = float(ev_percent)
+    allow_plus = True
+    k_dec = american_to_decimal(int(kalshi_american))
+    k_imp = (1.0 / k_dec) if k_dec > 1.0 else 1.0
+    surv_imps = [1.0 / float(b["decimal_pick"]) for b in (survivors or []) if float(b.get("decimal_pick") or 0) > 1.0]
+    better = count_better_than_kalshi(survivors, kalshi_american)
+
+    if used_fallback:
+        return {
+            "ev_percent": 0.0,
+            "plus_alert": False,
+            "allow_plus": False,
+            "reasons": ["fallback"],
+            "better_count": better,
+            "kalshi_implied": k_imp,
+        }
+
+    if len(survivors or []) < int(min_sharp_books):
+        return {
+            "ev_percent": ev,
+            "plus_alert": False,
+            "allow_plus": False,
+            "reasons": ["min_sharp"],
+            "better_count": better,
+            "kalshi_implied": k_imp,
+        }
+
+    if surv_imps:
+        med_s = _median_floats(surv_imps)
+        # Kalshi worse than (or ~equal to) the surviving median cannot print a plus.
+        if k_imp + 1e-12 >= med_s - MEDIAN_GATE_TOL:
+            if ev > 0:
+                ev = min(ev, 0.0)
+            allow_plus = False
+            reasons.append("median_gate")
+
+        band = [k_imp] + surv_imps
+        if max(band) - min(band) <= TIGHT_CLUSTER_BAND:
+            if abs(ev) > TIGHT_CLUSTER_EV_ABS:
+                ev = 0.0
+                allow_plus = False
+                reasons.append("tight_cluster")
+
+    if better >= BETTER_BOOKS_KILL:
+        ev = min(ev, 0.0)
+        allow_plus = False
+        reasons.append("better_books")
+
+    plus_alert = bool(allow_plus and ev > 0.0)
+    return {
+        "ev_percent": ev,
+        "plus_alert": plus_alert,
+        "allow_plus": allow_plus,
+        "reasons": reasons,
+        "better_count": better,
+        "kalshi_implied": k_imp,
+        "survivor_median_implied": _median_floats(surv_imps) if surv_imps else None,
+    }
+
+
+def evaluate_sharp_panel_ev(
+    books: List[Dict[str, Any]],
+    kalshi_american: int,
+    *,
+    min_sharp_books: int = 3,
+    method: str = "POWER",
+    used_fallback: bool = False,
+) -> Dict[str, Any]:
+    """Filter → POWER/AVERAGE fair → EV vs Kalshi → hard gates.
+
+    Returns surviving books, EV, and whether a plus alert may print.
+    Does not mention teams or tickers — callers pass anonymous boards.
+    """
+    surviving = filter_sharp_panel(books, kalshi_american=kalshi_american)
+    calc = EVCalculator({})
+    k_dec = american_to_decimal(int(kalshi_american))
+    price_cents = int(max(1, min(99, round(100.0 / k_dec)))) if k_dec > 1.0 else 0
+    fair: Optional[float] = None
+    ev = 0.0
+    if used_fallback:
+        gated = apply_ev_hard_gates(
+            0.0, kalshi_american, surviving, used_fallback=True, min_sharp_books=min_sharp_books
+        )
+    elif len(surviving) < int(min_sharp_books):
+        gated = apply_ev_hard_gates(
+            0.0, kalshi_american, surviving, used_fallback=False, min_sharp_books=min_sharp_books
+        )
+    else:
+        fair_src = fair_books_for_panel(surviving, kalshi_american)
+        if (method or "POWER").upper() == "POWER":
+            fair = power_average_fair_prob(fair_src, calc)
+        else:
+            fairs = [
+                calc.fair_probs_two_way(float(b["decimal_pick"]), float(b["decimal_opp"]), method)[0]
+                for b in fair_src
+            ]
+            fair = sum(fairs) / float(len(fairs)) if fairs else None
+        ev = calc.ev_percent_vs_kalshi(fair, price_cents) if fair is not None else -999.0
+        gated = apply_ev_hard_gates(
+            ev, kalshi_american, surviving, used_fallback=False, min_sharp_books=min_sharp_books
+        )
+    out = {
+        "surviving": surviving,
+        "surviving_names": [str(b.get("name") or "") for b in surviving],
+        "fair_prob": fair,
+        "raw_ev_percent": ev,
+        "ev_percent": gated["ev_percent"],
+        "plus_alert": gated["plus_alert"],
+        "better_count": gated["better_count"],
+        "reasons": gated["reasons"],
+        "kalshi_implied": gated["kalshi_implied"],
+        "survivor_median_implied": gated.get("survivor_median_implied"),
+        "used_fallback": used_fallback,
+    }
+    return out
 
 
 def _passes_odds_range(american: int, odds_ranges: List[Dict[str, Any]]) -> bool:
@@ -305,7 +672,8 @@ def ev_percent_three_methods_multi_sharp(
 
     Each panel is (decimal_outcome_A, decimal_outcome_B). Kalshi decimal must be for outcome A.
 
-    - POWER: first panel only, with the same POWER relaxation as ``ev_percent_three_methods_two_way``.
+    - POWER: mean of per-panel POWER fairs (same as type=AVERAGE over method=POWER).
+      Not panel[0] — a stale first book must not own the POWER column.
     - WORST_CASE / AVERAGE: aggregate implieds across panels, then EV vs Kalshi for side A.
 
     Single panel delegates to ``ev_percent_three_methods_two_way``.
@@ -324,7 +692,11 @@ def ev_percent_three_methods_multi_sharp(
     price_cents = int(max(1, min(99, round(100.0 / kalshi_dec))))
     calc = EVCalculator({})
     out: Dict[str, float] = {}
-    out["POWER"] = _ev_vs_kalshi_power_relaxed_two_way(calc, a0, b0, price_cents)
+    power_fairs = [_fair_prob_power_relaxed_two_way(calc, a, b) for a, b in panels if a > 1.0 and b > 1.0]
+    if power_fairs:
+        out["POWER"] = calc.ev_percent_vs_kalshi(sum(power_fairs) / len(power_fairs), price_cents)
+    else:
+        out["POWER"] = _ev_vs_kalshi_power_relaxed_two_way(calc, a0, b0, price_cents)
     f_wa, f_wb = _fair_probs_two_way_multi_aggregate(panels, "WORST_CASE")
     f_aa, f_ab = _fair_probs_two_way_multi_aggregate(panels, "AVERAGE")
     out["WORST_CASE"] = calc.ev_percent_vs_kalshi(f_wa, price_cents)

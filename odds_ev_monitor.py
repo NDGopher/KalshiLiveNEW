@@ -41,10 +41,14 @@ from ev_calculator import (
     _fair_prob_power_relaxed_three_way,
     _fair_prob_power_relaxed_two_way,
     _passes_hold,
+    apply_ev_hard_gates,
     decimal_to_american,
     ev_percent_three_methods_multi_sharp,
     ev_percent_three_methods_three_way,
+    fair_books_for_panel,
+    filter_sharp_panel,
     format_ev_percent_display,
+    power_average_fair_prob,
 )
 from odds_api_client import (
     get_shared_odds_client,
@@ -409,8 +413,23 @@ def _pick_matching_odds_row(mk: Dict[str, Any], mname: str, ref_row: Dict[str, A
         for r in rows:
             if isinstance(r, dict) and _numeric_close(r.get("hdp"), ref_row.get("hdp")):
                 return r
+    # Same-line only for spread/total. Do not take row[0] (alt / flipped line).
+    if is_total or is_spread:
+        return {}
     fir = _first_odds_row(mk)
     return fir if isinstance(fir, dict) else {}
+
+
+def _market_is_spread_or_total(mname: str) -> bool:
+    mu = (mname or "").upper()
+    if "TOTAL" in mu or ("OVER" in mu and "UNDER" in mu) or mu in ("OU", "O/U"):
+        return True
+    return (
+        "SPREAD" in mu
+        or "HANDICAP" in mu
+        or "PUCK LINE" in mu
+        or "PUCKLINE" in mu.replace(" ", "")
+    )
 
 
 def _sharp_row_for_market(
@@ -422,6 +441,8 @@ def _sharp_row_for_market(
         picked = _pick_matching_odds_row(mk, mname, ref_row)
         if picked:
             return picked
+        if _market_is_spread_or_total(mname):
+            return {}
     fir = _first_odds_row(mk)
     return fir if isinstance(fir, dict) else {}
 
@@ -988,13 +1009,15 @@ def _build_display_books_payload(
                     row = {**row, "home": ndh, "away": nda}
         d = _decimal_for_side(row, bet_side)
         if d and d > 1.0:
-            rows_out.append(
-                {
-                    "book": _norm_book(str(nm)),
-                    "odds": decimal_to_american(float(d)),
-                    "limit": float(_row_limit_hint(row) or 0.0),
-                }
-            )
+            blob: Dict[str, Any] = {
+                "book": _norm_book(str(nm)),
+                "odds": decimal_to_american(float(d)),
+                "limit": float(_row_limit_hint(row) or 0.0),
+            }
+            ts = row.get("updated_at") or row.get("book_updated_at")
+            if ts is not None:
+                blob["book_updated_at"] = ts
+            rows_out.append(blob)
     return {pick: rows_out}
 
 
@@ -1120,8 +1143,12 @@ class OddsEVMonitor:
                 "raw_html": json.dumps(bet),
                 "strict_pass": bool(bet.get("strict_pass", True)),
                 "ev_source": str(bet.get("ev_source") or "odds_api_value_bets"),
+                "book_updated_at": bet.get("book_updated_at") or {},
+                "kalshi_last_trade_ts": bet.get("kalshi_last_trade_ts"),
             }
             alert = EvAlert(alert_data)
+            alert.book_updated_at = alert_data["book_updated_at"]
+            alert.kalshi_last_trade_ts = alert_data["kalshi_last_trade_ts"]
             alert.ticker = self.extract_ticker_from_link(link) or bet.get("ticker")
             alert.price_cents = price_cents
             alert.line = line
@@ -2312,6 +2339,8 @@ class OddsEVMonitor:
         devig_book_labels: List[str] = []
         panels: List[Tuple[float, float, str]] = []
         triples: List[Tuple[float, float, float, str]] = []
+        surviving_books: List[Dict[str, Any]] = []
+        used_fallback_fair = False
 
         ref_for_sharps = canon_vb or (k_row if k_row else None)
         ml_med_h: Optional[float] = None
@@ -2378,20 +2407,50 @@ class OddsEVMonitor:
                     if not _row_passes_sharp_limit(row, sn, min_sharp_rules):
                         continue
                     panels.append((d_pick, d_opp, sn))
-                if len(panels) >= min_sharp_eff:
-                    pick_probs: List[float] = []
-                    for d_pick, d_opp, _sn in panels:
-                        pick_probs.append(_panel_relaxed_pick_fair_two_way(self._calc, d_pick, d_opp, method))
-                    fair_prob = min(pick_probs) if comb_type == "WORST_CASE" else sum(pick_probs) / len(pick_probs)
-                    sharp_books_used = len(panels)
-                    devig_book_labels = [p[2] for p in panels]
-                    d0, opp0 = panels[0][0], panels[0][1]
+                panel_books: List[Dict[str, Any]] = [
+                    {
+                        "name": sn,
+                        "american": decimal_to_american(d_pick),
+                        "decimal_pick": d_pick,
+                        "decimal_opp": d_opp,
+                    }
+                    for d_pick, d_opp, sn in panels
+                ]
+                surviving_books = filter_sharp_panel(
+                    panel_books, kalshi_american=decimal_to_american(k_dec)
+                )
+                # minSharp is the filter floor — do not lower it for live scan.
+                if len(surviving_books) >= min_sharp:
+                    fair_src = fair_books_for_panel(surviving_books, decimal_to_american(k_dec))
+                    if (method or "POWER").upper() == "POWER" and comb_type != "WORST_CASE":
+                        fair_prob = power_average_fair_prob(fair_src or surviving_books, self._calc)
+                    else:
+                        pick_probs = [
+                            _panel_relaxed_pick_fair_two_way(
+                                self._calc,
+                                float(b["decimal_pick"]),
+                                float(b["decimal_opp"]),
+                                method,
+                            )
+                            for b in (fair_src or surviving_books)
+                        ]
+                        fair_prob = (
+                            min(pick_probs) if comb_type == "WORST_CASE" else sum(pick_probs) / len(pick_probs)
+                        )
+                    sharp_books_used = len(surviving_books)
+                    devig_book_labels = [str(b.get("name") or "") for b in surviving_books]
+                    d0 = float(surviving_books[0]["decimal_pick"])
+                    opp0 = float(surviving_books[0]["decimal_opp"])
                     sharp_decimals = [d0, opp0]
                     fd_dec_for_side = d0
+                    panels = [
+                        (float(b["decimal_pick"]), float(b["decimal_opp"]), str(b.get("name") or ""))
+                        for b in surviving_books
+                    ]
 
         multi_panel_mode = bool(bks and sharp_names and min_sharp > 1)
-        if multi_panel_mode and fair_prob is None and not vb.get("_live_broad_scan"):
-            pc = len(triples) if bet_side == "draw" else len(panels)
+        if multi_panel_mode and fair_prob is None:
+            pc = len(triples) if bet_side == "draw" else len(surviving_books or panels)
             if _env_bool("ODDS_ALERT_DIAG", "false") or _diagnostic_mode():
                 print(
                     f"[PIPELINE] Dropped: insufficient sharp quotes ({pc}/{min_sharp}) for "
@@ -2442,6 +2501,8 @@ class OddsEVMonitor:
                     sharp_books_used = 1
 
         if fair_prob is None and (not multi_panel_mode or vb.get("_live_broad_scan")):
+            # Identity fallback (fair=1/k_dec) must never print a plus alert.
+            used_fallback_fair = True
             fair_prob = 1.0 / k_dec
             mh = _float_dec(market.get("home"))
             ma = _float_dec(market.get("away"))
@@ -2451,7 +2512,27 @@ class OddsEVMonitor:
                 sharp_decimals = [k_dec, max(1.02, k_dec * 1.01)]
             sharp_books_used = max(sharp_books_used, 1)
 
+        if fair_prob is None:
+            return None
+
         ev_percent = self._calc.ev_percent_vs_kalshi(fair_prob, price_cents)
+        kalshi_am = decimal_to_american(k_dec)
+        if surviving_books or used_fallback_fair:
+            gated = apply_ev_hard_gates(
+                ev_percent,
+                kalshi_am,
+                surviving_books,
+                used_fallback=used_fallback_fair,
+                min_sharp_books=min_sharp,
+            )
+            ev_percent = float(gated["ev_percent"])
+            if used_fallback_fair or not gated["plus_alert"]:
+                if _diagnostic_mode():
+                    print(
+                        f"[PIPELINE] Dropped: EV gates {gated.get('reasons') or ['no_plus']} "
+                        f"| {teams} | {mname} | ev={ev_percent:.2f}%"
+                    )
+                return None
         if ev_percent > 20.0:
             if _diagnostic_mode():
                 print("[PIPELINE] Dropped: suspect EV (>20%).")
@@ -2460,7 +2541,6 @@ class OddsEVMonitor:
             if _diagnostic_mode():
                 print("[PIPELINE] Dropped: suspect EV (<-100%).")
             return None
-        kalshi_am = decimal_to_american(k_dec)
         fd_am = decimal_to_american(fd_dec_for_side) if fd_dec_for_side else kalshi_am
 
         relaxed_fp = copy.deepcopy(self.filter_payload)
@@ -2530,6 +2610,23 @@ class OddsEVMonitor:
         display = _build_display_books_payload(
             pick, bks, mname, bet_side, disp_names, kalshi_am, k_row
         )
+        book_ts = {}
+        if isinstance(odds_doc, dict) and isinstance(odds_doc.get("book_updated_at"), dict):
+            book_ts = {str(k): v for k, v in odds_doc["book_updated_at"].items() if v is not None}
+            for _sel, rows in display.items():
+                if not isinstance(rows, list):
+                    continue
+                for blob in rows:
+                    if not isinstance(blob, dict):
+                        continue
+                    bk = str(blob.get("book") or "")
+                    if bk in book_ts and "book_updated_at" not in blob:
+                        blob["book_updated_at"] = book_ts[bk]
+        kalshi_trade_ts = None
+        for key in ("last_trade_ts", "last_trade_time", "updated_time", "last_updated_ts"):
+            if isinstance(k_row, dict) and k_row.get(key) is not None:
+                kalshi_trade_ts = k_row.get(key)
+                break
 
         liq_usd = float(kal_li) if kal_li is not None else 0.0
 
@@ -2545,6 +2642,8 @@ class OddsEVMonitor:
             "limit": liq_usd,
             "fairOdds": fair_odds_am,
             "link": href or "",
+            "book_updated_at": book_ts,
+            "kalshi_last_trade_ts": kalshi_trade_ts,
             "displayBooks": display,
             "devigBooks": devig_books,
             "ticker": ticker,
