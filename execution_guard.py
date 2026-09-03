@@ -1,0 +1,460 @@
+"""Fail-closed Kalshi execution identity and limit-order helpers.
+
+Cards may be painted from Odds-API plus public Kalshi market GETs.
+Private-key credentials are required only to submit orders.
+
+Never place when ticker, side, line, event identity, or price is missing
+or mismatched. Away spreads must already be -hdp (home-centric).
+"""
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+
+_TICKER_RE = re.compile(r"^[A-Z0-9]+(?:-[A-Z0-9]+)+$")
+_SUFFIX_RE = re.compile(r"^([A-Z]+)?(\d+)$")
+
+
+@dataclass(frozen=True)
+class ParsedTicker:
+    raw: str
+    series: str
+    event_key: str
+    event_ticker: str
+    family: str  # moneyline | spread | total
+    suffix: Optional[str]
+    team_code: Optional[str]
+    line_int: Optional[int]
+    is_market: bool
+
+
+@dataclass
+class ExecutionCheck:
+    ok: bool
+    reasons: List[str] = field(default_factory=list)
+    ticker: Optional[str] = None
+    event_ticker: Optional[str] = None
+    side: Optional[str] = None
+    price_cents: Optional[int] = None
+    line: Optional[float] = None
+    family: Optional[str] = None
+
+    def deny(self, reason: str) -> "ExecutionCheck":
+        self.ok = False
+        if reason and reason not in self.reasons:
+            self.reasons.append(reason)
+        return self
+
+
+def _clean(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _upper(value: Any) -> str:
+    return _clean(value).upper()
+
+
+def is_plive_venue(take_book: Any = None, ticker: Any = None) -> bool:
+    if _upper(take_book) == "PLIVE":
+        return True
+    return _upper(ticker).startswith("PLIVE")
+
+
+def is_kalshi_ticker(ticker: Any) -> bool:
+    t = _upper(ticker)
+    if not t or is_plive_venue(ticker=t):
+        return False
+    if t.startswith("KXSCAN"):
+        return False
+    return bool(_TICKER_RE.match(t)) and t.startswith("KX")
+
+
+def series_family(series: str) -> str:
+    s = _upper(series)
+    if "SPREAD" in s:
+        return "spread"
+    if "TOTAL" in s:
+        return "total"
+    return "moneyline"
+
+
+def to_game_series(series: str) -> str:
+    s = _upper(series)
+    return s.replace("SPREAD", "GAME").replace("TOTAL", "GAME")
+
+
+def parse_kalshi_ticker(ticker: Any) -> Optional[ParsedTicker]:
+    raw = _upper(ticker)
+    if not is_kalshi_ticker(raw):
+        return None
+    parts = raw.split("-")
+    if len(parts) < 2:
+        return None
+    series = parts[0]
+    event_key = parts[1]
+    suffix = parts[2] if len(parts) >= 3 else None
+    family = series_family(series)
+    team_code = None
+    line_int = None
+    if suffix:
+        m = _SUFFIX_RE.match(suffix)
+        if m:
+            team_code = m.group(1) or None
+            line_int = int(m.group(2))
+        elif suffix.isalpha():
+            team_code = suffix
+    event_ticker = f"{to_game_series(series)}-{event_key}"
+    return ParsedTicker(
+        raw=raw,
+        series=series,
+        event_key=event_key,
+        event_ticker=event_ticker,
+        family=family,
+        suffix=suffix,
+        team_code=team_code,
+        line_int=line_int,
+        is_market=suffix is not None,
+    )
+
+
+def event_ticker_from_any(ticker: Any) -> Optional[str]:
+    """Accept an event or market ticker; always return the GAME event ticker."""
+    parsed = parse_kalshi_ticker(ticker)
+    return parsed.event_ticker if parsed else None
+
+
+def same_event(left: Any, right: Any) -> bool:
+    a = parse_kalshi_ticker(left)
+    b = parse_kalshi_ticker(right)
+    if not a or not b:
+        return False
+    return a.event_key == b.event_key and to_game_series(a.series) == to_game_series(b.series)
+
+
+def kalshi_line_int(line: Any) -> Optional[int]:
+    try:
+        if line is None or line == "":
+            return None
+        return int(abs(float(line)))
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_alert_line(line: Any, qualifier: Any = None) -> Optional[float]:
+    for raw in (line, qualifier):
+        if raw is None or raw == "":
+            continue
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            return float(raw)
+        s = str(raw).replace("*", "").replace("+", "").strip() if False else str(raw).replace("*", "").strip()
+        try:
+            return float(s)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def away_inverted_line(home_hdp: Any, bet_side: str) -> Optional[float]:
+    """Home-centric hdp. Away is always -hdp. BookieBeats / KalshiBB rule."""
+    try:
+        hf = float(home_hdp)
+    except (TypeError, ValueError):
+        return None
+    if (bet_side or "").lower() == "away":
+        return -hf
+    return hf
+
+
+def split_home_away(teams: Any) -> Tuple[Optional[str], Optional[str]]:
+    """Alert teams are 'Away @ Home'."""
+    s = _clean(teams)
+    if not s:
+        return None, None
+    parts = re.split(r"\s*[@]\s*|\s+VS\.?\s+", s, maxsplit=1, flags=re.IGNORECASE)
+    if len(parts) != 2:
+        return None, None
+    return parts[0].strip(), parts[1].strip()
+
+
+def name_matches_code(name: Any, code: Any) -> bool:
+    n = _upper(name)
+    c = _upper(code)
+    if not n or not c:
+        return False
+    compact = re.sub(r"[^A-Z0-9]", "", n)
+    if c and c in compact:
+        return True
+    words = [w for w in re.split(r"[^A-Z0-9]+", n) if w]
+    if words and "".join(w[0] for w in words)[: len(c)] == c:
+        return True
+    for w in words:
+        if w == c or (len(w) >= 3 and (c.startswith(w[:3]) or w.startswith(c))):
+            return True
+    return False
+
+
+def pick_is_away(pick: Any, teams: Any) -> Optional[bool]:
+    away, home = split_home_away(teams)
+    if not away or not home:
+        return None
+    p = _upper(pick)
+    if name_matches_code(away, p) or p in _upper(away) or _upper(away) in p:
+        if p in _upper(home) and p not in _upper(away):
+            return False
+        return True
+    if name_matches_code(home, p) or p in _upper(home) or _upper(home) in p:
+        return False
+    away_hit = any(w in p for w in _upper(away).split() if len(w) > 3)
+    home_hit = any(w in p for w in _upper(home).split() if len(w) > 3)
+    if away_hit and not home_hit:
+        return True
+    if home_hit and not away_hit:
+        return False
+    return None
+
+
+def _family_from_market_type(market_type: Any) -> str:
+    m = _upper(market_type)
+    if "TOTAL" in m or m in ("OVER", "UNDER"):
+        return "total"
+    if "SPREAD" in m or "PUCK" in m or "HANDICAP" in m or "RUN LINE" in m:
+        return "spread"
+    return "moneyline"
+
+
+def expected_side_for_alert(
+    *,
+    market_type: Any,
+    pick: Any,
+    line: Optional[float],
+    ticker: Any,
+    teams: Any = None,
+) -> Optional[str]:
+    family = _family_from_market_type(market_type)
+    pick_u = _upper(pick)
+    parsed = parse_kalshi_ticker(ticker)
+    if family == "total":
+        if "UNDER" in pick_u:
+            return "no"
+        if "OVER" in pick_u:
+            return "yes"
+        return None
+    if not parsed:
+        return None
+    if family == "spread":
+        if line is None:
+            return None
+        pick_on_ticker = bool(parsed.team_code and name_matches_code(pick, parsed.team_code))
+        if line < 0:
+            # Favorite: Kalshi ticker is this team's market. YES = favorite covers.
+            return "yes" if pick_on_ticker else None
+        if line > 0:
+            # Underdog: ticker is the favorite (opponent). NO = underdog covers.
+            return "no" if (parsed.team_code and not pick_on_ticker) else None
+        return None
+    # moneyline: suffix is the YES team
+    if parsed.team_code and name_matches_code(pick, parsed.team_code):
+        return "yes"
+    if parsed.team_code:
+        away, home = split_home_away(teams)
+        opp = None
+        if away and home:
+            if name_matches_code(away, parsed.team_code) or _upper(away).find(parsed.team_code) >= 0:
+                opp = home
+            elif name_matches_code(home, parsed.team_code) or _upper(home).find(parsed.team_code) >= 0:
+                opp = away
+        if opp and (name_matches_code(pick, opp) or pick_u in _upper(opp) or _upper(opp) in pick_u):
+            return "no"
+        if not name_matches_code(pick, parsed.team_code):
+            return "no"
+    return None
+
+
+def has_trading_credentials(priv: Any, key_id: Any) -> bool:
+    return bool(priv) and bool(_clean(key_id))
+
+
+def public_get_headers(priv: Any, key_id: Any, signed_headers: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """Market/event/orderbook GETs are public. Sign only when a key is loaded."""
+    if has_trading_credentials(priv, key_id) and signed_headers:
+        return dict(signed_headers)
+    return {}
+
+
+def validate_limit_price(price_cents: Any) -> Optional[int]:
+    try:
+        n = int(price_cents)
+    except (TypeError, ValueError):
+        return None
+    if n < 1 or n > 99:
+        return None
+    return n
+
+
+def build_limit_order_payload(
+    *,
+    ticker: Any,
+    side: Any,
+    count: Any,
+    price_cents: Any,
+    post_only: bool = False,
+) -> Tuple[Optional[Dict[str, Any]], List[str]]:
+    """Limit at the displayed actionable price. Never a market order."""
+    reasons: List[str] = []
+    parsed = parse_kalshi_ticker(ticker)
+    if not parsed:
+        reasons.append("missing_or_invalid_ticker")
+    side_l = _clean(side).lower()
+    if side_l not in ("yes", "no"):
+        reasons.append("missing_or_invalid_side")
+    try:
+        n = int(count)
+    except (TypeError, ValueError):
+        n = 0
+    if n <= 0:
+        reasons.append("missing_or_invalid_count")
+    px = validate_limit_price(price_cents)
+    if px is None:
+        reasons.append("missing_or_invalid_price")
+    if reasons:
+        return None, reasons
+    payload: Dict[str, Any] = {
+        "ticker": parsed.raw,
+        "side": side_l,
+        "action": "buy",
+        "count": n,
+        "type": "limit",
+    }
+    if side_l == "yes":
+        payload["yes_price"] = px
+    else:
+        payload["no_price"] = px
+    if post_only:
+        payload["post_only"] = True
+    return payload, []
+
+
+def validate_execution_intent(
+    *,
+    ticker: Any,
+    side: Any,
+    price_cents: Any,
+    market_type: Any,
+    pick: Any,
+    teams: Any = None,
+    line: Any = None,
+    qualifier: Any = None,
+    event_ticker: Any = None,
+    rebuilt_ticker: Any = None,
+    take_book: Any = "Kalshi",
+    home_hdp: Any = None,
+    bet_side: Any = None,
+    require_credentials: bool = False,
+    has_credentials: bool = False,
+) -> ExecutionCheck:
+    """Refuse the order unless identity + price are complete and consistent."""
+    check = ExecutionCheck(ok=True)
+    if is_plive_venue(take_book, ticker):
+        return check.deny("plive_not_executable")
+    if require_credentials and not has_credentials:
+        return check.deny("credentials_required_for_orders")
+
+    parsed = parse_kalshi_ticker(ticker)
+    if not parsed:
+        return check.deny("missing_or_invalid_ticker")
+    check.ticker = parsed.raw
+    check.event_ticker = parsed.event_ticker
+    check.family = parsed.family
+
+    side_l = _clean(side).lower()
+    if side_l not in ("yes", "no"):
+        return check.deny("missing_or_invalid_side")
+    check.side = side_l
+
+    px = validate_limit_price(price_cents)
+    if px is None:
+        return check.deny("missing_or_invalid_price")
+    check.price_cents = px
+
+    if not _clean(pick):
+        return check.deny("missing_pick")
+
+    family = _family_from_market_type(market_type) or parsed.family
+    if parsed.family != family:
+        check.deny("wrong_market_family")
+
+    alert_line = parse_alert_line(line, qualifier)
+    check.line = alert_line
+
+    if family in ("spread", "total"):
+        if alert_line is None:
+            check.deny("missing_line")
+        elif parsed.line_int is None:
+            check.deny("ticker_missing_line")
+        elif parsed.line_int != kalshi_line_int(alert_line):
+            check.deny("wrong_line")
+
+    if home_hdp is not None and bet_side:
+        expected = away_inverted_line(home_hdp, str(bet_side))
+        if expected is None:
+            check.deny("missing_hdp")
+        elif alert_line is None or abs(float(alert_line) - float(expected)) > 1e-6:
+            check.deny("away_side_not_inverted")
+
+    if event_ticker:
+        if not same_event(parsed.raw, event_ticker):
+            check.deny("event_mismatch")
+    if rebuilt_ticker:
+        rebuilt = parse_kalshi_ticker(rebuilt_ticker)
+        if not rebuilt:
+            check.deny("stale_or_mismatched_ticker")
+        elif rebuilt.raw != parsed.raw:
+            check.deny("stale_or_mismatched_ticker")
+        elif not same_event(parsed.raw, rebuilt.raw):
+            check.deny("event_mismatch")
+
+    expected_side = expected_side_for_alert(
+        market_type=market_type,
+        pick=pick,
+        line=alert_line,
+        ticker=parsed.raw,
+        teams=teams,
+    )
+    if expected_side is None:
+        check.deny("side_unresolved")
+    elif expected_side != side_l:
+        check.deny("wrong_side")
+
+    if check.reasons:
+        check.ok = False
+    return check
+
+
+def prepare_executable_order(
+    alert: Dict[str, Any],
+    *,
+    rebuilt_ticker: Any = None,
+    home_hdp: Any = None,
+    bet_side: Any = None,
+    require_credentials: bool = True,
+    has_credentials: bool = False,
+) -> ExecutionCheck:
+    """Shared gate for click-to-bet and auto-bet. Fail closed."""
+    return validate_execution_intent(
+        ticker=alert.get("ticker"),
+        side=alert.get("side"),
+        price_cents=alert.get("price_cents"),
+        market_type=alert.get("market_type"),
+        pick=alert.get("pick"),
+        teams=alert.get("teams"),
+        line=alert.get("line"),
+        qualifier=alert.get("qualifier"),
+        event_ticker=alert.get("event_ticker"),
+        rebuilt_ticker=rebuilt_ticker,
+        take_book=alert.get("take_book") or "Kalshi",
+        home_hdp=home_hdp if home_hdp is not None else alert.get("home_hdp"),
+        bet_side=bet_side or alert.get("bet_side"),
+        require_credentials=require_credentials,
+        has_credentials=has_credentials,
+    )

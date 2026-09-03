@@ -51,6 +51,7 @@ warnings.filterwarnings('ignore', message='.*SSL.*')
 from ev_alert import EvAlert
 from market_matcher import MarketMatcher
 from kalshi_client import KalshiClient
+from execution_guard import event_ticker_from_any, prepare_executable_order
 from odds_ev_monitor import (
     OddsEVMonitor as EvMonitorImpl,
     _market_names_match,
@@ -2427,7 +2428,9 @@ async def handle_new_alert(alert: EvAlert):
     
     try:
         # CRITICAL: Extract EVENT ticker from link (not submarket ticker!)
-        event_ticker = alert.ticker or alert.extract_ticker_from_url()
+        # Odds-API href may be a market ticker (…-DET1). Coerce to the GAME event.
+        raw_ticker = alert.ticker or alert.extract_ticker_from_url()
+        event_ticker = event_ticker_from_any(raw_ticker) or raw_ticker
         
         # DIAGNOSTIC: Log sport type for debugging
         if event_ticker:
@@ -5096,15 +5099,15 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
         # Get expected price (ticker and side already determined above)
         expected_price_cents = alert_data.get('price_cents')
         
-        if not ticker or not side:
-            print(f"[AUTO-BET] SKIP: Alert {alert_id} - Missing ticker or side (ticker={ticker}, side={side}) [MISSING DATA]")
+        if not ticker or not side or not expected_price_cents:
+            print(f"[AUTO-BET] SKIP: Alert {alert_id} - Missing ticker, side, or price (ticker={ticker}, side={side}, price={expected_price_cents}) [MISSING DATA]")
             # Log high-EV alerts that are blocked due to missing data
             if ev_percent >= current_ev_min:
                 store_failed_auto_bet(
                     alert_id=alert_id,
                     alert=alert,
                     alert_data=alert_data,
-                    error=f"Missing ticker or side (ticker={ticker}, side={side})",
+                    error=f"Missing ticker, side, or price (ticker={ticker}, side={side}, price={expected_price_cents})",
                     reason=f"Alert has {ev_percent:.2f}% EV (>= {current_ev_min}% threshold) but missing required data for bet placement",
                     ticker=ticker,
                     side=side,
@@ -6194,7 +6197,7 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
                     print(f"[AUTO-BET] ProphetX + Novig detected - applying {px_novig_multiplier}x multiplier: ${base_amount:.2f} -> ${bet_amount:.2f}")
             
             # Calculate contracts and place bet (minimal logging for speed)
-            contracts = market_matcher.calculate_contracts_from_dollars(bet_amount, expected_price_cents or 50)
+            contracts = market_matcher.calculate_contracts_from_dollars(bet_amount, expected_price_cents)
             print(f"[AUTO-BET] Placing bet: {alert.teams} - {alert.pick} | {ticker} {side} | ${bet_amount:.2f} ({contracts} contracts @ {expected_price_cents}¢)")
             
             # Place the bet (lock is still held)
@@ -6528,6 +6531,41 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
                 print(f"[AUTO-BET] ========== CALLING place_order() NOW ==========")
                 print(f"[AUTO-BET] [TIMING] Order placement started at {time.strftime('%H:%M:%S.%f', time.localtime(order_placement_start))}")
                 print(f"[AUTO-BET] [TIMING] Step timings so far: {step_timings}")
+
+                rebuilt_ticker = None
+                event_for_rebuild = event_ticker_from_any(alert_data.get('event_ticker') or ticker)
+                if event_for_rebuild and alert_data.get('market_type') and alert_data.get('pick'):
+                    rebuilt_ticker = kalshi_client.build_market_ticker(
+                        event_for_rebuild,
+                        alert_data.get('market_type'),
+                        alert_data.get('line'),
+                        alert_data.get('pick'),
+                        alert_data.get('teams'),
+                    )
+                intent = prepare_executable_order(
+                    alert_data,
+                    rebuilt_ticker=rebuilt_ticker,
+                    require_credentials=True,
+                    has_credentials=kalshi_client.has_trading_credentials(),
+                )
+                if not intent.ok:
+                    print(f"[AUTO-BET] SKIP: Execution identity failed: {intent.reasons}")
+                    store_failed_auto_bet(
+                        alert_id=alert_id,
+                        alert=alert,
+                        alert_data=alert_data,
+                        error="Execution identity failed",
+                        reason=",".join(intent.reasons),
+                        ticker=ticker,
+                        side=side,
+                        ev_percent=ev_percent,
+                        odds=alert_data.get('american_odds'),
+                        filter_name=alert_filter_name,
+                    )
+                    return
+                ticker = intent.ticker
+                side = intent.side
+                expected_price_cents = intent.price_cents
                 
                 # TIMING: Track order placement
                 order_api_start = time.time()
@@ -9180,6 +9218,9 @@ def place_bet():
     if not kalshi_client:
         print(f"[BET] ERROR: Kalshi client not initialized")
         return jsonify({'error': 'Kalshi client not initialized'}), 500
+    if not kalshi_client.has_trading_credentials():
+        print(f"[BET] ERROR: Kalshi credentials required to place orders")
+        return jsonify({'error': 'Kalshi credentials required to place orders'}), 403
     
     data = request.json
     alert_id = data.get('alert_id')
@@ -9262,73 +9303,37 @@ def place_bet():
         print(f"[BET]   ⚠️  Could not fetch market data for logging: {e}")
     
     print(f"[BET] ==========================================")
+
+    # Fail closed: never rematch to a different market at click time.
+    rebuilt_ticker = None
+    event_for_rebuild = event_ticker_from_any(alert.get('event_ticker') or ticker)
+    if event_for_rebuild and alert.get('market_type') and alert.get('pick'):
+        rebuilt_ticker = kalshi_client.build_market_ticker(
+            event_for_rebuild,
+            alert.get('market_type'),
+            alert.get('line'),
+            alert.get('pick'),
+            alert.get('teams'),
+        )
+    intent = prepare_executable_order(
+        alert,
+        rebuilt_ticker=rebuilt_ticker,
+        require_credentials=True,
+        has_credentials=kalshi_client.has_trading_credentials(),
+    )
+    if not intent.ok:
+        print(f"[BET] ERROR: Execution identity failed: {intent.reasons}")
+        return jsonify({
+            'error': 'Execution identity failed — refusing order',
+            'reasons': intent.reasons,
+        }), 400
+    ticker = intent.ticker
+    side = intent.side
+    expected_price_cents = intent.price_cents
     
-    # FALLBACK MATCHING: If alert failed to match initially, try again for manual bets
-    if not ticker or not side:
-        event_ticker = alert.get('event_ticker')
-        market_type = alert.get('market_type')
-        qualifier = alert.get('qualifier')
-        pick = alert.get('pick')
-        teams = alert.get('teams')
-        
-        if event_ticker and market_type and pick:
-            print(f"[BET] ⚠️  Alert not matched initially - attempting fallback matching for manual bet...")
-            print(f"[BET]   Event Ticker: {event_ticker}")
-            print(f"[BET]   Market Type: {market_type}")
-            print(f"[BET]   Line/Qualifier: {qualifier}")
-            print(f"[BET]   Pick: {pick}")
-            
-            try:
-                loop = get_or_create_event_loop()
-                if loop.is_running():
-                    future = asyncio.run_coroutine_threadsafe(
-                        kalshi_client.find_submarket(
-                            event_ticker=event_ticker,
-                            market_type=market_type,
-                            line=qualifier if qualifier else None,
-                            selection=pick,
-                            teams_str=teams
-                        ),
-                        loop
-                    )
-                    match_result = future.result(timeout=5)
-                else:
-                    match_result = loop.run_until_complete(
-                        kalshi_client.find_submarket(
-                            event_ticker=event_ticker,
-                            market_type=market_type,
-                            line=qualifier if qualifier else None,
-                            selection=pick,
-                            teams_str=teams
-                        )
-                    )
-                
-                if match_result and match_result.get('ticker'):
-                    ticker = match_result['ticker']
-                    side = match_result.get('side')
-                    print(f"[BET] ✅ Fallback matching SUCCESS: ticker={ticker}, side={side}")
-                    
-                    # Update alert data with matched ticker/side
-                    alert['ticker'] = ticker
-                    alert['side'] = side
-                    active_alerts[alert_id] = alert
-                    
-                    # Try to get price if available
-                    if match_result.get('price_cents'):
-                        expected_price_cents = match_result['price_cents']
-                        alert['price_cents'] = expected_price_cents
-                else:
-                    print(f"[BET] ❌ Fallback matching FAILED: Could not find market")
-                    return jsonify({'error': 'Could not find matching market on Kalshi'}), 404
-            except Exception as e:
-                print(f"[BET] ❌ Fallback matching ERROR: {e}")
-                import traceback
-                traceback.print_exc()
-                return jsonify({'error': f'Failed to match market: {str(e)}'}), 500
-    
-    if not ticker or not side:
-        print(f"[BET] ERROR: Invalid alert data - ticker={ticker}, side={side}")
-        return jsonify({'error': 'Invalid alert data - market not found'}), 400
+    if not ticker or not side or expected_price_cents is None:
+        print(f"[BET] ERROR: Invalid alert data - ticker={ticker}, side={side}, price={expected_price_cents}")
+        return jsonify({'error': 'Invalid alert data - ticker, side, or price missing'}), 400
     
     # SPEED OPTIMIZATION: Skip portfolio check - Kalshi API will reject if insufficient balance
     # This saves 100-500ms per bet, critical for fast-moving edges
@@ -9346,13 +9351,13 @@ def place_bet():
         if max_bet_dollars <= 0:
             print(f"[BET] ERROR: No liquidity available (max_bet_dollars={max_bet_dollars})")
             return jsonify({'error': 'No liquidity available'}), 400
-        contracts = market_matcher.calculate_max_contracts(max_bet_dollars, expected_price_cents or 50)
+        contracts = market_matcher.calculate_max_contracts(max_bet_dollars, expected_price_cents)
         print(f"[BET] BET MAX mode: max_bet_dollars=${max_bet_dollars:.2f}, contracts={contracts}")
     else:
         if bet_amount <= 0:
             print(f"[BET] ERROR: Invalid bet amount: ${bet_amount:.2f}")
             return jsonify({'error': 'Invalid bet amount'}), 400
-        contracts = market_matcher.calculate_contracts_from_dollars(bet_amount, expected_price_cents or 50)
+        contracts = market_matcher.calculate_contracts_from_dollars(bet_amount, expected_price_cents)
         max_bet_dollars = None
         print(f"[BET] Fixed amount mode: bet_amount=${bet_amount:.2f}, contracts={contracts}")
     

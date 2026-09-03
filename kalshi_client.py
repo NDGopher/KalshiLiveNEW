@@ -16,6 +16,13 @@ from cryptography.hazmat.primitives.asymmetric import padding
 import websockets
 from pathlib import Path
 
+from execution_guard import (
+    build_limit_order_payload,
+    event_ticker_from_any,
+    has_trading_credentials,
+    public_get_headers,
+)
+
 load_dotenv(Path(__file__).resolve().parent / ".env", override=True, encoding="utf-8-sig")
 load_dotenv(Path.cwd() / ".env", override=True, encoding="utf-8-sig")
 
@@ -143,6 +150,24 @@ class KalshiClient:
         # Learned team codes - dynamically learned from tickers when one team is known
         self.learned_team_codes = {}  # Dict mapping team_name -> team_code (learned from successful matches)
         self.bet_cooldown_seconds = 60  # Prevent duplicate bets within 60 seconds
+
+    def has_trading_credentials(self):
+        """Private key is required only to submit orders, not to read markets."""
+        return has_trading_credentials(getattr(self.auth, "priv", None), getattr(self.auth, "kid", None))
+
+    def _headers_for(self, method, path, *, public_ok=False):
+        """Signed headers when a key is loaded. Public GETs may be unsigned."""
+        signed = None
+        if self.has_trading_credentials():
+            ts, sig = self.auth.sign(method, path)
+            signed = {
+                "KALSHI-ACCESS-KEY": self.auth.kid,
+                "KALSHI-ACCESS-SIGNATURE": sig,
+                "KALSHI-ACCESS-TIMESTAMP": ts,
+            }
+        if public_ok:
+            return public_get_headers(getattr(self.auth, "priv", None), getattr(self.auth, "kid", None), signed)
+        return signed or {}
     
     async def init(self):
         """Initialize HTTP session with current event loop.
@@ -662,35 +687,38 @@ class KalshiClient:
         return await self.build_all_sports_team_mapping()
     
     async def get_market_by_ticker(self, ticker):
-        """Get market details by ticker (submarket ticker, not event ticker)"""
+        """Get market details by ticker. Public GET — no private key required."""
         if not self.session:
             await self.init()
         
         try:
             # For v2 API, path must include /trade-api/v2 prefix
             path = f"/trade-api/v2/markets/{ticker}"
-            ts, sig = self.auth.sign("GET", path)
-            headers = {
-                "KALSHI-ACCESS-KEY": self.auth.kid,
-                "KALSHI-ACCESS-SIGNATURE": sig,
-                "KALSHI-ACCESS-TIMESTAMP": ts
-            }
-            
-            # Wrap in asyncio.wait_for to avoid timeout context manager issues when called from run_coroutine_threadsafe
-            async def _fetch_market():
+
+            def _unwrap(payload, fallback_ticker):
+                market = payload
+                if isinstance(payload, dict) and isinstance(payload.get("market"), dict):
+                    market = payload["market"]
+                if market and "ticker" not in market:
+                    market["ticker"] = fallback_ticker
+                return market
+
+            async def _fetch_market(headers):
                 async with self.session.get(
                     f"{self.base_url}{path}",
-                    headers=headers
+                    headers=headers or None
                 ) as resp:
                     if resp.status == 200:
-                        market = await resp.json()
-                        # CRITICAL: Ensure ticker field is set (API might return it nested or missing)
-                        if market and 'ticker' not in market:
-                            market['ticker'] = ticker
-                        return market
+                        return _unwrap(await resp.json(), ticker)
+                    if resp.status in (401, 403) and headers:
+                        return "retry_public"
                     return None
-            
-            return await asyncio.wait_for(_fetch_market(), timeout=35.0)
+
+            headers = self._headers_for("GET", path, public_ok=True)
+            market = await asyncio.wait_for(_fetch_market(headers), timeout=35.0)
+            if market == "retry_public":
+                market = await asyncio.wait_for(_fetch_market({}), timeout=35.0)
+            return market if market != "retry_public" else None
         except Exception as e:
             error_msg = str(e)
             # Suppress "Timeout context manager" errors - these are handled by asyncio.wait_for
@@ -1467,6 +1495,9 @@ class KalshiClient:
         - Spread -5.5 Marquette: KXNCAAMBSPREAD-26JAN31MARQHALL-MARQ5
         - Moneyline Wagner: KXNCAAMBGAME-26JAN31FDUWAG-WAG
         """
+        coerced = event_ticker_from_any(event_ticker)
+        if coerced:
+            event_ticker = coerced
         event_ticker_upper = event_ticker.upper()
         market_type_lower = market_type.lower()
         selection_upper = selection.upper() if selection else ""
@@ -2301,13 +2332,9 @@ class KalshiClient:
         
         try:
             # For v2 API, path must include /trade-api/v2 prefix
+            # Orderbook GET is public / read-only — do not require a private key.
             path = f"/trade-api/v2/markets/{ticker}/orderbook"
-            ts, sig = self.auth.sign("GET", path)
-            headers = {
-                "KALSHI-ACCESS-KEY": self.auth.kid,
-                "KALSHI-ACCESS-SIGNATURE": sig,
-                "KALSHI-ACCESS-TIMESTAMP": ts
-            }
+            headers = self._headers_for("GET", path, public_ok=True)
             
             # Wrap in asyncio.wait_for to avoid timeout context manager issues when called from run_coroutine_threadsafe
             async def _request():
@@ -2318,12 +2345,7 @@ class KalshiClient:
                         elif resp.status == 429:
                             # Rate limited - wait and retry once
                             await asyncio.sleep(1)
-                            ts, sig = self.auth.sign("GET", path)
-                            headers_retry = {
-                                "KALSHI-ACCESS-KEY": self.auth.kid,
-                                "KALSHI-ACCESS-SIGNATURE": sig,
-                                "KALSHI-ACCESS-TIMESTAMP": ts
-                            }
+                            headers_retry = self._headers_for("GET", path, public_ok=True)
                             async with self.session.get(f"{self.base_url}{path}", headers=headers_retry) as retry_resp:
                                 if retry_resp.status == 200:
                                     return await retry_resp.json()
@@ -2502,6 +2524,10 @@ class KalshiClient:
         exp_str = f", expires={expiration_ts}" if expiration_ts else ""
         manual_str = " [MANUAL - skip_duplicate_check=True]" if skip_duplicate_check else ""
         print(f"[ORDER] place_order() called: ticker={ticker}, side={side}, count={count}, expected_price={expected_price_cents}, type={order_type_str}{exp_str}{manual_str}")
+
+        if not self.has_trading_credentials():
+            print("[ORDER] ERROR: Kalshi credentials required to place orders (public reads are allowed without a key)")
+            return {"error": "Kalshi credentials required to place orders"}
         
         # Duplicate bet prevention - ONLY for auto-bettor. Manual dashboard bets pass skip_duplicate_check=True so user can click multiple times.
         bet_key = (ticker.upper(), side.lower())
@@ -3294,26 +3320,19 @@ class KalshiClient:
                         "details": error_msg
                     }
                 
-                # Prepare order payload with SIDE-SPECIFIC price field (Kalshi requirement)
-                # Kalshi requires "yes_price" for side="yes" or "no_price" for side="no" (in cents)
-                order_payload = {
-                    "ticker": ticker.upper(),
-                    "side": side.lower(),
-                    "action": "buy",  # Always buying contracts
-                    "count": final_count,
-                    "type": "limit"  # Limit order for price control
-                }
-                
-                # Add side-specific price field (Kalshi API requirement)
-                # CRITICAL: Limit orders will ONLY fill at price_cents or better (never worse)
-                # If market price is better, order fills immediately at better price (no slippage)
-                # If market price is worse, order sits on book at price_cents (may not fill, but no slippage)
-                if side.lower() == "yes":
-                    order_payload["yes_price"] = int(price_cents)
-                    print(f"[ORDER] Limit order: Will fill at {price_cents}¢ or BETTER (never worse) - no slippage protection")
-                else:
-                    order_payload["no_price"] = int(price_cents)
-                    print(f"[ORDER] Limit order: Will fill at {price_cents}¢ or BETTER (never worse) - no slippage protection")
+                # Limit at the displayed actionable price. Never a market order.
+                # Kalshi requires yes_price / no_price. Fills at price_cents or better.
+                order_payload, payload_reasons = build_limit_order_payload(
+                    ticker=ticker,
+                    side=side,
+                    count=final_count,
+                    price_cents=price_cents,
+                    post_only=bool(post_only),
+                )
+                if not order_payload:
+                    print(f"[ORDER] ERROR: Refusing order — {payload_reasons}")
+                    return {"error": "Invalid limit order", "reasons": payload_reasons}
+                print(f"[ORDER] Limit order: Will fill at {price_cents}¢ or BETTER (never worse)")
                 
                 # Add post-only flag if requested (maker order - won't cross, may rest on book)
                 if post_only:
