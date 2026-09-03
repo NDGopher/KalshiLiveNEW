@@ -1,9 +1,12 @@
 """Odds-API.io WebSocket unit tests — no live ODDS_API_KEY required."""
 from __future__ import annotations
 
+import asyncio
 import os
 
 import pytest
+
+import odds_api_ws as ows
 
 from odds_api_client import (
     DEFAULT_ODDS_API_BOOKMAKERS,
@@ -13,14 +16,19 @@ from odds_api_client import (
     parse_odds_api_seq_header,
 )
 from odds_api_ws import (
+    OddsApiWsFeed,
     OddsWsStore,
     WsFilterError,
     bookmaker_list_mismatch,
     build_ws_url,
+    is_odds_api_rate_limit_error,
     mlb_ws_slice_active,
     odds_api_ws_wanted,
     redact_ws_url,
+    resolve_odds_docs,
+    ws_close_code,
     ws_filters_from_env,
+    ws_reconnect_delay_sec,
 )
 
 
@@ -326,3 +334,280 @@ def test_rest_docs_merge_by_name_per_book():
     assert "Spread" in names
     assert "ML" in names
     assert store.merged_doc(9)["home"] == "Yankees"
+
+
+class _DummyRest:
+    last_seq = None
+
+    async def list_live_events(self, sport=None, force_refresh=False):
+        return []
+
+    async def select_bookmakers(self, names=None):
+        return None
+
+    async def get_odds_multi(self, *args, **kwargs):
+        return []
+
+    async def get_odds_updated(self, since, bookmaker, sport=None):
+        return []
+
+
+class _TryAgainLater(Exception):
+    code = 1013
+
+    def __str__(self) -> str:
+        return "received 1013 (Try again later)"
+
+
+class _Raise1013Connect:
+    def __init__(self, url):
+        raise _TryAgainLater()
+
+
+class _Immediate1013Socket:
+    close_code = 1013
+
+    def __init__(self, url):
+        self.url = url
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        raise StopAsyncIteration
+
+
+def test_ws_close_code_and_429_detection():
+    class Frame:
+        code = 1013
+
+    class Closed(Exception):
+        rcvd = Frame()
+
+    assert ws_close_code(Closed()) == 1013
+    assert ws_close_code(_Immediate1013Socket("wss://x")) == 1013
+    err = Exception("429 Too Many Requests")
+    err.status = 429
+    assert is_odds_api_rate_limit_error(err) is True
+    assert is_odds_api_rate_limit_error(Exception("timeout")) is False
+
+
+def test_1013_reconnect_delay_grows_with_jitter_bounds(monkeypatch):
+    monkeypatch.setenv("ODDS_API_WS_1013_BASE_SEC", "8")
+    monkeypatch.setenv("ODDS_API_WS_1013_MAX_SEC", "120")
+    monkeypatch.setenv("ODDS_API_WS_RECONNECT_JITTER", "0.25")
+    mid = [ws_reconnect_delay_sec(i, close_code=1013, rng=lambda: 0.5) for i in range(1, 6)]
+    assert mid == [8.0, 16.0, 32.0, 64.0, 120.0]
+    lo = ws_reconnect_delay_sec(1, close_code=1013, rng=lambda: 0.0)
+    hi = ws_reconnect_delay_sec(1, close_code=1013, rng=lambda: 1.0)
+    assert lo == pytest.approx(6.0)
+    assert hi == pytest.approx(10.0)
+    # Non-1013 uses the normal 2s base, not the 8s 1013 floor.
+    monkeypatch.setenv("ODDS_API_WS_RECONNECT_BASE_SEC", "2")
+    monkeypatch.setenv("ODDS_API_WS_RECONNECT_MAX_SEC", "60")
+    assert ws_reconnect_delay_sec(1, close_code=None, rng=lambda: 0.5) == 2.0
+
+
+def test_1013_reconnect_storm_does_not_reset_backoff(monkeypatch):
+    """Brief 1013 closes must grow delay instead of 1s-looping with lastSeq."""
+    monkeypatch.setenv("ODDS_API_KEY", "test-not-a-real-key")
+    monkeypatch.setenv("ODDS_API_WS_RECONNECT_JITTER", "0")
+    monkeypatch.setenv("ODDS_API_WS_1013_BASE_SEC", "8")
+    monkeypatch.setenv("ODDS_API_WS_1013_MAX_SEC", "120")
+    monkeypatch.setenv("ODDS_API_WS_HEALTHY_RESET_SEC", "15")
+    delays = []
+
+    async def run() -> None:
+        feed = OddsApiWsFeed(
+            _DummyRest(),
+            api_key="test-not-a-real-key",
+            connect_fn=_Immediate1013Socket,
+        )
+        feed.store.last_seq = 99
+        feed._running = True
+
+        async def fake_sleep(delay):
+            delays.append(float(delay))
+            if len(delays) >= 5:
+                feed._running = False
+
+        monkeypatch.setattr(ows.asyncio, "sleep", fake_sleep)
+        await feed._run_loop()
+        assert feed.last_close_code == 1013
+        assert feed._reconnect_attempts == 5
+
+    asyncio.run(run())
+    assert delays == [8.0, 16.0, 32.0, 64.0, 120.0]
+
+
+def test_1013_exception_reconnect_storm(monkeypatch):
+    monkeypatch.setenv("ODDS_API_KEY", "test-not-a-real-key")
+    monkeypatch.setenv("ODDS_API_WS_RECONNECT_JITTER", "0")
+    monkeypatch.setenv("ODDS_API_WS_1013_BASE_SEC", "8")
+    monkeypatch.setenv("ODDS_API_WS_1013_MAX_SEC", "120")
+    delays = []
+
+    async def run() -> None:
+        feed = OddsApiWsFeed(
+            _DummyRest(),
+            api_key="test-not-a-real-key",
+            connect_fn=_Raise1013Connect,
+        )
+        feed._running = True
+
+        async def fake_sleep(delay):
+            delays.append(float(delay))
+            if len(delays) >= 4:
+                feed._running = False
+
+        monkeypatch.setattr(ows.asyncio, "sleep", fake_sleep)
+        await feed._run_loop()
+        assert feed.last_close_code == 1013
+
+    asyncio.run(run())
+    assert delays == [8.0, 16.0, 32.0, 64.0]
+
+
+def _install_shared_feed(feed: OddsApiWsFeed) -> None:
+    ows._shared_feed = feed
+    ows._recovery_lock = None
+
+
+def test_429_fallback_suppression(monkeypatch):
+    monkeypatch.setenv("ODDS_API_KEY", "test-not-a-real-key")
+    monkeypatch.setenv("ODDS_API_WS", "true")
+    monkeypatch.setenv("ODDS_API_REST_UPDATED_FALLBACK", "true")
+    monkeypatch.setenv("ODDS_API_REST_FALLBACK_429_COOLDOWN_SEC", "60")
+
+    class RateLimitedRest(_DummyRest):
+        def __init__(self):
+            self.calls = []
+
+        async def get_odds_updated(self, since, bookmaker, sport=None):
+            self.calls.append(bookmaker)
+            err = Exception("429 Too Many Requests")
+            err.status = 429
+            raise err
+
+        async def get_odds_multi(self, *args, **kwargs):
+            raise AssertionError("fail-closed must not fall through to /odds/multi")
+
+    async def run() -> None:
+        rest = RateLimitedRest()
+        feed = OddsApiWsFeed(rest, api_key="test-not-a-real-key")
+        feed.store.event_meta[1] = {"id": 1, "home": "A", "away": "B"}
+        feed.store.apply_rest_docs(
+            [
+                {
+                    "id": 1,
+                    "home": "A",
+                    "away": "B",
+                    "bookmakers": {"FanDuel": [{"name": "ML", "odds": [{"home": 1.9, "away": 2.0}]}]},
+                }
+            ]
+        )
+        feed._reconnect_attempts = 2
+        feed.last_error = "1013 try again later"
+        _install_shared_feed(feed)
+        books = ["DraftKings", "FanDuel", "BetMGM", "Kalshi"]
+        docs, src = await resolve_odds_docs(rest, [1], books)
+        assert src == "unavailable"
+        assert docs == []
+        assert rest.calls == ["DraftKings"]
+        assert feed.fallback_cooling_down() is True
+        docs2, src2 = await resolve_odds_docs(rest, [1], books)
+        assert src2 == "unavailable"
+        assert docs2 == []
+        assert rest.calls == ["DraftKings"]
+
+    try:
+        asyncio.run(run())
+    finally:
+        ows._shared_feed = None
+        ows._recovery_lock = None
+
+
+def test_no_concurrent_recovery_calls(monkeypatch):
+    monkeypatch.setenv("ODDS_API_KEY", "test-not-a-real-key")
+    monkeypatch.setenv("ODDS_API_WS", "true")
+    monkeypatch.setenv("ODDS_API_REST_UPDATED_FALLBACK", "true")
+    monkeypatch.setenv("ODDS_API_REST_FALLBACK_COOLDOWN_SEC", "30")
+
+    class SlowRest(_DummyRest):
+        def __init__(self):
+            self.calls = []
+            self.inflight = 0
+            self.max_inflight = 0
+
+        async def get_odds_updated(self, since, bookmaker, sport=None):
+            self.inflight += 1
+            self.max_inflight = max(self.max_inflight, self.inflight)
+            self.calls.append(bookmaker)
+            await asyncio.sleep(0.05)
+            self.inflight -= 1
+            return []
+
+    async def run() -> None:
+        rest = SlowRest()
+        feed = OddsApiWsFeed(rest, api_key="test-not-a-real-key")
+        feed.store.event_meta[7] = {"id": 7}
+        feed._reconnect_attempts = 1
+        feed.last_error = "disconnected"
+        _install_shared_feed(feed)
+        books = ["DraftKings", "FanDuel", "BetMGM"]
+        results = await asyncio.gather(
+            resolve_odds_docs(rest, [7], books),
+            resolve_odds_docs(rest, [7], books),
+            resolve_odds_docs(rest, [7], books),
+            feed.rest_updated_fallback(1, books),
+        )
+        assert rest.max_inflight == 1
+        # One fallback pass (3 books). Extra callers wait then hit cooldown.
+        assert rest.calls == ["DraftKings", "FanDuel", "BetMGM"]
+        sources = [r[1] if isinstance(r, tuple) else "direct" for r in results]
+        assert sources.count("unavailable") >= 2
+        assert "rest_multi" not in sources
+
+    try:
+        asyncio.run(run())
+    finally:
+        ows._shared_feed = None
+        ows._recovery_lock = None
+
+
+def test_ws_recovery_fail_closed_does_not_serve_stale(monkeypatch):
+    monkeypatch.setenv("ODDS_API_KEY", "test-not-a-real-key")
+    monkeypatch.setenv("ODDS_API_WS", "true")
+    monkeypatch.setenv("ODDS_API_REST_UPDATED_FALLBACK", "true")
+
+    async def run() -> None:
+        rest = _DummyRest()
+        feed = OddsApiWsFeed(rest, api_key="test-not-a-real-key")
+        feed.store.apply_rest_docs(
+            [
+                {
+                    "id": 3,
+                    "bookmakers": {"Kalshi": [{"name": "ML", "odds": [{"home": 1.5, "away": 2.5}]}]},
+                }
+            ]
+        )
+        feed._fallback_cooldown_until = 1e12
+        feed._reconnect_attempts = 3
+        feed.last_error = "1013"
+        _install_shared_feed(feed)
+        docs, src = await resolve_odds_docs(rest, [3], ["Kalshi"])
+        assert src == "unavailable"
+        assert docs == []
+        assert feed.healthy is False
+
+    try:
+        asyncio.run(run())
+    finally:
+        ows._shared_feed = None
+        ows._recovery_lock = None
