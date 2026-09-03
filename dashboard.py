@@ -1879,6 +1879,9 @@ async def handle_new_alert(alert: EvAlert):
             elif ticker_upper.startswith('KXEPL'):
                 print(f"[HANDLE ALERT] ⚽ EPL ALERT DETECTED: {event_ticker} - {alert.teams} - {alert.pick}")
         
+        if event_ticker and str(event_ticker).upper().startswith("KXSCAN"):
+            print(f"[HANDLE ALERT] Dropping synthetic KXSCAN ticker (not a Kalshi market): {event_ticker}")
+            return
         if not event_ticker:
             filter_name = getattr(alert, 'filter_name', '') or ''
             if 'CBB' in filter_name or 'NCAAB' in filter_name:
@@ -4138,6 +4141,8 @@ def is_unlisted_match_failed(row: Dict) -> bool:
     if row.get("match_failed") is True:
         return True
     ticker = row.get("ticker")
+    if ticker and str(ticker).upper().startswith("KXSCAN"):
+        return True
     if ticker in (None, "") and row.get("match_failure_reason"):
         return True
     return False

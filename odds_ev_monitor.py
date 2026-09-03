@@ -50,7 +50,9 @@ from ev_calculator import (
     fair_books_for_panel,
     filter_sharp_panel,
     format_ev_percent_display,
+    is_polymarket_book,
     power_average_fair_prob,
+    spread_keep_on_labeled_side,
 )
 from odds_api_client import (
     get_shared_odds_client,
@@ -403,6 +405,8 @@ def fair_sharp_names(sharps: List[str], take_book: str = "Kalshi") -> List[str]:
             continue
         if n == "plive" or n == take:
             continue
+        if is_polymarket_book(raw) or is_polymarket_book(n):
+            continue
         if n == "kalshi" and take != "plive":
             continue
         seen.add(n)
@@ -487,16 +491,23 @@ def _pick_matching_odds_row(mk: Dict[str, Any], mname: str, ref_row: Dict[str, A
     return fir if isinstance(fir, dict) else {}
 
 
-def _market_is_spread_or_total(mname: str) -> bool:
+def _market_is_spread(mname: str) -> bool:
     mu = (mname or "").upper()
-    if "TOTAL" in mu or ("OVER" in mu and "UNDER" in mu) or mu in ("OU", "O/U"):
-        return True
+    if "TOTAL" in mu or "OVER" in mu or "UNDER" in mu or mu in ("OU", "O/U"):
+        return False
     return (
         "SPREAD" in mu
         or "HANDICAP" in mu
         or "PUCK LINE" in mu
         or "PUCKLINE" in mu.replace(" ", "")
     )
+
+
+def _market_is_spread_or_total(mname: str) -> bool:
+    mu = (mname or "").upper()
+    if "TOTAL" in mu or ("OVER" in mu and "UNDER" in mu) or mu in ("OU", "O/U"):
+        return True
+    return _market_is_spread(mname)
 
 
 def _sharp_row_for_market(
@@ -700,18 +711,25 @@ def _event_debug_sort_key(ev: Dict[str, Any]) -> Tuple[int, str]:
     return (0 if live else 1, str(ev.get("date") or ""))
 
 
+def is_synthetic_kxscan_ticker(ticker: Optional[str]) -> bool:
+    """Live-scan placeholder. Never a Kalshi event/market ticker."""
+    return str(ticker or "").strip().upper().startswith("KXSCAN")
+
+
 def extract_kalshi_ticker_from_href(href: Optional[str]) -> Optional[str]:
     if not href:
         return None
     m = re.search(r"kalshi\.com/(?:[^/]+/)*([A-Z0-9]{3,}[A-Z0-9\-]*)", href, re.I)
-    if m:
-        return m.group(1).upper()
-    parts = href.rstrip("/").split("/")
-    if parts:
-        cand = parts[-1].upper()
-        if cand.startswith("KX"):
-            return cand
-    return None
+    found = m.group(1).upper() if m else None
+    if not found:
+        parts = href.rstrip("/").split("/")
+        if parts:
+            cand = parts[-1].upper()
+            if cand.startswith("KX"):
+                found = cand
+    if is_synthetic_kxscan_ticker(found):
+        return None
+    return found
 
 
 def _float_dec(s: Any) -> Optional[float]:
@@ -786,6 +804,60 @@ def _first_odds_row(market: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _float_hdp(value: Any) -> Optional[float]:
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def home_centric_hdp(row: Optional[Dict[str, Any]]) -> Optional[float]:
+    """Odds-API / PLive spread rows store ``hdp`` as the home handicap."""
+    if not isinstance(row, dict):
+        return None
+    return _float_hdp(row.get("hdp"))
+
+
+def side_handicap(home_hdp: Optional[float], bet_side: str) -> Optional[float]:
+    """Actual handicap for this side. Away is the negated home line — never reuse home's sign."""
+    hf = _float_hdp(home_hdp)
+    if hf is None:
+        return None
+    if (bet_side or "").lower() == "away":
+        return -hf
+    return hf
+
+
+def format_spread_qualifier(hdp: Optional[float]) -> Optional[str]:
+    hf = _float_hdp(hdp)
+    if hf is None:
+        return None
+    return f"{hf:+.1f}"
+
+
+def parse_painted_handicap(qualifier: Any) -> Optional[float]:
+    if qualifier is None or qualifier == "":
+        return None
+    if isinstance(qualifier, (int, float)) and not isinstance(qualifier, bool):
+        return float(qualifier)
+    s = str(qualifier).replace("*", "").strip()
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def spread_label_matches_actual(painted: Any, actual: Any, *, tol: float = 1e-6) -> bool:
+    """False when the card name still has home's sign on the away price."""
+    pf = parse_painted_handicap(painted)
+    af = _float_hdp(actual)
+    if pf is None or af is None:
+        return False
+    return abs(pf - af) <= tol
+
+
 def _pick_qualifier_line_for_side(
     event_home: str,
     event_away: str,
@@ -805,15 +877,13 @@ def _pick_qualifier_line_for_side(
         if side == "under":
             return "Under", (f"{lf:.1f}" if lf is not None else None), lf
     if "SPREAD" in mname or "HANDICAP" in mname or "PUCK LINE" in mname or "PUCKLINE" in mname.replace(" ", ""):
-        hdp = row.get("hdp")
-        try:
-            hf = float(hdp) if hdp is not None else None
-        except (TypeError, ValueError):
-            hf = None
+        # Home-centric hdp. Away must flip the sign or the ticker/name is the other contract.
+        hf = side_handicap(home_centric_hdp(row), side)
+        qual = format_spread_qualifier(hf)
         if side == "home":
-            return event_home, (f"{hf:+.1f}" if hf is not None else None), hf
+            return event_home, qual, hf
         if side == "away":
-            return event_away, (f"{hf:+.1f}" if hf is not None else None), hf
+            return event_away, qual, hf
     # Moneyline
     if side == "home":
         return event_home, None, None
@@ -1577,8 +1647,10 @@ class OddsEVMonitor:
                     if is_spread_m and sh and sa and skh and ska and hdp is not None:
                         hn = str(doc.get("home") or "Home")[:10]
                         an = str(doc.get("away") or "Away")[:10]
-                        queue_two_way(f"Spr {hdp} {hn}", sh, skh, sa)
-                        queue_two_way(f"Spr {hdp} {an}", sa, ska, sh)
+                        home_line = side_handicap(hdp, "home")
+                        away_line = side_handicap(hdp, "away")
+                        queue_two_way(f"Spr {home_line} {hn}", sh, skh, sa)
+                        queue_two_way(f"Spr {away_line} {an}", sa, ska, sh)
 
             raw_count = len(rows_for_event)
             kept: List[Dict[str, Any]] = []
@@ -2121,7 +2193,7 @@ class OddsEVMonitor:
                             if k_row.get(kk) is not None:
                                 mk_payload[kk] = k_row.get(kk)
                         bo: Dict[str, Any] = {
-                            "href": f"https://kalshi.com/markets/KXSCAN{eid}-{sig}",
+                            "href": "",
                             "home": k_row.get("home"),
                             "away": k_row.get("away"),
                         }
@@ -2138,7 +2210,6 @@ class OddsEVMonitor:
                                 "expectedValue": 0.0,
                                 "_live_broad_scan": True,
                                 "_ev_source": "live_event_scan",
-                                "_synthetic_ticker": f"KXSCAN{eid}{sig[:6].upper()}",
                                 "_scan_teams": teams,
                                 "_scan_mname": mname,
                                 "_canonical_kalshi_row": canon,
@@ -2426,9 +2497,9 @@ class OddsEVMonitor:
 
         bo = vb.get("bookmakerOdds") or {}
         href = bo.get("href") if isinstance(bo, dict) else None
-        ticker = extract_kalshi_ticker_from_href(href) or (
-            str(vb["_synthetic_ticker"]) if vb.get("_synthetic_ticker") else None
-        )
+        ticker = extract_kalshi_ticker_from_href(href)
+        if is_synthetic_kxscan_ticker(ticker) or is_synthetic_kxscan_ticker(vb.get("_synthetic_ticker")):
+            ticker = None
 
         take_canon = _norm_book(str(take_book or "Kalshi")) or "Kalshi"
         take_only = vb.get("_take_only")
@@ -2495,6 +2566,11 @@ class OddsEVMonitor:
                 k_dec = _decimal_for_side(k_row, bet_side)
                 if k_dec is None or k_dec <= 1.0:
                     return None
+            elif take_canon.lower() == "kalshi":
+                # Take price is this book's row only. Never borrow Polymarket / another book.
+                k_dec = _decimal_for_side(k_row, bet_side)
+                if k_dec is None or k_dec <= 1.0:
+                    return None
         elif take_canon.lower() == "plive":
             return None
         if k_dec is None or k_dec <= 1.0:
@@ -2503,6 +2579,12 @@ class OddsEVMonitor:
 
         row_for_pick = k_row if k_row else f_row if f_row else market
         pick, qualifier, line_val = _pick_qualifier_line_for_side(home, away, mname, bet_side, row_for_pick)
+        if _market_is_spread(mname):
+            actual_hdp = side_handicap(home_centric_hdp(row_for_pick), bet_side)
+            if actual_hdp is not None:
+                # Re-grade on the side's real line. Do not drop as a totals/TT mismatch.
+                line_val = actual_hdp
+                qualifier = format_spread_qualifier(actual_hdp)
 
         df = self.filter_payload.get("devigFilter") or {}
         method = str(df.get("method", "POWER")).upper()

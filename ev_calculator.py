@@ -335,15 +335,49 @@ def exclude_plive_from_fair(books: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     return [b for b in (books or []) if not is_plive_book(b.get("name"))]
 
 
+def exclude_from_fair(books: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """PLive and Polymarket never enter POWER/AVERAGE. No Poly sign-flip / invert."""
+    out: List[Dict[str, Any]] = []
+    for b in books or []:
+        if is_plive_book(b.get("name")) or is_polymarket_book(b.get("name")):
+            continue
+        out.append(b)
+    return out
+
+
+def spread_keep_on_labeled_side(
+    *,
+    painted_hdp: Optional[float] = None,
+    actual_hdp: Optional[float] = None,
+    kalshi_hdp: Optional[float] = None,
+    rec_hdp: Optional[float] = None,
+) -> Dict[str, Any]:
+    """KEEP uses the side's real handicap after negate-away — not the painted home sign.
+
+    Sox @ Astros away prices on the −1.5 slot must not KEEP as “Sox +1.5”.
+    This is a run-line sign gate, not a market-type / team-total drop.
+    """
+    reasons: List[str] = []
+    actual = actual_hdp if actual_hdp is not None else kalshi_hdp
+    if painted_hdp is not None and actual is not None:
+        if abs(float(painted_hdp) - float(actual)) > 1e-6:
+            reasons.append("spread_label_mismatch")
+    k = kalshi_hdp if kalshi_hdp is not None else actual
+    if k is not None and rec_hdp is not None:
+        if abs(float(k) - float(rec_hdp)) > 1e-6:
+            reasons.append("spread_hdp_mismatch")
+    return {"allow_keep": not reasons, "reasons": reasons}
+
+
 def fair_books_excluding_take(
     books: List[Dict[str, Any]],
     take_book: str = "Kalshi",
 ) -> List[Dict[str, Any]]:
-    """Fair/devig set: never PLive. Never the take venue. Kalshi allowed on PLive cards."""
+    """Fair/devig set: never PLive, never Polymarket, never the take venue."""
     take = _book_name_key(take_book or "Kalshi")
     out: List[Dict[str, Any]] = []
     for b in books or []:
-        if is_plive_book(b.get("name")):
+        if is_plive_book(b.get("name")) or is_polymarket_book(b.get("name")):
             continue
         if _book_name_key(b.get("name")) == take:
             continue
@@ -499,7 +533,7 @@ def power_average_fair_prob(
     """
     rows = [
         b
-        for b in exclude_plive_from_fair(survivors)
+        for b in exclude_from_fair(survivors)
         if float(b.get("decimal_pick") or 0) > 1.0 and float(b.get("decimal_opp") or 0) > 1.0
     ]
     if not rows:
@@ -615,6 +649,9 @@ def evaluate_sharp_panel_ev(
     method: str = "POWER",
     used_fallback: bool = False,
     take_book: str = "Kalshi",
+    painted_side_hdp: Optional[float] = None,
+    kalshi_side_hdp: Optional[float] = None,
+    rec_side_hdp: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Filter → POWER/AVERAGE fair → EV vs take → hard gates.
 
@@ -651,16 +688,29 @@ def evaluate_sharp_panel_ev(
         gated = apply_ev_hard_gates(
             ev, kalshi_american, fair_eligible, used_fallback=False, min_sharp_books=min_sharp_books
         )
+    hdp_gate = spread_keep_on_labeled_side(
+        painted_hdp=painted_side_hdp,
+        actual_hdp=kalshi_side_hdp,
+        kalshi_hdp=kalshi_side_hdp,
+        rec_hdp=rec_side_hdp,
+    )
+    plus_alert = bool(gated["plus_alert"])
+    ev_out = float(gated["ev_percent"])
+    reasons = list(gated["reasons"] or [])
+    if not hdp_gate["allow_keep"]:
+        plus_alert = False
+        ev_out = min(ev_out, 0.0)
+        reasons.extend(hdp_gate["reasons"])
     out = {
         "surviving": surviving,
         "surviving_names": [str(b.get("name") or "") for b in surviving],
         "fair_names": [str(b.get("name") or "") for b in fair_eligible],
         "fair_prob": fair,
         "raw_ev_percent": ev,
-        "ev_percent": gated["ev_percent"],
-        "plus_alert": gated["plus_alert"],
+        "ev_percent": ev_out,
+        "plus_alert": plus_alert,
         "better_count": gated["better_count"],
-        "reasons": gated["reasons"],
+        "reasons": reasons,
         "kalshi_implied": gated["kalshi_implied"],
         "survivor_median_implied": gated.get("survivor_median_implied"),
         "used_fallback": used_fallback,

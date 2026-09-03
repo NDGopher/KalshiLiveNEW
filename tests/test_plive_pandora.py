@@ -10,11 +10,14 @@ from plive_pandora import (
     PLIVE_SPORT_CATALOG_FALLBACK,
     PlivePandoraFeed,
     PliveStore,
+    align_plive_markets_to_odds_fixture,
     coeff_room_for_event,
     event_id_from_channel,
     extra_local_bookmakers,
     handshake_emits,
     match_plive_event_to_odds_doc,
+    merge_plive_market_lists,
+    plive_orientation_swapped_vs_odds,
     plive_sport_id,
     note_handshake_ack,
     parse_coeff_path,
@@ -73,8 +76,8 @@ def test_totals_and_spread_two_way():
         [
             {"op": "replace", "path": "/c/m/5/o/over_8.5/1", "value": 1.91},
             {"op": "replace", "path": "/c/m/5/o/under_8.5/1", "value": 1.91},
-            {"op": "replace", "path": "/c/m/2/o/-1.5/1", "value": 1.95},
-            {"op": "replace", "path": "/c/m/2/o/1.5/1", "value": 1.87},
+            {"op": "replace", "path": "/c/m/6/o/-1.5/1", "value": 1.95},
+            {"op": "replace", "path": "/c/m/6/o/1.5/1", "value": 1.87},
         ],
     )
     names = {m["name"] for m in store.markets_for_event(eid)}
@@ -266,7 +269,7 @@ def test_game_period_markets_ml_spread_totals():
                 "id": 199992971,
                 "c": {
                     "m": {
-                        "3": {"o": {"1": 1.29, "2": 3.45}},
+                        "10": {"o": {"1": 1.29, "2": 3.45}},
                         "5": {"o": {"14.5": [1.80, 1.94]}, "r": 14.5},
                         "6": {"o": {"-2": [1.93, 1.81]}, "r": -2},
                     }
@@ -291,8 +294,8 @@ def test_status_snapshot_reports_priced_mlb():
     feed.connected = True
     feed._running = True
     feed.store.apply_meta("99", {"home": "New York Yankees", "away": "Boston Red Sox", "sportId": 1})
-    feed.store.set_coeff("99", 3, "1", 1, 1.8)
-    feed.store.set_coeff("99", 3, "2", 1, 2.1)
+    feed.store.set_coeff("99", 10, "1", 1, 1.8)
+    feed.store.set_coeff("99", 10, "2", 1, 2.1)
     snap = feed.status_snapshot()
     assert snap["connected"] is True
     assert snap["partner_id"] == 113
@@ -302,3 +305,78 @@ def test_status_snapshot_reports_priced_mlb():
     assert snap["mlb_with_prices"] == 1
     assert snap["receiving_prices"] is True
     assert snap["samples"]
+
+
+def test_market6_nested_pair_is_run_line_not_dead_scalars():
+    """Dan dump: slot-1 [1.446, 2.65] is the live ±1.5; 8.86 / 1.045 are dead."""
+    store = PliveStore()
+    eid = "199298371"
+    store.set_coeff(eid, 6, "-1.5", 0, 8.86)
+    store.set_coeff(eid, 6, "-1.5", 1, [1.446, 2.65])
+    store.set_coeff(eid, 6, "2.5", 1, [1.17, 4.6])
+    store.set_coeff(eid, 5, "4.5", 1, 3.79)
+    store.set_coeff(eid, 7, "2.5", 1, 4.25)
+    mk = {m["name"]: m for m in store.markets_for_event(eid)}
+    assert "Spread" in mk
+    rows = mk["Spread"]["odds"]
+    live = next(r for r in rows if abs(float(r["hdp"])) == 1.5)
+    assert live["home"] == 1.446
+    assert live["away"] == 2.65
+    assert all(r["home"] != 8.86 for r in rows)
+    assert all(r["home"] != 3.79 for r in rows)
+    names = set(mk)
+    assert "Spread" in names
+    # Team totals (7) must not become a spread row.
+    assert not any(abs(float(r.get("hdp") or 0) - 4.5) < 1e-9 for r in rows)
+
+
+def test_unpriced_run_line_omits_plive_spread_tile():
+    store = PliveStore()
+    store.set_coeff("1", 6, "-1.5", 0, 8.86)
+    store.set_coeff("1", 6, "-1.5", 1, 1.045)
+    store.set_coeff("1", 5, "4.5", 0, 3.79)
+    store.set_coeff("1", 5, "4.5", 1, 1.30)
+    names = {m["name"] for m in store.markets_for_event("1")}
+    assert "Spread" not in names
+    assert "Totals" in names
+
+
+def test_market3_is_not_ml_column():
+    store = PliveStore()
+    store.set_coeff("e", 3, "1", 1, 2.61)
+    store.set_coeff("e", 3, "2", 1, 1.463)
+    store.set_coeff("e", 10, "1", 1, 1.69)
+    store.set_coeff("e", 10, "2", 1, 2.10)
+    ml = next(m for m in store.markets_for_event("e") if m["name"] == "ML")
+    assert ml["odds"][0]["home"] == 1.69
+    assert ml["odds"][0]["away"] == 2.10
+
+
+def test_align_plive_home_away_to_odds_api_fixture():
+    assert plive_orientation_swapped_vs_odds(
+        "Chicago White Sox", "Houston Astros", "Houston Astros", "Chicago White Sox"
+    )
+    markets = [
+        {"name": "Spread", "odds": [{"hdp": -1.5, "home": 2.65, "away": 1.446}]},
+        {"name": "ML", "odds": [{"home": 2.10, "away": 1.69}]},
+    ]
+    aligned = align_plive_markets_to_odds_fixture(
+        markets,
+        plive_home="Chicago White Sox",
+        plive_away="Houston Astros",
+        odds_home="Houston Astros",
+        odds_away="Chicago White Sox",
+    )
+    sp = next(m for m in aligned if m["name"] == "Spread")
+    assert sp["odds"][0]["hdp"] == 1.5
+    assert sp["odds"][0]["home"] == 1.446
+    assert sp["odds"][0]["away"] == 2.65
+
+
+def test_merge_keeps_odds_api_plive_ml():
+    existing = [{"name": "ML", "odds": [{"home": 1.69, "away": 2.10}]}]
+    incoming = [{"name": "Spread", "odds": [{"hdp": 1.5, "home": 1.45, "away": 2.65}]}]
+    merged = merge_plive_market_lists(existing, incoming)
+    ml = next(m for m in merged if m["name"] == "ML")
+    assert ml["odds"][0]["home"] == 1.69
+    assert any(m["name"] == "Spread" for m in merged)

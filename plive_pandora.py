@@ -68,11 +68,15 @@ _SPORT_HASH_RE = re.compile(r"#!?/sport/(\d+)", re.I)
 # index 0 ≈ money price, index 1 ≈ decimal odds (see Unified README).
 # Defaults from that subscriber's MLB-looking examples (market 10 ML, 5 totals)
 # plus common 2-way handicap = 2. Override with env if the tree differs.
-# Live catalog game period ``c.m`` (not the old UnifiedBetting guess of 10/1):
-#   3 = 2-way moneyline, 6 = spread (pair odds), 5 = totals (pair odds).
-_DEFAULT_ML_MARKETS = (3, 9, 10, 1)
-_DEFAULT_SPREAD_MARKETS = (6, 2)
+# Live catalog game period ``c.m`` (main baseball list = ML / game total / run line):
+#   6 = run line only (nested [home, away] often lives in slot 1).
+#   5 = game totals. 7/8 = team totals — never paint those on a spread tile.
+# Market 3 is not the public-UI / Odds-API PLive ML for MLB; do not use it
+# for the ML column (Odds-API PLive ML wins on merge).
+_DEFAULT_ML_MARKETS = (10, 9, 1)
+_DEFAULT_SPREAD_MARKETS = (6,)
 _DEFAULT_TOTAL_MARKETS = (5,)
+_TEAM_TOTAL_MARKETS = (7, 8)
 
 
 def _env_bool(name: str, default: str = "false") -> bool:
@@ -263,6 +267,50 @@ def _decimal_from_slot(slots: Dict[int, Any]) -> Optional[float]:
         f = _as_float(slots.get(idx))
         if f is not None and f > 1.0:
             return f
+    return None
+
+
+def _as_decimal_pair(value: Any) -> Optional[Tuple[float, float]]:
+    """Unwrap ``[home, away]`` or ``{0: home, 1: away}``. Nested slot-1 pairs from market 6."""
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        a, b = _as_float(value[0]), _as_float(value[1])
+        if a is not None and b is not None and a > 1.0 and b > 1.0:
+            return (a, b)
+        return None
+    if isinstance(value, dict):
+        a = _as_float(value.get(0) if value.get(0) is not None else value.get("0"))
+        b = _as_float(value.get(1) if value.get(1) is not None else value.get("1"))
+        if a is None:
+            a = _as_float(value.get("home"))
+        if b is None:
+            b = _as_float(value.get("away"))
+        if a is not None and b is not None and a > 1.0 and b > 1.0:
+            return (a, b)
+    return None
+
+
+def _looks_like_live_spread_dec(d: float) -> bool:
+    """Reject dead scalars (dump: 8.86 / 1.045 on hidden Astros −1.5). Keep 1.17 / 4.6 alts."""
+    return 1.12 <= float(d) <= 7.0
+
+
+def _spread_pair_from_slots(slots: Dict[int, Any]) -> Optional[Tuple[float, float]]:
+    """Market 6 run line: prefer nested pair in slot 1. Dead scalars → unpriced."""
+    if not isinstance(slots, dict):
+        return None
+    for idx in (1, 0, 2):
+        pair = _as_decimal_pair(slots.get(idx))
+        if pair and _looks_like_live_spread_dec(pair[0]) and _looks_like_live_spread_dec(pair[1]):
+            return pair
+    a = _as_float(slots.get(0))
+    b = _as_float(slots.get(1))
+    if (
+        a is not None
+        and b is not None
+        and _looks_like_live_spread_dec(a)
+        and _looks_like_live_spread_dec(b)
+    ):
+        return (a, b)
     return None
 
 
@@ -475,6 +523,76 @@ def _team_score(a: str, b: str) -> int:
         if not aw or not bw:
             return 0
         return int(100 * len(aw & bw) / len(aw | bw))
+
+
+def plive_orientation_swapped_vs_odds(
+    plive_home: str,
+    plive_away: str,
+    odds_home: str,
+    odds_away: str,
+    *,
+    min_score: int = 72,
+) -> bool:
+    """True when Pandora home/away is flipped vs the Odds-API fixture (Sox @ Astros)."""
+    if not plive_home or not plive_away or not odds_home or not odds_away:
+        return False
+    normal = min(_team_score(odds_home, plive_home), _team_score(odds_away, plive_away))
+    swapped = min(_team_score(odds_home, plive_away), _team_score(odds_away, plive_home))
+    return swapped > normal and swapped >= min_score
+
+
+def align_plive_markets_to_odds_fixture(
+    markets: List[Dict[str, Any]],
+    *,
+    plive_home: Optional[str],
+    plive_away: Optional[str],
+    odds_home: str,
+    odds_away: str,
+) -> List[Dict[str, Any]]:
+    """Attach prices on the Odds-API home/away axis, not Pandora's swapped labels."""
+    if not plive_orientation_swapped_vs_odds(
+        str(plive_home or ""), str(plive_away or ""), odds_home, odds_away
+    ):
+        return list(markets or [])
+    out: List[Dict[str, Any]] = []
+    for mk in markets or []:
+        if not isinstance(mk, dict):
+            continue
+        name = str(mk.get("name") or "")
+        rows: List[Dict[str, Any]] = []
+        for row in mk.get("odds") or []:
+            if not isinstance(row, dict):
+                continue
+            flipped = dict(row)
+            if name in ("ML", "Spread"):
+                flipped["home"], flipped["away"] = row.get("away"), row.get("home")
+                if name == "Spread" and row.get("hdp") is not None:
+                    hf = _as_float(row.get("hdp"))
+                    if hf is not None:
+                        flipped["hdp"] = -hf
+            rows.append(flipped)
+        out.append({**mk, "odds": rows})
+    return out
+
+
+def merge_plive_market_lists(
+    existing: Optional[List[Dict[str, Any]]],
+    incoming: Optional[List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """Odds-API PLive ML stays. Overlay run line (Spread) and game totals only."""
+    by_name: Dict[str, Dict[str, Any]] = {}
+    for m in existing or []:
+        if isinstance(m, dict) and m.get("name"):
+            by_name[str(m.get("name"))] = m
+    for m in incoming or []:
+        if not isinstance(m, dict) or not m.get("name"):
+            continue
+        name = str(m.get("name"))
+        if name == "ML" and "ML" in by_name:
+            continue
+        if name in ("Spread", "Totals", "ML"):
+            by_name[name] = m
+    return list(by_name.values())
 
 
 def match_plive_event_to_odds_doc(
@@ -718,63 +836,40 @@ class PliveStore:
                 out.append({"name": "ML", "odds": [{"home": home, "away": away}]})
                 break
 
-        # Spread: outcome is the home handicap (e.g. -1.5) or a [home, away] pair.
+        # Run line only (market 6). Team totals 7/8 and game totals 5 never land here.
         spread_rows: List[Dict[str, Any]] = []
         for mk in self.spread_markets:
+            if int(mk) in _TEAM_TOTAL_MARKETS or int(mk) in self.total_markets:
+                continue
             by_line: Dict[float, Dict[str, float]] = {}
-            home_dec = away_dec = None
-            hdp = None
+            singles: Dict[float, float] = {}
             for (market, outcome), slots in coeffs.items():
                 if market != mk:
                     continue
+                line = _as_float(outcome)
+                if line is None:
+                    continue
+                pair = _spread_pair_from_slots(slots)
+                if pair:
+                    by_line[float(line)] = {"home": pair[0], "away": pair[1]}
+                    continue
                 dec = _decimal_from_slot(slots)
-                if dec is None:
+                if dec is not None and _looks_like_live_spread_dec(dec):
+                    singles[float(line)] = dec
+            seen_abs: Set[float] = set()
+            for line, home_dec in singles.items():
+                key = abs(float(line))
+                if key in seen_abs or float(line) in by_line:
                     continue
-                oc = str(outcome)
-                ocl = oc.lower()
-                pair_home = _as_float(slots.get(0))
-                pair_away = _as_float(slots.get(1))
-                line = _as_float(oc)
-                if (
-                    line is not None
-                    and pair_home is not None
-                    and pair_away is not None
-                    and pair_home > 1.0
-                    and pair_away > 1.0
-                ):
-                    by_line.setdefault(line, {})["home"] = pair_home
-                    by_line.setdefault(line, {})["away"] = pair_away
+                opp = singles.get(-float(line))
+                if opp is None:
                     continue
-                if ocl in ("1", "home", "h"):
-                    home_dec = dec
-                    h = _as_float(slots.get(2) or slots.get("hdp"))
-                    if h is not None:
-                        hdp = h
-                elif ocl in ("2", "away", "a"):
-                    away_dec = dec
-                else:
-                    if line is None:
-                        continue
-                    by_line.setdefault(line, {})["home"] = dec
-                    by_line.setdefault(-line, {})
-            if home_dec and away_dec:
+                seen_abs.add(key)
+                by_line[float(line)] = {"home": home_dec, "away": opp}
+            for line, sides in by_line.items():
                 spread_rows.append(
-                    {"hdp": hdp if hdp is not None else 0.0, "home": home_dec, "away": away_dec}
+                    {"hdp": line, "home": sides["home"], "away": sides["away"]}
                 )
-            else:
-                for line, sides in by_line.items():
-                    if "home" in sides and "away" in sides:
-                        spread_rows.append(
-                            {"hdp": line, "home": sides["home"], "away": sides["away"]}
-                        )
-                        continue
-                    if "home" not in sides:
-                        continue
-                    opp = by_line.get(-line, {})
-                    away_s = opp.get("home")
-                    if away_s is None:
-                        continue
-                    spread_rows.append({"hdp": line, "home": sides["home"], "away": away_s})
             if spread_rows:
                 break
         if spread_rows:
@@ -978,7 +1073,14 @@ class PlivePandoraFeed:
         eid = match_plive_event_to_odds_doc(self.store.mlb_events(), home, away)
         if not eid:
             return []
-        return self.store.markets_for_event(eid)
+        ev = self.store.events.get(str(eid)) or {}
+        return align_plive_markets_to_odds_fixture(
+            self.store.markets_for_event(eid),
+            plive_home=str(ev.get("home") or ""),
+            plive_away=str(ev.get("away") or ""),
+            odds_home=home,
+            odds_away=away,
+        )
 
     def _record_ack(self, event_name: Optional[str], data: Any = None) -> None:
         kind = note_handshake_ack(event_name, data)
@@ -1247,17 +1349,19 @@ def merge_plive_into_docs(docs: List[Dict[str, Any]]) -> int:
         if not isinstance(bks, dict):
             doc["bookmakers"] = {}
             bks = doc["bookmakers"]
-        if markets:
-            bks[book] = list(markets)  # replace PLive markets only — never Betfair
-            stamps = doc.setdefault("book_updated_at", {})
-            if isinstance(stamps, dict):
-                stamps[book] = time.time()
-            n += 1
-        elif book in bks:
-            del bks[book]
-            stamps = doc.get("book_updated_at")
-            if isinstance(stamps, dict):
-                stamps.pop(book, None)
+        existing = bks.get(book) if isinstance(bks.get(book), list) else []
+        if not markets:
+            # Leave Odds-API PLive ML in place. Do not invent or wipe.
+            continue
+        incoming_spread = any(str(m.get("name")) == "Spread" for m in markets if isinstance(m, dict))
+        merged = merge_plive_market_lists(existing, markets)
+        if not incoming_spread:
+            merged = [m for m in merged if str(m.get("name")) != "Spread"]
+        bks[book] = merged
+        stamps = doc.setdefault("book_updated_at", {})
+        if isinstance(stamps, dict):
+            stamps[book] = time.time()
+        n += 1
     return n
 
 
