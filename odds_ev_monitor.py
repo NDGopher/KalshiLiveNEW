@@ -76,6 +76,7 @@ from odds_api_ws import (
     peek_shared_odds_ws_feed,
     resolve_odds_docs,
 )
+from kalshi_public_feed import attach_public_kalshi_to_docs
 from plive_pandora import (
     extra_local_bookmakers,
     get_shared_plive_feed,
@@ -2258,8 +2259,13 @@ class OddsEVMonitor:
                         for kk in ("home", "away", "hdp", "over", "under", "max", "line", "draw"):
                             if k_row.get(kk) is not None:
                                 mk_payload[kk] = k_row.get(kk)
+                        side_href = (
+                            k_row.get(f"{bet_side}_href")
+                            or k_row.get("href")
+                            or ""
+                        )
                         bo: Dict[str, Any] = {
-                            "href": str(k_row.get("href") or ""),
+                            "href": str(side_href),
                             "home": k_row.get("home"),
                             "away": k_row.get("away"),
                         }
@@ -2611,9 +2617,11 @@ class OddsEVMonitor:
                     if eid is not None:
                         odds_by_id[int(eid)] = doc
                 n_plive = merge_plive_into_docs(list(odds_by_id.values()))
+                n_kalshi_pub = await attach_public_kalshi_to_docs(odds_by_id)
                 print(
                     f"[MONITOR] odds source={src} events={len(odds_by_id)} "
-                    f"plive_matched={n_plive} (WS-first; REST only if WS down)"
+                    f"plive_matched={n_plive} kalshi_public_attached={n_kalshi_pub} "
+                    f"(WS-first; REST only if WS down)"
                 )
             except Exception as ex:
                 print(f"[MONITOR] [WARN] live scan odds resolve failed: {ex}")
@@ -2769,7 +2777,11 @@ class OddsEVMonitor:
                     if eid is not None:
                         odds_by_id[int(eid)] = doc
                 n_plive = merge_plive_into_docs(list(odds_by_id.values()))
-                print(f"[MONITOR] value-bets odds source={src} plive_matched={n_plive}")
+                n_kalshi_pub = await attach_public_kalshi_to_docs(odds_by_id)
+                print(
+                    f"[MONITOR] value-bets odds source={src} plive_matched={n_plive} "
+                    f"kalshi_public_attached={n_kalshi_pub}"
+                )
             except Exception as e:
                 print(f"[MONITOR] [WARN] odds resolve failed (using value-bet payload only): {e}")
 

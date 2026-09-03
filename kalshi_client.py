@@ -214,19 +214,14 @@ class KalshiClient:
             if params:
                 path += f"?{params}"
             
-            ts, sig = self.auth.sign("GET", path)
-            headers = {
-                "KALSHI-ACCESS-KEY": self.auth.kid,
-                "KALSHI-ACCESS-SIGNATURE": sig,
-                "KALSHI-ACCESS-TIMESTAMP": ts
-            }
+            headers = self._headers_for("GET", path, public_ok=True)
             
             # Use asyncio.wait_for instead of ClientTimeout to avoid "Timeout context manager should be used inside a task" error
             # when called from run_coroutine_threadsafe
             async def _make_request():
                 async with self.session.get(
                     f"{self.base_url}{path}",
-                    headers=headers
+                    headers=headers or None
                 ) as resp:
                     if resp.status == 200:
                         data = await resp.json()
@@ -234,12 +229,7 @@ class KalshiClient:
                     elif resp.status == 429:
                         await asyncio.sleep(2)
                         # Retry once
-                        ts, sig = self.auth.sign("GET", path)
-                        headers_retry = {
-                            "KALSHI-ACCESS-KEY": self.auth.kid,
-                            "KALSHI-ACCESS-SIGNATURE": sig,
-                            "KALSHI-ACCESS-TIMESTAMP": ts
-                        }
+                        headers_retry = self._headers_for("GET", path, public_ok=True)
                         async with self.session.get(
                             f"{self.base_url}{path}",
                             headers=headers_retry
@@ -266,18 +256,13 @@ class KalshiClient:
                     if params:
                         path += f"?{params}"
                     
-                    ts, sig = self.auth.sign("GET", path)
-                    headers = {
-                        "KALSHI-ACCESS-KEY": self.auth.kid,
-                        "KALSHI-ACCESS-SIGNATURE": sig,
-                        "KALSHI-ACCESS-TIMESTAMP": ts
-                    }
+                    headers = self._headers_for("GET", path, public_ok=True)
                     
                     # Use asyncio.wait_for instead of timeout context manager
                     async def _make_request():
                         async with self.session.get(
                             f"{self.base_url}{path}",
-                            headers=headers
+                            headers=headers or None
                         ) as resp:
                             if resp.status == 200:
                                 return await resp.json()
@@ -319,18 +304,13 @@ class KalshiClient:
         # METHOD 1: Try /events/{event_ticker} first (may only have moneylines)
         try:
             path = f"/trade-api/v2/events/{event_ticker}"
-            ts, sig = self.auth.sign("GET", path)
-            headers = {
-                "KALSHI-ACCESS-KEY": self.auth.kid,
-                "KALSHI-ACCESS-SIGNATURE": sig,
-                "KALSHI-ACCESS-TIMESTAMP": ts
-            }
+            headers = self._headers_for("GET", path, public_ok=True)
             
             # Wrap in asyncio.wait_for to avoid timeout context manager issues when called from run_coroutine_threadsafe
             async def _fetch_event():
                 async with self.session.get(
                     f"{self.base_url}{path}",
-                    headers=headers
+                    headers=headers or None
                 ) as resp:
                     if resp.status == 200:
                         event_data = await resp.json()
@@ -457,18 +437,13 @@ class KalshiClient:
                         "limit": 1000
                     }
                     
-                    ts, sig = self.auth.sign("GET", path)
-                    headers = {
-                        "KALSHI-ACCESS-KEY": self.auth.kid,
-                        "KALSHI-ACCESS-SIGNATURE": sig,
-                        "KALSHI-ACCESS-TIMESTAMP": ts
-                    }
+                    headers = self._headers_for("GET", path, public_ok=True)
                     
                     # Wrap in asyncio.wait_for to avoid timeout context manager issues when called from run_coroutine_threadsafe
                     async def _fetch_series():
                         async with self.session.get(
                             f"{self.base_url}{path}",
-                            headers=headers,
+                            headers=headers or None,
                             params=params
                         ) as resp:
                             if resp.status == 200:
@@ -745,13 +720,7 @@ class KalshiClient:
             # For now, try v2 API with market_id as parameter
             path = f"/trade-api/v2/markets"
             params = {"market_id": market_id}
-            
-            ts, sig = self.auth.sign("GET", path)
-            headers = {
-                "KALSHI-ACCESS-KEY": self.auth.kid,
-                "KALSHI-ACCESS-SIGNATURE": sig,
-                "KALSHI-ACCESS-TIMESTAMP": ts
-            }
+            headers = self._headers_for("GET", path, public_ok=True)
             
             # Use asyncio.wait_for instead of ClientTimeout to avoid context manager issues
             async def _make_request():
@@ -4766,13 +4735,7 @@ class KalshiClient:
             # Fetch all open events from Kalshi trade-api v2
             path = "/trade-api/v2/events"
             params = {"status": "open", "limit": 200}
-            
-            ts, sig = self.auth.sign("GET", path)
-            headers = {
-                "KALSHI-ACCESS-KEY": self.auth.kid,
-                "KALSHI-ACCESS-SIGNATURE": sig,
-                "KALSHI-ACCESS-TIMESTAMP": ts
-            }
+            headers = self._headers_for("GET", path, public_ok=True)
 
             async with self.session.get(f"{self.base_url}{path}", headers=headers, params=params) as resp:
                 if resp.status == 200:
