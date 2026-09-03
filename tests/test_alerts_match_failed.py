@@ -122,6 +122,105 @@ def test_get_alerts_omits_match_failed(monkeypatch):
         assert body.get("count") == 1
 
 
+def test_get_alerts_lists_href_less_plive_over_under(monkeypatch):
+    """DET@MIN 11.5 PLive-take O/U list on /api/alerts with no Kalshi ticker."""
+    monkeypatch.delenv("DASHBOARD_PASSWORD", raising=False)
+    try:
+        import asyncio
+
+        import dashboard as dash
+        from ev_alert import EvAlert
+    except Exception as exc:  # pragma: no cover
+        pytest.skip(f"dashboard import failed: {exc}")
+
+    dash.active_alerts.clear()
+    monkeypatch.setattr(dash, "dashboard_min_ev", 0.0)
+    monkeypatch.setattr(dash, "selected_dashboard_filters", set())
+
+    def _ou(pick: str) -> EvAlert:
+        alert = EvAlert(
+            {
+                "market_type": "Total Runs",
+                "teams": "Detroit Tigers @ Minnesota Twins",
+                "pick": pick,
+                "qualifier": "11.5",
+                "ev_percent": 4.0,
+                "odds": "-112",
+                "take_book": "PLive",
+                "ev_source": "plive_take",
+                "ticker": "",
+                "market_url": "",
+            }
+        )
+        alert.price_cents = 53
+        return alert
+
+    over = _ou("Over")
+    under = _ou("Under")
+    assert dash._is_plive_take_alert(over) is True
+    assert dash._is_plive_take_alert(under) is True
+    kalshi_blank = EvAlert(
+        {
+            "market_type": "Total Runs",
+            "teams": "Detroit Tigers @ Minnesota Twins",
+            "pick": "Over",
+            "qualifier": "11.5",
+            "ev_percent": 4.0,
+            "ticker": "",
+            "market_url": "",
+            "take_book": "Kalshi",
+        }
+    )
+    assert dash._is_plive_take_alert(kalshi_blank) is False
+
+    asyncio.run(dash.handle_new_alert(over))
+    asyncio.run(dash.handle_new_alert(under))
+    with dash.app.test_client() as client:
+        resp = client.get("/api/alerts")
+        assert resp.status_code == 200
+        body = resp.get_json()
+        picks = {(a.get("pick"), str(a.get("qualifier"))) for a in body.get("alerts") or []}
+        assert ("Over", "11.5") in picks
+        assert ("Under", "11.5") in picks
+        assert body.get("count") >= 2
+        for a in body.get("alerts") or []:
+            if a.get("pick") in ("Over", "Under") and str(a.get("qualifier")) == "11.5":
+                assert a.get("take_book") == "PLive"
+                assert a.get("match_failed") is False
+                assert str(a.get("ticker") or "").startswith("PLIVE|")
+                assert "KXMLB" not in str(a.get("ticker") or "")
+                assert dash.is_unlisted_match_failed(a) is False
+
+
+def test_href_less_plive_not_hidden_as_match_failed():
+    try:
+        from dashboard import is_unlisted_match_failed
+    except Exception as exc:  # pragma: no cover
+        pytest.skip(f"dashboard import failed: {exc}")
+
+    href_less = {
+        "id": "plive-ou-hrefless",
+        "ticker": "PLIVE|Detroit Tigers @ Minnesota Twins|Over|11.5",
+        "ev_source": "plive_take",
+        "take_book": "PLive",
+        "match_failed": True,
+        "match_failure_reason": "Could not find matching submarket",
+        "ev_percent": 4.0,
+        "pick": "Over",
+        "qualifier": "11.5",
+    }
+    assert is_unlisted_match_failed(href_less) is False
+    kalshi_blank = {
+        "id": "kalshi-blank",
+        "ticker": None,
+        "take_book": "Kalshi",
+        "match_failed": True,
+        "match_failure_reason": "Could not find matching submarket",
+        "ev_percent": 4.0,
+    }
+    assert is_unlisted_match_failed(kalshi_blank) is True
+
+
 def test_unmatched_handle_does_not_emit_new_alert():
     try:
         from dashboard import fanout_unmatched_alert, unmatched_alert_should_emit_new_alert

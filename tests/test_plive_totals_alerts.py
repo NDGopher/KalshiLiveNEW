@@ -133,6 +133,20 @@ def _plive_totals_vb(side: str, row: dict | None = None) -> dict:
     }
 
 
+def test_href_less_kalshi_totals_still_emit_plive_scan_sides():
+    """Empty Kalshi href must not block PLive Over/Under scan rows."""
+    mon = _totals_monitor()
+    doc = det_min_plive_totals_doc()
+    doc["bookmakers"]["Kalshi"] = [
+        {"name": "Totals", "odds": [{"max": 11.5, "line": 11.5, "over": 1.81, "under": 1.76}]}
+    ]
+    vbs = mon.live_scan_value_bets_from_docs({DET_MIN_EID: doc})
+    plive = [r for r in vbs if r.get("_take_only") == "PLive"]
+    sides = {r.get("betSide") for r in plive}
+    assert "over" in sides
+    assert "under" in sides
+
+
 def test_take_gate_keeps_plive_only_totals():
     doc = det_min_plive_totals_doc()
     assert "Kalshi" not in (doc["bookmakers"] or {})

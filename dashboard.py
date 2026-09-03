@@ -730,6 +730,8 @@ def _live_market_kind_of_name(name: str) -> Optional[str]:
     u = str(name or "").upper()
     if "PLAYER" in u:
         return None
+    if "TEAM" in u and "TOTAL" in u:
+        return None
     if "TOTAL" in u or u in ("OU", "O/U") or ("OVER" in u and "UNDER" in u):
         return "total"
     if "SPREAD" in u or "HANDICAP" in u or "PUCK" in u:
@@ -2137,7 +2139,28 @@ def create_alert_id(alert: EvAlert) -> str:
 
 
 def _is_plive_take_alert(alert: EvAlert) -> bool:
-    return str(getattr(alert, "take_book", "") or "Kalshi").strip().lower() == "plive"
+    """PLive-take cards list without a Kalshi ticker. Href-less O/U must not go through match_failed."""
+    if str(getattr(alert, "take_book", "") or "").strip().lower() == "plive":
+        return True
+    if str(getattr(alert, "ev_source", "") or "").strip().lower() == "plive_take":
+        return True
+    ticker = str(getattr(alert, "ticker", "") or "")
+    if ticker.upper().startswith("PLIVE|"):
+        return True
+    return False
+
+
+def _row_is_plive_take(row: Dict) -> bool:
+    if not isinstance(row, dict):
+        return False
+    if str(row.get("take_book") or "").strip().lower() == "plive":
+        return True
+    if str(row.get("ev_source") or "").strip().lower() == "plive_take":
+        return True
+    ticker = str(row.get("ticker") or "")
+    if ticker.upper().startswith("PLIVE|"):
+        return True
+    return False
 
 
 async def handle_plive_take_display_alert(alert: EvAlert) -> None:
@@ -4512,7 +4535,7 @@ def is_unlisted_match_failed(row: Dict) -> bool:
     """
     if not isinstance(row, dict):
         return True
-    if str(row.get("take_book") or "").strip().lower() == "plive":
+    if _row_is_plive_take(row):
         return False
     if row.get("match_failed") is True:
         return True

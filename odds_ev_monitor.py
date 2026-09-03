@@ -1366,7 +1366,9 @@ class OddsEVMonitor:
             alert.book_updated_at = alert_data["book_updated_at"]
             alert.kalshi_last_trade_ts = alert_data["kalshi_last_trade_ts"]
             alert.take_book = str(bet.get("take_book") or "Kalshi")
-            if alert.take_book.lower() == "plive":
+            if alert.take_book.lower() == "plive" or str(alert.ev_source).lower() == "plive_take":
+                alert.take_book = "PLive"
+                alert.ev_source = "plive_take"
                 alert.ticker = str(bet.get("ticker") or f"PLIVE|{teams}|{selection}|{qualifier}")
             else:
                 alert.ticker = self.extract_ticker_from_link(link) or bet.get("ticker")
@@ -2059,6 +2061,9 @@ class OddsEVMonitor:
                 (str(r.get("eventId")), str(r.get("_scan_mname") or "").upper(), str(r.get("betSide") or "").lower())
                 for r in scan_rows
                 if r.get("eventId") == eid
+                and extract_kalshi_ticker_from_href(
+                    ((r.get("bookmakerOdds") or {}) if isinstance(r.get("bookmakerOdds"), dict) else {}).get("href")
+                )
             }
             for mname, pl_mk in _kalshi_scan_gameline_markets(bks, "PLive"):
                 odds_rows = pl_mk.get("odds") or []
