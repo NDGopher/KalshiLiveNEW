@@ -719,7 +719,7 @@ function tilePaintState(bookName, bookOdds, alert, takeAm) {
     }
     const take = isCardTakeBook(bookName, alert);
     const bookAm = parseAmericanOddsValue(bookOdds);
-    const takeN = takeAm == null ? null : parseAmericanOddsValue(takeAm);
+    const takeN = parseAmericanOddsValue(takeAm != null ? takeAm : (alert && (alert.book_price || alert.american_odds)));
     if (!take && takeN != null && bookAm != null && isJunkVsKalshi(bookAm, takeN)) {
         return { skip: true, take: false, better: false };
     }

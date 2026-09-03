@@ -157,10 +157,11 @@ def test_royals_poly_minus455_skip_paint_not_gray():
     assert r["Polymarket"] == {"skip": True, "take": False, "better": False}
     assert r["PLive"] == {"skip": False, "take": False, "better": False}
     assert r["Betfair Exchange"] == {"skip": False, "take": False, "better": False}
-    assert r["DraftKings"] == {"skip": False, "take": False, "better": False}
     assert r["FanDuel"] == {"skip": False, "take": False, "better": False}
-    assert r["Bet365"] == {"skip": False, "take": False, "better": False}
     assert r["Caesars"] == {"skip": False, "take": False, "better": False}
+    # |implied(+105)−implied(+163)| ≈ 10.8c and +100 ≈ 12c → junk, omit (not gray).
+    assert r["DraftKings"]["skip"] is True
+    assert r["Bet365"]["skip"] is True
 
 
 def test_worse_css_full_opacity():

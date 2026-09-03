@@ -369,7 +369,7 @@ def test_royals_ml_plus163_omits_junk_poly_keeps_plive_tile():
     assert all("poly" not in n.lower() for n in names)
     assert all("pinnacle" not in n.lower() for n in names)
     assert any(n == "PLive" for n in names)
-    assert any("fair" in n.lower() or n == "Betfair Exchange" for n in names)
+    assert "Betfair Exchange" in names
 
 
 def test_junk_poly_minus455_vs_plus163_no_tile_no_power():
