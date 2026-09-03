@@ -1978,9 +1978,10 @@ if (stoppagesOnlyCb) {
             const kind = String(row.market_kind || '').toLowerCase();
             const mkt = String(row.market || '');
             const isTotal = kind === 'total' || /total/i.test(mkt);
-            const away = isTotal ? 'Over' : (parts[0] || 'Away');
-            const home = isTotal ? 'Under' : (parts[1] || 'Home');
-            const meta = `${escapeHtml(row.league || '')} · ${escapeHtml(row.market || '')}`;
+            const lineBit = (row.line != null && row.line !== '') ? ` ${row.line}` : '';
+            const away = row.side_a || (isTotal ? `Over${lineBit}` : (parts[0] || 'Away'));
+            const home = row.side_b || (isTotal ? `Under${lineBit}` : (parts[1] || 'Home'));
+            const meta = `${escapeHtml(row.league || '')} · ${escapeHtml(row.market || '')}${isTotal ? '' : escapeHtml(lineBit)}`;
             const best = row.best || {};
 
             const trA = document.createElement('tr');

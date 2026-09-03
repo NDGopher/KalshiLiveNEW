@@ -109,7 +109,7 @@ def test_redact_api_key_in_url():
     assert "apiKey=%2A%2A%2A" in red or "apiKey=***" in red
 
 
-def test_store_replaces_markets_never_merges():
+def test_store_ml_only_update_keeps_totals():
     store = OddsWsStore()
     store.apply_message(
         {
@@ -117,7 +117,17 @@ def test_store_replaces_markets_never_merges():
             "seq": 10,
             "id": "100",
             "bookie": "FanDuel",
-            "markets": [{"name": "ML", "odds": [{"home": "1.9", "away": "2.0"}]}, {"name": "Totals"}],
+            "markets": [
+                {"name": "ML", "odds": [{"home": "1.9", "away": "2.0"}]},
+                {
+                    "name": "Spread",
+                    "odds": [{"hdp": -1.5, "home": 1.91, "away": 1.91}],
+                },
+                {
+                    "name": "Totals",
+                    "odds": [{"max": 11.5, "hdp": 11.5, "over": 1.892857, "under": 1.847458}],
+                },
+            ],
         }
     )
     store.apply_message(
@@ -132,8 +142,17 @@ def test_store_replaces_markets_never_merges():
     doc = store.merged_doc(100)
     fd = doc["bookmakers"]["FanDuel"]
     names = [m["name"] for m in fd]
-    assert names == ["ML"]  # Totals gone — replace, not merge
-    assert fd[0]["odds"][0]["home"] == "1.8"
+    assert "ML" in names
+    assert "Totals" in names
+    assert "Spread" in names
+    ml = next(m for m in fd if m["name"] == "ML")
+    tot = next(m for m in fd if m["name"] == "Totals")
+    assert ml["odds"][0]["home"] == "1.8"
+    assert tot["odds"][0]["over"] == 1.892857
+    counts = store.market_family_counts()
+    assert counts["ml"] == 1
+    assert counts["totals"] == 1
+    assert counts["spread"] == 1
     assert store.last_seq == 11
     assert "FanDuel" in doc["book_updated_at"]
     assert store.book_updated_at[(100, "FanDuel")] == doc["book_updated_at"]["FanDuel"]

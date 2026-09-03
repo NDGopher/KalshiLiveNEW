@@ -54,7 +54,10 @@ from kalshi_client import KalshiClient
 from odds_ev_monitor import (
     OddsEVMonitor as EvMonitorImpl,
     _market_names_match,
+    _pick_matching_odds_row,
+    _pick_qualifier_line_for_side,
     apply_betmgm_ml_grid_consensus_fix,
+    total_line_value,
 )
 from odds_api_client import (
     get_shared_odds_client,
@@ -65,7 +68,7 @@ from odds_api_client import (
     odds_api_sports_list,
     sport_slug_query_for_api,
 )
-from odds_api_ws import peek_shared_odds_ws_feed, resolve_odds_docs
+from odds_api_ws import _ws_market_family, peek_shared_odds_ws_feed, resolve_odds_docs
 from plive_pandora import (
     extra_local_bookmakers,
     merge_plive_into_docs,
@@ -567,62 +570,62 @@ def _plive_status_payload() -> Dict[str, Any]:
 
 
 def _plive_board_rows() -> List[Dict[str, Any]]:
-    """PLive-only extras: one row per ML / Spread / Totals when prices exist."""
+    """PLive Odds-tab rows: ML plus Spread and Totals (Over/Under with the line)."""
     feed = peek_shared_plive_feed()
     if feed is None:
         return []
-    store = getattr(feed, "store", None)
     rows: List[Dict[str, Any]] = []
     for s in feed.priced_mlb_summaries():
-        teams = f"{s.get('away') or ''} @ {s.get('home') or ''}".strip(" @")
         eid = s.get("id")
-        base = {
-            "event_id": eid,
-            "teams": teams,
-            "league": "MLB",
-            "sport_slug": "baseball",
-            "live": True,
-            "status": "live",
-            "start_display": "",
-            "plive_only": True,
-        }
+        home = str(s.get("home") or "")
+        away = str(s.get("away") or "")
+        teams = f"{away} @ {home}".strip(" @")
         mkts: List[Dict[str, Any]] = []
-        if store is not None and eid is not None:
-            mkts = store.markets_for_event(str(eid)) or []
-        by_name = {str(m.get("name") or ""): m for m in mkts}
-        for kind, fallback in (("ml", "ML"), ("spread", "Spread"), ("total", "Totals")):
-            mk = by_name.get(fallback)
-            if mk is not None:
-                prices = _live_prices_for_kind({"PLive": [mk]}, ["PLive"], fallback, kind)
-            elif kind == "ml":
-                prices = {
-                    "PLive": {
-                        "home_dec": s.get("home_dec"),
-                        "away_dec": s.get("away_dec"),
-                        "home_am": s.get("home_am"),
-                        "away_am": s.get("away_am"),
+        try:
+            mkts = list(feed.store.markets_for_event(eid) or [])
+        except Exception:
+            mkts = []
+        if not mkts:
+            if s.get("home_am") is not None or s.get("away_am") is not None:
+                mkts.append(
+                    {
+                        "name": "ML",
+                        "odds": [{"home": s.get("home_dec"), "away": s.get("away_dec")}],
                     }
-                }
-            else:
-                continue
-            if not _live_market_has_any_price(prices):
-                continue
-            bh, ham = _live_best_side(prices, "home_dec")
-            ba, aam = _live_best_side(prices, "away_dec")
-            rows.append(
-                {
-                    **base,
-                    "market": fallback,
-                    "market_kind": kind,
-                    "books": prices,
-                    "best": {
-                        "home_book": bh,
-                        "home_am": ham,
-                        "away_book": ba,
-                        "away_am": aam,
-                    },
-                }
-            )
+                )
+            if s.get("tot_line") is not None:
+                mkts.append(
+                    {
+                        "name": "Totals",
+                        "odds": [
+                            {
+                                "hdp": s.get("tot_line"),
+                                "max": s.get("tot_line"),
+                                "line": s.get("tot_line"),
+                                "over": s.get("tot_over"),
+                                "under": s.get("tot_under"),
+                            }
+                        ],
+                    }
+                )
+        extra = live_odds_board_rows_from_bookmakers(
+            event_id=eid,
+            home=home,
+            away=away,
+            teams=teams,
+            league="MLB",
+            sport_slug="baseball",
+            live=True,
+            status="live",
+            start_display="",
+            clock="",
+            clock_running=None,
+            status_detail="",
+            bks={"PLive": mkts},
+            books=["PLive"],
+            plive_only=True,
+        )
+        rows.extend(extra)
     return rows
 
 
@@ -793,6 +796,334 @@ def _live_market_has_any_price(prices: Dict[str, Dict[str, Any]]) -> bool:
         if row.get("home_am") is not None or row.get("away_am") is not None:
             return True
     return False
+
+
+def _live_pick_family_name(bks: Dict[str, Any], family: str) -> Optional[str]:
+    """First priced market name in this family (ml / spread / totals). Team totals are other."""
+    prefs = ("Kalshi", "FanDuel", "DraftKings", "PLive")
+
+    def _from_book(book: str) -> Optional[str]:
+        for m in _live_mkts_for_book(bks, book):
+            n = str(m.get("name") or "").strip()
+            if _ws_market_family(n) == family:
+                return n
+        return None
+
+    for pref in prefs:
+        n = _from_book(pref)
+        if n:
+            return n
+    for _bk, mkts in (bks or {}).items():
+        if not isinstance(mkts, list):
+            continue
+        for m in mkts:
+            n = str(m.get("name") or "").strip()
+            if _ws_market_family(n) == family:
+                return n
+    return None
+
+
+def _live_am_from_dec(d: Optional[float]) -> Optional[int]:
+    return int(decimal_to_american(d)) if d else None
+
+
+def _live_odds_ml_prices(bks: Dict[str, Any], books: List[str], ml_name: str) -> Dict[str, Dict[str, Any]]:
+    prices: Dict[str, Dict[str, Any]] = {}
+    for bk in books:
+        mk = _live_find_market(_live_mkts_for_book(bks, bk), ml_name)
+        row = _live_first_row(mk)
+        dh = _live_float_dec(row.get("home"))
+        da = _live_float_dec(row.get("away"))
+        prices[bk] = {
+            "home_dec": dh,
+            "away_dec": da,
+            "home_am": _live_am_from_dec(dh),
+            "away_am": _live_am_from_dec(da),
+        }
+    apply_betmgm_ml_grid_consensus_fix(prices, books)
+    return prices
+
+
+def _live_odds_line_prices(
+    bks: Dict[str, Any],
+    books: List[str],
+    mname: str,
+    ref_row: Dict[str, Any],
+    family: str,
+) -> Dict[str, Dict[str, Any]]:
+    prices: Dict[str, Dict[str, Any]] = {}
+    line = total_line_value(ref_row) if family == "totals" else None
+    for bk in books:
+        mk = _live_find_market(_live_mkts_for_book(bks, bk), mname)
+        picked = _pick_matching_odds_row(mk or {}, mname, ref_row) if mk else {}
+        if family == "totals":
+            over = _live_float_dec(picked.get("over"))
+            under = _live_float_dec(picked.get("under"))
+            # First board row is Over (away_* slot); second is Under (home_* slot).
+            prices[bk] = {
+                "home_dec": under,
+                "away_dec": over,
+                "home_am": _live_am_from_dec(under),
+                "away_am": _live_am_from_dec(over),
+                "over_dec": over,
+                "under_dec": under,
+                "over_am": _live_am_from_dec(over),
+                "under_am": _live_am_from_dec(under),
+                "line": line,
+            }
+        else:
+            dh = _live_float_dec(picked.get("home"))
+            da = _live_float_dec(picked.get("away"))
+            prices[bk] = {
+                "home_dec": dh,
+                "away_dec": da,
+                "home_am": _live_am_from_dec(dh),
+                "away_am": _live_am_from_dec(da),
+                "hdp": picked.get("hdp") if picked else ref_row.get("hdp"),
+            }
+    return prices
+
+
+def _live_odds_finish_row(
+    *,
+    event_id: Any,
+    teams: str,
+    league: str,
+    sport_slug: str,
+    live: bool,
+    status: str,
+    start_display: str,
+    clock: Any,
+    clock_running: Any,
+    status_detail: Any,
+    market: str,
+    prices: Dict[str, Dict[str, Any]],
+    side_a: Optional[str] = None,
+    side_b: Optional[str] = None,
+    line: Any = None,
+    plive_only: bool = False,
+) -> Dict[str, Any]:
+    bh, ham = _live_best_side(prices, "home_dec")
+    ba, aam = _live_best_side(prices, "away_dec")
+    row: Dict[str, Any] = {
+        "event_id": event_id,
+        "teams": teams,
+        "league": league,
+        "sport_slug": sport_slug,
+        "live": live,
+        "status": status,
+        "clock": clock,
+        "clock_running": clock_running,
+        "statusDetail": status_detail,
+        "start_display": start_display,
+        "market": market,
+        "market_kind": {"ml": "ml", "spread": "spread", "totals": "total"}.get(
+            _ws_market_family(market)
+        ),
+        "books": prices,
+        "best": {
+            "home_book": bh,
+            "home_am": ham,
+            "away_book": ba,
+            "away_am": aam,
+        },
+    }
+    if side_a:
+        row["side_a"] = side_a
+    if side_b:
+        row["side_b"] = side_b
+    if line is not None:
+        row["line"] = line
+    if plive_only:
+        row["plive_only"] = True
+    return row
+
+
+def live_odds_board_rows_from_bookmakers(
+    *,
+    event_id: Any,
+    home: str,
+    away: str,
+    teams: str,
+    league: str,
+    sport_slug: str,
+    live: bool,
+    status: str,
+    start_display: str,
+    clock: Any = "",
+    clock_running: Any = None,
+    status_detail: Any = "",
+    bks: Dict[str, Any],
+    books: List[str],
+    plive_only: bool = False,
+) -> List[Dict[str, Any]]:
+    """One ML row plus Spread and Totals (Over/Under with the line). Team totals omitted."""
+    common = dict(
+        event_id=event_id,
+        teams=teams,
+        league=league,
+        sport_slug=sport_slug,
+        live=live,
+        status=status,
+        start_display=start_display,
+        clock=clock,
+        clock_running=clock_running,
+        status_detail=status_detail,
+        plive_only=plive_only,
+    )
+    out: List[Dict[str, Any]] = []
+    ml_name = _live_pick_ml_name(bks) if _live_pick_family_name(bks, "ml") else None
+    if ml_name:
+        prices = _live_odds_ml_prices(bks, books, ml_name)
+        if any(
+            (p.get("home_am") is not None) or (p.get("away_am") is not None)
+            for p in prices.values()
+        ):
+            out.append(
+                _live_odds_finish_row(
+                    **common,
+                    market=ml_name,
+                    prices=prices,
+                    side_a=away or "Away",
+                    side_b=home or "Home",
+                )
+            )
+
+    sp_name = _live_pick_family_name(bks, "spread")
+    if sp_name:
+        sp_mk = None
+        for pref in ("Kalshi", "FanDuel", "DraftKings", "PLive"):
+            sp_mk = _live_find_market(_live_mkts_for_book(bks, pref), sp_name)
+            if sp_mk:
+                break
+        if not sp_mk:
+            for _bk, mkts in (bks or {}).items():
+                if isinstance(mkts, list):
+                    sp_mk = _live_find_market(mkts, sp_name)
+                    if sp_mk:
+                        break
+        for ref in ((sp_mk or {}).get("odds") or [])[:8]:
+            if not isinstance(ref, dict):
+                continue
+            if ref.get("over") is not None and ref.get("home") is None:
+                continue
+            if ref.get("hdp") is None:
+                continue
+            prices = _live_odds_line_prices(bks, books, sp_name, ref, "spread")
+            if not any(
+                (p.get("home_am") is not None) or (p.get("away_am") is not None)
+                for p in prices.values()
+            ):
+                continue
+            a_pick, a_qual, _ = _pick_qualifier_line_for_side(home, away, sp_name, "away", ref)
+            h_pick, h_qual, _ = _pick_qualifier_line_for_side(home, away, sp_name, "home", ref)
+            side_a = f"{a_pick} {a_qual}".strip() if a_qual else (a_pick or away)
+            side_b = f"{h_pick} {h_qual}".strip() if h_qual else (h_pick or home)
+            out.append(
+                _live_odds_finish_row(
+                    **common,
+                    market=sp_name,
+                    prices=prices,
+                    side_a=side_a,
+                    side_b=side_b,
+                    line=ref.get("hdp"),
+                )
+            )
+
+    tot_name = _live_pick_family_name(bks, "totals")
+    if tot_name:
+        tot_mk = None
+        for pref in ("Kalshi", "FanDuel", "DraftKings", "PLive"):
+            tot_mk = _live_find_market(_live_mkts_for_book(bks, pref), tot_name)
+            if tot_mk:
+                break
+        if not tot_mk:
+            for _bk, mkts in (bks or {}).items():
+                if isinstance(mkts, list):
+                    tot_mk = _live_find_market(mkts, tot_name)
+                    if tot_mk:
+                        break
+        for ref in ((tot_mk or {}).get("odds") or [])[:8]:
+            if not isinstance(ref, dict):
+                continue
+            line = total_line_value(ref)
+            if line is None:
+                continue
+            if ref.get("over") is None or ref.get("under") is None:
+                continue
+            prices = _live_odds_line_prices(bks, books, tot_name, ref, "totals")
+            if not any(
+                (p.get("away_am") is not None) or (p.get("home_am") is not None)
+                for p in prices.values()
+            ):
+                continue
+            line_s = f"{line:g}" if float(line).is_integer() else f"{line:.1f}"
+            try:
+                line_s = f"{float(line):.1f}"
+            except (TypeError, ValueError):
+                line_s = str(line)
+            out.append(
+                _live_odds_finish_row(
+                    **common,
+                    market=tot_name,
+                    prices=prices,
+                    side_a=f"Over {line_s}",
+                    side_b=f"Under {line_s}",
+                    line=line,
+                )
+            )
+    return out
+
+
+def _live_odds_row_merge_key(row: Dict[str, Any]) -> Tuple[str, str, str]:
+    eid = str(row.get("event_id") or "")
+    teams = str(row.get("teams") or "").lower()
+    fam = _ws_market_family(row.get("market"))
+    line = row.get("line")
+    line_s = "" if fam == "ml" or line is None else str(line)
+    return (eid or teams, fam, line_s)
+
+
+def _merge_plive_into_live_odds_rows(
+    rows_out: List[Dict[str, Any]], extras: List[Dict[str, Any]]
+) -> None:
+    """Add PLive Totals/Spread even when the event already has an ML row. Merge same line."""
+    index = {_live_odds_row_merge_key(r): r for r in rows_out}
+    for extra in extras:
+        key = _live_odds_row_merge_key(extra)
+        existing = index.get(key)
+        if existing is None and extra.get("event_id") is not None:
+            want_eid = str(extra.get("event_id"))
+            want_fam = _ws_market_family(extra.get("market"))
+            want_line = extra.get("line")
+            for r in rows_out:
+                if str(r.get("event_id")) != want_eid:
+                    continue
+                if _ws_market_family(r.get("market")) != want_fam:
+                    continue
+                if want_fam != "ml" and r.get("line") != want_line:
+                    continue
+                existing = r
+                break
+        if existing is None:
+            rows_out.append(extra)
+            index[key] = extra
+            continue
+        books = existing.setdefault("books", {})
+        for bk, blob in (extra.get("books") or {}).items():
+            books[bk] = blob
+        if extra.get("side_a") and not existing.get("side_a"):
+            existing["side_a"] = extra["side_a"]
+        if extra.get("side_b") and not existing.get("side_b"):
+            existing["side_b"] = extra["side_b"]
+        bh, ham = _live_best_side(books, "home_dec")
+        ba, aam = _live_best_side(books, "away_dec")
+        existing["best"] = {
+            "home_book": bh,
+            "home_am": ham,
+            "away_book": ba,
+            "away_am": aam,
+        }
 
 
 def _live_find_market(book_odds: List[Dict[str, Any]], name: str) -> Optional[Dict[str, Any]]:
@@ -1086,68 +1417,34 @@ async def _live_odds_build_snapshot_with_client(
         if _ws is not None:
             ws_meta = _ws.store.event_meta.get(eid)
         clock_fields = clock_fields_for_live_odds(e, doc, ws_meta)
-        teams = f"{away} @ {home}" if away and home else str(e.get("name") or "")
-        for kind, fallback_name in (("ml", "ML"), ("spread", "Spread"), ("total", "Totals")):
-            mname = _live_pick_kind_name(bks, kind) or fallback_name
-            prices = _live_prices_for_kind(bks, books, mname, kind)
-            if kind == "ml":
-                apply_betmgm_ml_grid_consensus_fix(prices, books)
-            if not _live_market_has_any_price(prices):
-                continue
-            bh, ham = _live_best_side(prices, "home_dec")
-            ba, aam = _live_best_side(prices, "away_dec")
-            display = mname
-            if kind == "total":
-                display = "Totals"
-            elif kind == "spread":
-                display = "Spread"
-            rows_out.append(
-                {
-                    "event_id": eid,
-                    "teams": teams,
-                    "league": league_s,
-                    "sport_slug": _sport_slug_event(e),
-                    "live": _event_is_live(e),
-                    "status": str(
-                        e.get("status")
-                        or e.get("state")
-                        or (doc or {}).get("status")
-                        or (ws_meta or {}).get("status")
-                        or ""
-                    ),
-                    "clock": clock_fields["clock"],
-                    "clock_running": clock_fields["clock_running"],
-                    "statusDetail": clock_fields["statusDetail"],
-                    "start_display": start_s,
-                    "market": display,
-                    "market_kind": kind,
-                    "books": prices,
-                    "best": {
-                        "home_book": bh,
-                        "home_am": ham,
-                        "away_book": ba,
-                        "away_am": aam,
-                    },
-                }
+        rows_out.extend(
+            live_odds_board_rows_from_bookmakers(
+                event_id=eid,
+                home=home,
+                away=away,
+                teams=f"{away} @ {home}" if away and home else str(e.get("name") or ""),
+                league=league_s,
+                sport_slug=_sport_slug_event(e),
+                live=_event_is_live(e),
+                status=str(
+                    e.get("status")
+                    or e.get("state")
+                    or (doc or {}).get("status")
+                    or (ws_meta or {}).get("status")
+                    or ""
+                ),
+                start_display=start_s,
+                clock=clock_fields["clock"],
+                clock_running=clock_fields["clock_running"],
+                status_detail=clock_fields["statusDetail"],
+                bks=bks,
+                books=books,
             )
+        )
     _log_live_odds_book_flow_and_pipeline(books, rows_out, timing_l, sport_l)
     sport_wants_plive = sport_l in ("all", "baseball") or lf in ("all", "mlb")
     if sport_wants_plive:
-        have = {
-            (
-                (str(r.get("teams") or "")).lower(),
-                str(r.get("market_kind") or r.get("market") or "").lower(),
-            )
-            for r in rows_out
-        }
-        for extra in _plive_board_rows():
-            key = (
-                (str(extra.get("teams") or "")).lower(),
-                str(extra.get("market_kind") or extra.get("market") or "").lower(),
-            )
-            if key[0] and key not in have:
-                rows_out.append(extra)
-                have.add(key)
+        _merge_plive_into_live_odds_rows(rows_out, _plive_board_rows())
     return {
         "ok": True,
         "updated": time.time(),
@@ -4144,7 +4441,7 @@ def live_odds_page():
 @app.route('/api/live_odds')
 @requires_auth
 def api_live_odds():
-    """JSON snapshot: events × books moneyline (auto-refresh from the browser).
+    """JSON snapshot: events × books ML / Spread / Totals (auto-refresh from the browser).
 
     Odds-API.io's shared async client is bound to the monitor event loop; scheduling
     snapshot work on api_loop caused broken/empty responses. We use monitor_loop
@@ -4209,9 +4506,14 @@ def serve_logo(filename):
 
 
 def is_unlisted_match_failed(row: Dict) -> bool:
-    """Unmatched Kalshi cards must not appear on GET /api/alerts or the live list."""
+    """Unmatched Kalshi cards must not appear on GET /api/alerts or the live list.
+
+    PLive-take cards list even with no Kalshi ticker. Do not hide them as match_failed.
+    """
     if not isinstance(row, dict):
         return True
+    if str(row.get("take_book") or "").strip().lower() == "plive":
+        return False
     if row.get("match_failed") is True:
         return True
     ticker = row.get("ticker")

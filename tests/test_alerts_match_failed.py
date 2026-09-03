@@ -60,6 +60,16 @@ def test_listed_alerts_drop_match_failed():
     assert is_unlisted_match_failed(rows["bad"]) is True
     assert is_unlisted_match_failed(rows["also"]) is True
     assert is_unlisted_match_failed(rows["good"]) is False
+    plive = {
+        "id": "plive-ou",
+        "ticker": "PLIVE|Detroit Tigers @ Minnesota Twins|Over|11.5",
+        "take_book": "PLive",
+        "match_failed": False,
+        "ev_percent": 4.2,
+        "pick": "Over",
+        "qualifier": "11.5",
+    }
+    assert is_unlisted_match_failed(plive) is False
     visible = listed_active_alerts(rows)
     assert [r["id"] for r in visible] == ["good"]
 

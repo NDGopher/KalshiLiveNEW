@@ -287,6 +287,8 @@ def test_game_period_markets_ml_spread_totals():
     assert by_name["ML"]["odds"][0]["home"] == 1.29
     assert by_name["ML"]["odds"][0]["away"] == 3.45
     assert by_name["Totals"]["odds"][0]["hdp"] == 14.5
+    assert by_name["Totals"]["odds"][0]["max"] == 14.5
+    assert by_name["Totals"]["odds"][0]["line"] == 14.5
     assert by_name["Totals"]["odds"][0]["over"] == 1.80
     assert by_name["Totals"]["odds"][0]["under"] == 1.94
     assert by_name["Spread"]["odds"][0]["hdp"] == -2.0
@@ -459,6 +461,64 @@ def test_event_199298371_live_ws_dump_pair_and_away_sign():
     merged = merge_plive_market_lists(existing_ml, store.markets_for_event(eid))
     ml = next(m for m in merged if m["name"] == "ML")
     assert ml["odds"][0]["home"] == 1.662
+
+
+def test_event_199295331_market5_totals_not_on_spread():
+    """DET@MIN live market 5: 11.5 over 1.892857 / under 1.847458. Market 7 stays off Spread."""
+    store = PliveStore()
+    eid = "199295331"
+    store.apply_message(
+        {
+            "isDiff": False,
+            "payload": {
+                "c": {
+                    "m": {
+                        "5": {
+                            "o": {
+                                "11.5": {0: 1.892857, 1: 1.847458},
+                                "12.5": {0: 2.47, 1: 1.502513},
+                            }
+                        },
+                        "7": {"o": {"5.5": {0: 1.220264, 1: 3.75}}},
+                    }
+                }
+            },
+        },
+        event_name=f"live.main.{PLIVE_LINE_SET}.eventCoefficients.{eid}",
+    )
+    by_name = {m["name"]: m for m in store.markets_for_event(eid)}
+    assert "Totals" in by_name
+    t11 = next(r for r in by_name["Totals"]["odds"] if abs(float(r["hdp"]) - 11.5) < 1e-9)
+    assert t11["over"] == 1.892857
+    assert t11["under"] == 1.847458
+    assert t11.get("max") == 11.5
+    assert t11.get("line") == 11.5
+    t12 = next(r for r in by_name["Totals"]["odds"] if abs(float(r["hdp"]) - 12.5) < 1e-9)
+    assert t12["over"] == 2.47
+    assert t12["under"] == 1.502513
+    # Later hunt: same event, 11.5 moved to {0: 1.735294, 1: 2.03}. Nested lists are 7/8, not 5.
+    store.apply_message(
+        {
+            "isDiff": False,
+            "payload": {"c": {"m": {"5": {"o": {"11.5": {0: 1.735294, 1: 2.03}}}}}},
+        },
+        event_name=f"live.main.{PLIVE_LINE_SET}.eventCoefficients.{eid}",
+    )
+    later = next(
+        r
+        for r in next(m for m in store.markets_for_event(eid) if m["name"] == "Totals")["odds"]
+        if abs(float(r["hdp"]) - 11.5) < 1e-9
+    )
+    assert later["over"] == 1.735294
+    assert later["under"] == 2.03
+    assert later.get("max") == 11.5
+    assert later.get("line") == 11.5
+    if "Spread" in by_name:
+        assert all(
+            r.get("home") != 1.220264 and r.get("away") != 3.75
+            for r in by_name["Spread"]["odds"]
+        )
+    assert all(r.get("over") != 1.220264 for r in by_name["Totals"]["odds"])
 
 
 def test_merge_keeps_odds_api_plive_ml():

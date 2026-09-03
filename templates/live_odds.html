@@ -106,7 +106,7 @@
                 let cells = `<td>${escapeHtml(row.teams || '')}</td>` +
                     `<td>${escapeHtml(row.league || '')}</td>` +
                     `<td>${row.live ? 'Yes' : 'No'}</td>` +
-                    `<td>${escapeHtml(row.market || '')}</td>`;
+                    `<td>${escapeHtml(row.market || '')}${row.line != null && row.line !== '' ? ' ' + escapeHtml(String(row.line)) : ''}${row.side_a ? ' · ' + escapeHtml(row.side_a) + ' / ' + escapeHtml(row.side_b || '') : ''}</td>`;
                 for (const b of books) {
                     const p = pr[b] || {};
                     cells += `<td>${fmtAm(p.home_am)}</td><td>${fmtAm(p.away_am)}</td>`;

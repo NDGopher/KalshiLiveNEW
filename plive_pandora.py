@@ -878,29 +878,24 @@ class PliveStore:
         if spread_rows:
             out.append({"name": "Spread", "odds": spread_rows[:12]})
 
-        # Totals: outcome "over"/"under" or numeric line + o/u suffix.
+        # Totals (market 5): same 2-way pair as market 6 — slot 0 over, slot 1 under.
         total_rows: List[Dict[str, Any]] = []
         for mk in self.total_markets:
             by_line: Dict[float, Dict[str, float]] = {}
             for (market, outcome), slots in coeffs.items():
                 if market != mk:
                     continue
-                dec = _decimal_from_slot(slots)
-                if dec is None:
-                    continue
                 ocl = str(outcome).lower()
-                pair_over = _as_float(slots.get(0))
-                pair_under = _as_float(slots.get(1))
                 line = _as_float(slots.get(2) or slots.get("hdp") or slots.get("max")) or _as_float(ocl)
-                if (
-                    line is not None
-                    and pair_over is not None
-                    and pair_under is not None
-                    and pair_over > 1.0
-                    and pair_under > 1.0
-                ):
-                    by_line.setdefault(float(line), {})["over"] = pair_over
-                    by_line[float(line)]["under"] = pair_under
+                pair = _spread_pair_from_slots(slots) if isinstance(slots, dict) else None
+                if pair is None and isinstance(slots, (list, tuple)):
+                    pair = _as_decimal_pair(slots)
+                if line is not None and pair is not None:
+                    by_line.setdefault(float(line), {})["over"] = pair[0]
+                    by_line[float(line)]["under"] = pair[1]
+                    continue
+                dec = _decimal_from_slot(slots) if isinstance(slots, dict) else _as_float(slots)
+                if dec is None:
                     continue
                 side = None
                 if "over" in ocl or ocl in ("o", "3"):
@@ -913,7 +908,6 @@ class PliveStore:
                         line = _as_float(ocl.replace("under", "").replace("u", "").replace("_", ""))
                 else:
                     line = _as_float(ocl) if line is None else line
-                    # Bare line: treat even index / first as over if we later see the other.
                     side = "over" if line is not None and line not in by_line else "under"
                 if line is None or side is None:
                     continue
@@ -921,7 +915,13 @@ class PliveStore:
             for line, sides in by_line.items():
                 if "over" in sides and "under" in sides:
                     total_rows.append(
-                        {"hdp": line, "over": sides["over"], "under": sides["under"]}
+                        {
+                            "hdp": line,
+                            "max": line,
+                            "line": line,
+                            "over": sides["over"],
+                            "under": sides["under"],
+                        }
                     )
             if total_rows:
                 break
@@ -995,22 +995,32 @@ class PlivePandoraFeed:
             mk = self.store.markets_for_event(eid)
             if not mk:
                 continue
+            names = [m.get("name") for m in mk]
             ml = next((m for m in mk if m.get("name") == "ML"), None)
             row = ((ml or {}).get("odds") or [{}])[0] if ml else {}
             home_dec = _as_float((row or {}).get("home"))
             away_dec = _as_float((row or {}).get("away"))
-            if home_dec is None or away_dec is None:
+            tot = next((m for m in mk if m.get("name") == "Totals"), None)
+            tot_row = ((tot or {}).get("odds") or [{}])[0] if tot else {}
+            spr = next((m for m in mk if m.get("name") == "Spread"), None)
+            spr_row = ((spr or {}).get("odds") or [{}])[0] if spr else {}
+            if home_dec is None and away_dec is None and not tot_row and not spr_row:
                 continue
             out.append(
                 {
                     "id": eid,
                     "home": ev.get("home"),
                     "away": ev.get("away"),
-                    "markets": [m.get("name") for m in mk],
+                    "markets": names,
                     "home_dec": home_dec,
                     "away_dec": away_dec,
                     "home_am": self._dec_to_am(home_dec),
                     "away_am": self._dec_to_am(away_dec),
+                    "tot_line": tot_row.get("hdp") if tot_row else None,
+                    "tot_over": tot_row.get("over") if tot_row else None,
+                    "tot_under": tot_row.get("under") if tot_row else None,
+                    "tot_over_am": self._dec_to_am(_as_float(tot_row.get("over")) if tot_row else None),
+                    "tot_under_am": self._dec_to_am(_as_float(tot_row.get("under")) if tot_row else None),
                 }
             )
         return out
@@ -1018,10 +1028,16 @@ class PlivePandoraFeed:
     def status_snapshot(self) -> Dict[str, Any]:
         priced = self.priced_mlb_summaries()
         mlb = self.store.mlb_events()
-        samples = [
-            f"{s.get('away')}@{s.get('home')} ML {s.get('away_am')}/{s.get('home_am')}"
-            for s in priced[:5]
-        ]
+        samples = []
+        for s in priced[:5]:
+            bits = [f"{s.get('away')}@{s.get('home')}"]
+            if s.get("away_am") is not None and s.get("home_am") is not None:
+                bits.append(f"ML {s.get('away_am')}/{s.get('home_am')}")
+            if s.get("tot_line") is not None:
+                bits.append(
+                    f"Tot {s.get('tot_line')} {s.get('tot_over_am')}/{s.get('tot_under_am')}"
+                )
+            samples.append(" ".join(bits))
         return {
             "connected": bool(self.connected),
             "healthy": self.healthy,

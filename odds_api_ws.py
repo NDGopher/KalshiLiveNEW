@@ -14,7 +14,9 @@ Official contract (do not invent):
 - ``leagues`` and ``eventIds`` are mutually exclusive (eventIds max 50).
 - Message types: welcome, created, updated, deleted, no_markets, score, status,
   resync_required.
-- REPLACE markets per event+bookie — never merge (suspended lines disappear).
+- Upsert markets per event+bookie by market family (ML / Spread / Totals).
+  An ML-only ``updated`` must not wipe prior Spread/Totals. ``no_markets``
+  and ``deleted`` still clear. A payload that includes Totals replaces Totals.
 - Track ``seq``; reconnect with ``lastSeq`` (compacted latest-state replay).
 - On ``resync_required``: REST snapshot with ``includeSeq=true``, then reconnect.
 - Process updates asynchronously; exponential backoff on reconnect.
@@ -417,14 +419,32 @@ class AppliedMessage:
     dirty: bool = False
 
 
+def _ws_market_family(name: Any) -> str:
+    """ML / Spread / Totals family. Team totals are not game Totals."""
+    u = str(name or "").strip().upper()
+    if not u:
+        return "other"
+    if "PLAYER" in u:
+        return "other"
+    if "TEAM" in u and "TOTAL" in u:
+        return "other"
+    if "TOTAL" in u or ("OVER" in u and "UNDER" in u) or u in ("OU", "O/U"):
+        return "totals"
+    if "SPREAD" in u or "HANDICAP" in u or "PUCK LINE" in u or "PUCKLINE" in u.replace(" ", ""):
+        return "spread"
+    if u == "ML" or "MONEY" in u or "WINNER" in u:
+        return "ml"
+    return "other"
+
+
 @dataclass
 class OddsWsStore:
-    """In-memory latest-state store. Markets are replaced, never merged."""
+    """In-memory latest-state store. WS created/updated upsert by market family."""
 
     last_seq: Optional[int] = None
     welcome: Optional[Dict[str, Any]] = None
     event_meta: Dict[int, Dict[str, Any]] = field(default_factory=dict)
-    # (event_id, canonical_bookie) -> full markets list (replaced on each odds message)
+    # (event_id, canonical_bookie) -> markets list (WS upsert by family; REST full-replace)
     books: Dict[Tuple[int, str], List[Dict[str, Any]]] = field(default_factory=dict)
     # Last time we replaced that book's markets (WS created/updated or REST snapshot).
     book_updated_at: Dict[Tuple[int, str], float] = field(default_factory=dict)
@@ -497,6 +517,7 @@ class OddsWsStore:
             self.generation += 1
 
     def _replace_markets(self, eid: int, bookie: str, markets: Any) -> None:
+        """Full replace (``no_markets`` / REST). Empty list clears the book."""
         ck = _canonical_odds_api_bookmaker(bookie)
         if isinstance(markets, list):
             self.books[(eid, ck)] = list(markets)
@@ -504,8 +525,45 @@ class OddsWsStore:
             self.books[(eid, ck)] = []
         self.book_updated_at[(eid, ck)] = time.time()
 
+    def _upsert_markets_by_family(self, eid: int, bookie: str, markets: Any) -> None:
+        """Keep prior Spread/Totals when this payload is ML-only.
+
+        Incoming markets replace the same family. Families not in the payload
+        stay. Empty ``markets`` on created/updated is a no-op (``no_markets``
+        still clears).
+        """
+        ck = _canonical_odds_api_bookmaker(bookie)
+        incoming = list(markets) if isinstance(markets, list) else []
+        if not incoming:
+            self.book_updated_at[(eid, ck)] = time.time()
+            return
+        incoming_fams = {
+            _ws_market_family(m.get("name"))
+            for m in incoming
+            if isinstance(m, dict)
+        }
+        prev = list(self.books.get((eid, ck)) or [])
+        kept = [
+            m
+            for m in prev
+            if isinstance(m, dict) and _ws_market_family(m.get("name")) not in incoming_fams
+        ]
+        self.books[(eid, ck)] = incoming + kept
+        self.book_updated_at[(eid, ck)] = time.time()
+
+    def market_family_counts(self) -> Dict[str, int]:
+        """How many stored market blocks are ML / Spread / Totals."""
+        counts = {"ml": 0, "spread": 0, "totals": 0, "other": 0}
+        for markets in self.books.values():
+            for m in markets or []:
+                if not isinstance(m, dict):
+                    continue
+                fam = _ws_market_family(m.get("name"))
+                counts[fam] = counts.get(fam, 0) + 1
+        return counts
+
     def apply_message(self, msg: Dict[str, Any]) -> AppliedMessage:
-        """Apply one official WS JSON object. Replace markets; never merge."""
+        """Apply one official WS JSON object. Upsert by market family on created/updated."""
         if not isinstance(msg, dict):
             return AppliedMessage(type="unknown")
         t = str(msg.get("type") or "").strip().lower()
@@ -548,7 +606,7 @@ class OddsWsStore:
         if t in ("created", "updated"):
             if eid is None or not bookie:
                 return AppliedMessage(type=t, event_id=eid, bookie=bookie, seq=seq)
-            self._replace_markets(eid, bookie, msg.get("markets"))
+            self._upsert_markets_by_family(eid, bookie, msg.get("markets"))
             meta = self.event_meta.setdefault(eid, {"id": eid})
             if msg.get("url"):
                 meta.setdefault("urls", {})
