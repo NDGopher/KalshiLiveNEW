@@ -618,7 +618,15 @@ def _log_raw_book_prices_for_side(
         mk = _find_market_block(_markets_list_for_book(bks, book), mname)
         row = _sharp_row_for_market(mk or {}, mname, ref_row) if ref_row else (_first_odds_row(mk or {}) or {})
         d = _decimal_for_side(row, bet_side)
-        parts.append(f"{book}={_fmt_american_from_dec(d)}")
+        am = _fmt_american_from_dec(d)
+        if _market_is_total(mname):
+            strike = total_line_value(row)
+            if strike is not None:
+                parts.append(f"{book}={str(bet_side).title()} {strike:g} {am}")
+            else:
+                parts.append(f"{book}={am}")
+        else:
+            parts.append(f"{book}={am}")
     print(f"[PIPELINE] Raw books ({teams} {mname} side={bet_side}): " + " | ".join(parts))
 
 

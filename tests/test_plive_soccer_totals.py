@@ -19,6 +19,7 @@ from plive_pandora import (
     PliveStore,
     merge_plive_market_lists,
     parse_soccer_total_outcome,
+    soccer_totals_identity_rows,
 )
 
 
@@ -31,6 +32,8 @@ UNDER_35 = 1.72
 OVER_35 = 2.20
 UNDER_45 = 1.28
 OVER_45 = 3.60
+UNDER_45_169 = american_to_decimal(-169)
+UNDER_35_108 = american_to_decimal(-108)
 
 
 def _store_with_al_kholood_side_named() -> PliveStore:
@@ -87,6 +90,15 @@ def test_parse_soccer_total_outcome_keeps_strikes():
     assert parse_soccer_total_outcome("4.5") == (4.5, None)
     assert parse_soccer_total_outcome("over") == (None, "over")
     assert parse_soccer_total_outcome("u-2.5") == (2.5, "under")
+    assert parse_soccer_total_outcome("2.25") == (2.25, None)
+    assert parse_soccer_total_outcome("under_2.75") == (2.75, "under")
+    assert parse_soccer_total_outcome("3.0") == (3.0, None)
+    # Bare 3/4 are over/under codes, not 3.0/4.0 strikes. +186 must not
+    # become a line. Prices 2.86 / 3.45 are not on the 0.25 grid.
+    assert parse_soccer_total_outcome("3") == (None, None)
+    assert parse_soccer_total_outcome("4") == (None, None)
+    assert parse_soccer_total_outcome("2.86") == (None, None)
+    assert parse_soccer_total_outcome("3.45") == (None, None)
 
 
 def test_al_kholood_under_25_is_186_not_245():
@@ -290,3 +302,141 @@ def test_dashboard_take_matches_raw_under_186():
     if under35:
         assert decimal_to_american(float(under35[0]["bookmakerOdds"]["under"])) != 186
         assert decimal_to_american(float(under35[0]["bookmakerOdds"]["under"])) != 245
+
+
+def _stephen_visible_board_store() -> PliveStore:
+    """PLive soccer board: distinct 2.5 / 3.5 / 4.5 plus quarter-point alts.
+
+    Visible Under 2.5 +186 must stay on 2.5. Screenshot cards that painted
+    Under 3.5 +186 and Under 4.5 −169 were line-identity leaks.
+    """
+    store = PliveStore()
+    store.apply_meta(
+        EID,
+        {
+            "sportId": 5,
+            "home": "Al-Fayha FC",
+            "away": "Al-Kholood",
+            "leagueName": "Saudi Pro League",
+            "ip": True,
+        },
+    )
+    over_225, under_225 = 1.40, 2.95
+    over_275, under_275 = 1.68, 2.22
+    over_325, under_325 = 1.95, 1.88
+    over_375, under_375 = 2.55, 1.50
+    store.apply_message(
+        {
+            "isDiff": False,
+            "payload": {
+                "c": {
+                    "m": {
+                        "5": {
+                            "o": {
+                                "over_2.25": {0: over_225, 1: 1.48},
+                                "under_2.25": {0: under_225, 1: 3.10},
+                                "over_2.5": {0: OVER_25, 1: 1.61},
+                                "under_2.5": {0: UNDER_25_TAKE, 1: UNDER_25_WRONG},
+                                "over_2.75": {0: over_275, 1: 1.80},
+                                "under_2.75": {0: under_275, 1: 2.40},
+                                "over_3.25": {0: over_325, 1: 2.10},
+                                "under_3.25": {0: under_325, 1: 1.95},
+                                "over_3.5": {0: OVER_35, 1: 2.45},
+                                "under_3.5": {0: UNDER_35_108, 1: 1.95},
+                                "over_3.75": {0: over_375, 1: 2.80},
+                                "under_3.75": {0: under_375, 1: 1.62},
+                                "over_4.5": {0: OVER_45, 1: 4.10},
+                                "under_4.5": {0: UNDER_45_169, 1: 1.70},
+                            }
+                        }
+                    }
+                }
+            },
+        },
+        event_name=f"live.main.{PLIVE_LINE_SET}.eventCoefficients.{EID}",
+    )
+    return store
+
+
+def test_stephen_board_under_186_stays_on_25_not_35():
+    """Screenshot: dashboard Under 3.5 +186 was the 2.5 price crossing lines."""
+    store = _stephen_visible_board_store()
+    ident = soccer_totals_identity_rows(store.markets_for_event(EID))
+    by_line = {round(r["line"], 2): r for r in ident}
+    assert set(by_line) >= {2.25, 2.5, 2.75, 3.25, 3.5, 3.75, 4.5}
+    assert by_line[2.5]["under_am"] == 186
+    assert by_line[3.5]["under_am"] == -108
+    assert by_line[3.5]["under_am"] != 186
+    assert by_line[4.5]["under_am"] == -169
+    assert by_line[4.5]["under_am"] != 186
+    owners_186 = [r["line"] for r in ident if r.get("under_am") == 186]
+    assert owners_186 == [2.5]
+    owners_169 = [r["line"] for r in ident if r.get("under_am") == -169]
+    assert owners_169 == [4.5]
+    for lf, row in by_line.items():
+        if abs(lf - 2.5) > 1e-9:
+            assert row.get("under_am") != 186
+            assert row.get("over_am") != 186
+
+
+def test_price_value_is_never_a_strike():
+    """Never infer 2.86 / 3.45 / 1.59 as lines from the take coefficients."""
+    store = PliveStore()
+    store.apply_meta(EID, {"sportId": 5, "home": "Al-Fayha FC", "away": "Al-Kholood", "ip": True})
+    store.apply_coeff_tree(
+        EID,
+        {
+            "c": {
+                "m": {
+                    "5": {
+                        "o": {
+                            "over_2.5": {0: OVER_25},
+                            "under_2.5": {0: UNDER_25_TAKE, 2: UNDER_25_TAKE, "hdp": UNDER_25_TAKE},
+                            "under": {0: UNDER_25_TAKE, "hdp": 3.5},
+                            "3": {0: UNDER_25_TAKE},
+                            "4": {1: UNDER_45_169},
+                        }
+                    }
+                }
+            }
+        },
+    )
+    by_line = _totals_by_line(store)
+    assert 2.5 in by_line
+    assert decimal_to_american(by_line[2.5]["under"]) == 186
+    for forbidden in (2.86, 3.45, 1.59, 3.0, 4.0):
+        assert all(abs(lf - forbidden) > 1e-6 for lf in by_line)
+    assert 3.5 not in by_line
+
+
+def test_side_without_strike_key_is_dropped():
+    store = PliveStore()
+    store.apply_meta(EID, {"sportId": 5, "home": "Al-Fayha FC", "away": "Al-Kholood", "ip": True})
+    store.apply_coeff_tree(
+        EID,
+        {
+            "c": {
+                "m": {
+                    "5": {
+                        "o": {
+                            "over": {0: OVER_35, "hdp": 3.5},
+                            "under": {0: UNDER_25_TAKE, "max": 3.5},
+                        }
+                    }
+                }
+            }
+        },
+    )
+    names = {m["name"] for m in store.markets_for_event(EID)}
+    assert "Totals" not in names
+
+
+def test_quarter_point_alts_keep_their_own_prices():
+    store = _stephen_visible_board_store()
+    by_line = _totals_by_line(store)
+    assert abs(float(by_line[2.25]["under"]) - 2.95) < 1e-9
+    assert abs(float(by_line[2.75]["under"]) - 2.22) < 1e-9
+    assert abs(float(by_line[3.25]["under"]) - 1.88) < 1e-9
+    assert abs(float(by_line[3.75]["under"]) - 1.50) < 1e-9
+    assert decimal_to_american(by_line[2.25]["under"]) != 186
+    assert decimal_to_american(by_line[2.75]["under"]) != 186

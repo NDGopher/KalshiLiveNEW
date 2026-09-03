@@ -104,11 +104,12 @@ _EVENT_HASH_RE = re.compile(r"#!?/event/(\d+)", re.I)
 # (first-5 / other) and must not paint a ML card.
 # Market 5 = game totals. 7/8 = team totals (click-in only) — never on Spread.
 # Soccer totals are not MLB market-3 idx1 and not a market-6 [idx0, idx1]
-# home/away pair. Strike identity is the outcome key (2.5 / 3.5 / 4.5 or
-# over_2.5 / under_2.5). Side-named soccer slots: idx0 is the take (raw
-# market data). idx1 is not Over/Under of that strike. Line-only soccer
-# outcomes emit only when [idx0, idx1] is a real Over/Under pair. Missing,
-# stale, or mismatched strikes are dropped — never reuse a nearby line.
+# home/away pair. Strike / market identity is the outcome key only
+# (2.5 / 3.5 / 4.5, quarter-point alts, over_2.5 / under_2.5). Never infer
+# a line from a coefficient (idx0/idx1/idx2 or a price like +186=2.86).
+# Side-named soccer slots: idx0 is the take. idx1 is not Over/Under.
+# Line-only keys emit only when [idx0, idx1] is a real Over/Under pair.
+# Missing or mismatched strikes are dropped — never reuse a nearby line.
 # eventData list is [home, away] (stadium home first).
 # Sox @ Astros 199298371 Game tab: Astros −1.5 is unpriced. The only +325
 # on that event is Chicago White Sox Total Over 2.5 (market 7/8), not a run line.
@@ -477,6 +478,10 @@ def is_game_totals_market_name(name: Any) -> bool:
 
 
 def _is_plausible_game_total_line(line: Optional[float], *, soccer: bool) -> bool:
+    """Half-point (MLB) or quarter-point (soccer Asian) grids only.
+
+    Prices are not lines: 2.86 (+186) and 3.45 (+245) fail the 0.25 grid.
+    """
     if line is None:
         return False
     try:
@@ -485,8 +490,9 @@ def _is_plausible_game_total_line(line: Optional[float], *, soccer: bool) -> boo
         return False
     if lf != lf or lf <= 0:
         return False
-    twice = lf * 2.0
-    if abs(twice - round(twice)) > 1e-6:
+    step = 4.0 if soccer else 2.0
+    stepped = lf * step
+    if abs(stepped - round(stepped)) > 1e-6:
         return False
     if soccer:
         return 0.25 <= lf <= 15.0
@@ -508,18 +514,27 @@ _SOCCER_TOTAL_OUTCOME_RE = re.compile(
 
 
 def parse_soccer_total_outcome(outcome: Any) -> Tuple[Optional[float], Optional[str]]:
-    """Strike + side from a PLive soccer totals outcome key. No nearby-line guess."""
+    """Strike + side from the outcome / market key only. Never from a price.
+
+    Bare integers (``3`` / ``4``) are over/under codes, not 3.0 / 4.0 lines.
+    """
     raw = str(outcome or "").strip().lower()
     if not raw:
         return None, None
+    if raw in ("over", "o"):
+        return None, "over"
+    if raw in ("under", "u"):
+        return None, "under"
+    if re.fullmatch(r"\d{1,2}", raw):
+        return None, None
     m = _SOCCER_TOTAL_OUTCOME_RE.match(raw)
     if not m:
-        if raw in ("over", "o"):
-            return None, "over"
-        if raw in ("under", "u"):
-            return None, "under"
         return None, None
-    line = _as_float(m.group("line"))
+    line_tok = m.group("line")
+    if line_tok is not None and re.fullmatch(r"\d{1,2}", line_tok) and "." not in raw:
+        # ``over3`` / ``u4`` without a decimal — not an authoritative strike.
+        return None, None
+    line = _as_float(line_tok)
     if not _is_plausible_game_total_line(line, soccer=True):
         line = None
     side_tok = (m.group("side") or m.group("side2") or "").lower()
@@ -529,6 +544,38 @@ def parse_soccer_total_outcome(outcome: Any) -> Tuple[Optional[float], Optional[
     elif side_tok in ("under", "u"):
         side = "under"
     return line, side
+
+
+def soccer_totals_identity_rows(markets: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """Visible board rows: exact strike + Over/Under American. For payload diffs."""
+    from ev_calculator import decimal_to_american
+
+    out: List[Dict[str, Any]] = []
+    for m in markets or []:
+        if not isinstance(m, dict) or not is_game_totals_market_name(m.get("name")):
+            continue
+        for row in m.get("odds") or []:
+            if not isinstance(row, dict):
+                continue
+            line = row.get("hdp")
+            if line is None:
+                continue
+            try:
+                lf = float(line)
+            except (TypeError, ValueError):
+                continue
+            over = _as_float(row.get("over"))
+            under = _as_float(row.get("under"))
+            out.append(
+                {
+                    "line": lf,
+                    "over": over,
+                    "under": under,
+                    "over_am": decimal_to_american(over) if over and over > 1.0 else None,
+                    "under_am": decimal_to_american(under) if under and under > 1.0 else None,
+                }
+            )
+    return out
 
 
 def _soccer_total_side_take_decimal(slots: Any) -> Optional[float]:
@@ -541,17 +588,6 @@ def _soccer_total_side_take_decimal(slots: Any) -> Optional[float]:
     if a is not None:
         return a
     return _slot_decimal(slots, 1)
-
-
-def _explicit_total_line_from_slots(slots: Any, *, soccer: bool) -> Optional[float]:
-    """Line from named fields only. Never treat coeff index 2 as a strike."""
-    if not isinstance(slots, dict):
-        return None
-    for key in ("hdp", "max", "line"):
-        cand = _as_float(slots.get(key))
-        if _is_plausible_game_total_line(cand, soccer=soccer):
-            return cand
-    return None
 
 
 _EVENT_ID_RE = re.compile(r"(?:eventCoefficients|eventData|event)[./](\d+)", re.I)
@@ -1633,13 +1669,10 @@ class PliveStore:
         for (market, outcome), slots in coeffs.items():
             if int(market) not in wanted:
                 continue
+            # Outcome / market key is the only strike identity. Slot values
+            # (idx0/1/2, leftover hdp/max) are prices — never lines.
             line, side = parse_soccer_total_outcome(outcome)
-            meta = _explicit_total_line_from_slots(slots, soccer=True)
-            if line is not None and meta is not None and abs(float(line) - float(meta)) > 1e-6:
-                _reject(float(line))
-                continue
-            strike = line if line is not None else meta
-            if strike is None or not _is_plausible_game_total_line(strike, soccer=True):
+            if line is None or not _is_plausible_game_total_line(line, soccer=True):
                 continue
             if side:
                 named.append((int(market), str(outcome), slots))
@@ -1648,23 +1681,19 @@ class PliveStore:
 
         for market, outcome, slots in named:
             line, side = parse_soccer_total_outcome(outcome)
-            meta = _explicit_total_line_from_slots(slots, soccer=True)
-            strike = line if line is not None else meta
-            if strike is None or side is None:
+            if line is None or side is None:
                 continue
             dec = _soccer_total_side_take_decimal(slots)
-            if dec is None:
-                _reject(float(strike))
+            if dec is None or abs(float(dec) - float(line)) < 1e-6:
+                _reject(float(line))
                 continue
-            _put(float(strike), side, dec, market)
+            _put(float(line), side, dec, market)
 
         for market, outcome, slots in line_only:
             line, _side = parse_soccer_total_outcome(outcome)
-            meta = _explicit_total_line_from_slots(slots, soccer=True)
-            strike = line if line is not None else meta
-            if strike is None:
+            if line is None:
                 continue
-            lf = float(strike)
+            lf = float(line)
             if lf in rejected:
                 continue
             pair = _spread_pair_from_slots(slots) if isinstance(slots, dict) else None
@@ -1673,6 +1702,9 @@ class PliveStore:
             if pair is None or not _valid_ou_hold(pair[0], pair[1]):
                 if lf in by_line:
                     _reject(lf)
+                continue
+            if abs(pair[0] - lf) < 1e-6 or abs(pair[1] - lf) < 1e-6:
+                _reject(lf)
                 continue
             rec = by_line.get(lf)
             if rec and (
