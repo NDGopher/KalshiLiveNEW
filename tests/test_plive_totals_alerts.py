@@ -10,6 +10,8 @@ from odds_ev_monitor import (
     _odds_doc_has_take_tradable_gameline,
     _pick_matching_odds_row,
     _pick_qualifier_line_for_side,
+    _row_limit_hint,
+    _row_passes_sharp_limit,
     _two_way_pick_opp_decimals,
     total_line_value,
 )
@@ -490,3 +492,188 @@ def test_live_odds_emits_totals_and_spread_in_addition_to_ml():
     spr = next(r for r in rows if r.get("market") == "Spread")
     assert "5.5" not in str(spr.get("side_a") or "")
     assert spr.get("line") == -1.5
+
+
+def test_totals_max_is_line_not_liquidity():
+    """MLB Totals ``max``=11.5 must not fail FanDuel minSharpLimits=200."""
+    from ev_calculator import american_to_decimal
+
+    row = {"max": 11.5, "line": 11.5, "over": american_to_decimal(-140), "under": american_to_decimal(120)}
+    assert _row_limit_hint(row) is None
+    assert _row_passes_sharp_limit(row, "FanDuel", [{"book": "FanDuel", "min": 200}]) is True
+    assert _row_passes_sharp_limit(row, "DraftKings", [{"book": "DraftKings", "min": 200}]) is True
+    ml = {"home": 1.9, "away": 2.0, "max": 500}
+    assert _row_limit_hint(ml) == 500.0
+
+
+def det_min_plive_ou_plus_doc() -> dict:
+    """DET@MIN market 5: PLive hdp-only 11.5, no Kalshi Totals, DK/FD/CZ max/line."""
+    from ev_calculator import american_to_decimal
+
+    rec = {
+        "max": 11.5,
+        "line": 11.5,
+        "over": american_to_decimal(-140),
+        "under": american_to_decimal(120),
+    }
+    return {
+        "id": DET_MIN_EID,
+        "home": "Minnesota Twins",
+        "away": "Detroit Tigers",
+        "league": "MLB",
+        "bookmakers": {
+            "Kalshi": [{"name": "ML", "odds": [{"home": 1.8, "away": 2.1}]}],
+            "PLive": [
+                {"name": "ML", "odds": [{"home": 1.85, "away": 2.05}]},
+                {"name": "Spread", "odds": [{"hdp": -1.5, "home": 1.91, "away": 1.91}]},
+                {
+                    "name": "Totals",
+                    "odds": [dict(PLIVE_HDP_ONLY)],
+                },
+                {
+                    "name": "Team Total",
+                    "odds": [{"hdp": 5.5, "over": 1.22, "under": 3.75, "plive_market": 7}],
+                },
+            ],
+            "FanDuel": [{"name": "Totals", "odds": [dict(rec)]}],
+            "DraftKings": [{"name": "Totals", "odds": [dict(rec)]}],
+            "Caesars": [{"name": "Totals", "odds": [dict(rec)]}],
+        },
+    }
+
+
+def _prod_totals_monitor() -> OddsEVMonitor:
+    """minSharp=3 and production-like minSharpLimits (FD/DK 200). Hold 8%."""
+    mon = OddsEVMonitor(auth_token=None)
+    mon.set_filter(
+        {
+            "betTypes": ["GAMELINES"],
+            "minRoi": 0,
+            "devigFilter": {
+                "sharps": ["FanDuel", "DraftKings", "Caesars"],
+                "method": "POWER",
+                "type": "AVERAGE",
+                "minEv": 0,
+                "minSharpBooks": 3,
+                "hold": [{"book": "Any", "max": 8}],
+            },
+            "oddsRanges": [{"book": "Any", "min": -500, "max": 500}],
+            "minLimits": [{"book": "Kalshi", "min": 75}],
+            "minSharpLimits": [
+                {"book": "FanDuel", "min": 200},
+                {"book": "DraftKings", "min": 200},
+                {"book": "Caesars", "min": 0},
+            ],
+            "displayBooks": ["Kalshi", "FanDuel", "DraftKings", "Caesars", "PLive"],
+        }
+    )
+    return mon
+
+
+def test_det_min_plive_ou_listed_without_kalshi_ticker():
+    """Fixture: DET@MIN PLive 11.5 over 1.893 / under 1.847, href="", minSharp=3.
+
+    No Kalshi Totals block. DK/FD Totals (max/line) must still enter POWER.
+    Listed Over card take=PLive, not alert_match_failed, not Spread.
+    find_submarket is never called.
+    """
+    from ev_calculator import is_plus_print_ev
+
+    doc = det_min_plive_ou_plus_doc()
+    assert "Kalshi" in doc["bookmakers"]
+    assert not any(m.get("name") == "Totals" for m in doc["bookmakers"]["Kalshi"])
+    pl_row = doc["bookmakers"]["PLive"][2]["odds"][0]
+    assert pl_row == PLIVE_HDP_ONLY
+    assert "max" not in pl_row and "line" not in pl_row
+    assert total_line_value(pl_row) == 11.5
+    pick, qual, line = _pick_qualifier_line_for_side(
+        "Minnesota Twins", "Detroit Tigers", "Totals", "over", pl_row
+    )
+    assert pick == "Over" and qual == "11.5" and line == 11.5
+    joined = _pick_matching_odds_row(doc["bookmakers"]["FanDuel"][0], "Totals", pl_row)
+    assert joined.get("max") == 11.5
+    tw = _two_way_pick_opp_decimals(pl_row, "over")
+    assert tw == (PLIVE_OVER, PLIVE_UNDER)
+
+    mon = _prod_totals_monitor()
+    vbs = mon.live_scan_value_bets_from_docs({DET_MIN_EID: doc})
+    plive_ou = [
+        r
+        for r in vbs
+        if r.get("_take_only") == "PLive" and r.get("_scan_mname") == "Totals"
+    ]
+    sides = {r.get("betSide") for r in plive_ou}
+    assert "over" in sides and "under" in sides
+    assert all((r.get("bookmakerOdds") or {}).get("href") == "" for r in plive_ou)
+    assert all(r.get("_canonical_kalshi_row", {}).get("hdp") == 11.5 for r in plive_ou)
+
+    over_vb = next(r for r in plive_ou if r.get("betSide") == "over")
+    assert mon._value_bet_to_normalized_bet(over_vb, doc, take_book="Kalshi") is None
+    built = mon._value_bet_to_normalized_bet(over_vb, doc, take_book="PLive")
+    assert built is not None
+    assert built["take_book"] == "PLive"
+    assert built["selection"] == "Over"
+    assert built["qualifier"] == "11.5"
+    assert built["market"] == "Total Runs"
+    assert built.get("link") in ("", None)
+    assert str(built.get("ticker") or "").startswith("PLIVE|")
+    assert "KXMLB" not in str(built.get("ticker") or "")
+
+    alerts = mon.alerts_from_live_scan_docs({DET_MIN_EID: doc})
+    plus = [a for a in alerts if is_plus_print_ev(getattr(a, "ev_percent", None))]
+    over = [
+        a
+        for a in plus
+        if str(a.pick).lower() == "over"
+        and str(a.qualifier) == "11.5"
+        and str(getattr(a, "take_book", "")).lower() == "plive"
+    ]
+    assert over, [(a.pick, a.qualifier, a.ev_percent, a.take_book, a.market_type) for a in alerts]
+    assert over[0].market_type == "Total Runs"
+    assert "spread" not in str(over[0].market_type).lower()
+    assert str(over[0].ticker or "").startswith("PLIVE|")
+
+    try:
+        import asyncio
+
+        import dashboard as dash
+    except Exception as exc:  # pragma: no cover
+        pytest.skip(f"dashboard import failed: {exc}")
+
+    called = []
+
+    async def _forbidden_find_submarket(*_a, **_k):
+        called.append(True)
+        raise AssertionError("PLive O/U must not go through find_submarket")
+
+    class _NoMatchClient:
+        find_submarket = staticmethod(_forbidden_find_submarket)
+
+    dash.active_alerts.clear()
+    dash.selected_dashboard_filters = []
+    dash.dashboard_min_ev = 0.0
+    prev_client = dash.kalshi_client
+    dash.kalshi_client = _NoMatchClient()
+    try:
+        asyncio.run(dash.handle_new_alert(over[0]))
+    finally:
+        dash.kalshi_client = prev_client
+    assert called == []
+    with dash.app.test_client() as client:
+        resp = client.get("/api/alerts")
+        assert resp.status_code == 200
+        body = resp.get_json()
+        listed = body.get("alerts") or []
+        ou = [
+            a
+            for a in listed
+            if a.get("pick") == "Over" and str(a.get("qualifier")) == "11.5"
+        ]
+        assert ou, listed
+        card = ou[0]
+        assert card.get("take_book") == "PLive"
+        assert card.get("match_failed") is False
+        assert dash.is_unlisted_match_failed(card) is False
+        assert "spread" not in str(card.get("market_type") or "").lower()
+        assert str(card.get("ticker") or "").startswith("PLIVE|")
+        assert "KXMLB" not in str(card.get("ticker") or "")

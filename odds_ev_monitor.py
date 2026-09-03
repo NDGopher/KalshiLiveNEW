@@ -1027,7 +1027,17 @@ def _markets_list_for_book(bks: Dict[str, Any], book: str) -> List[Dict[str, Any
 
 
 def _row_limit_hint(row: Dict[str, Any]) -> Optional[float]:
-    for key in ("maxStake", "maxBet", "limit", "volume", "liquidity", "stake", "max"):
+    """Stake/limit only. Odds-API Totals use ``max`` as the line (MLB 11.5), not liquidity.
+
+    Treating ``max`` as a floor dropped every DK/FD MLB total against minSharpLimits=200.
+    """
+    if not isinstance(row, dict):
+        return None
+    keys = ("maxStake", "maxBet", "limit", "volume", "liquidity", "stake")
+    # ``max`` is a stake only on moneyline / non-total rows.
+    if row.get("over") is None and row.get("under") is None:
+        keys = keys + ("max",)
+    for key in keys:
         v = row.get(key)
         if v is None:
             continue
@@ -2250,13 +2260,17 @@ class OddsEVMonitor:
                         for kk in ("home", "away", "hdp", "over", "under", "max", "line", "draw"):
                             if p_row.get(kk) is not None:
                                 mk_payload[kk] = p_row.get(kk)
+                        bo_pl: Dict[str, Any] = {bet_side: dec, "href": ""}
+                        for kk in ("hdp", "max", "line", "over", "under", "draw", "home", "away"):
+                            if p_row.get(kk) is not None:
+                                bo_pl[kk] = p_row.get(kk)
                         scan_rows.append(
                             {
                                 "eventId": eid,
                                 "event": ev_stub,
                                 "market": mk_payload,
                                 "betSide": bet_side,
-                                "bookmakerOdds": {bet_side: dec},
+                                "bookmakerOdds": bo_pl,
                                 "expectedValue": 0.0,
                                 "_live_broad_scan": True,
                                 "_ev_source": "plive_take",
@@ -2771,6 +2785,17 @@ class OddsEVMonitor:
         take_canon = _norm_book(str(take_book or "Kalshi")) or "Kalshi"
         take_only = vb.get("_take_only")
         if take_only and _norm_book(str(take_only)).lower() != take_canon.lower():
+            return None
+        # href="" synthetic scan rows are not Kalshi-take cards. PLive O/U print
+        # without a Kalshi ticker — do not send them through find_submarket.
+        if (
+            take_canon.lower() == "kalshi"
+            and not ticker
+            and (
+                vb.get("_live_broad_scan")
+                or str(vb.get("_ev_source") or "") in ("live_event_scan", "plive_take")
+            )
+        ):
             return None
         k_dec = _float_dec(bo.get(bet_side)) if isinstance(bo, dict) else None
         if take_canon.lower() == "kalshi" and (k_dec is None or k_dec <= 1.0):
