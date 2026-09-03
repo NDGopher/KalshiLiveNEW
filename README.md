@@ -59,9 +59,10 @@ Public handshake (bare connect is silent):
 1. `wss://pandora.ganchrow.com/socket.io/?EIO=4&transport=websocket`
 2. Header `Origin: https://plive.becoms.co`
 3. After CONNECT emit `setSocketMetadata {partnerId: 113, flavor: "live"}`
-4. Then `subscribeSystemEvents` + `subscribe` / `getCache` for `live.sports`, `live.events`, `live.main.<LINE_SET>.eventData`, and per-event `eventCoefficients`
+4. Then `subscribeSystemEvents` + `subscribe` / `getCache` for `live.sports`, `live.main.<LINE_SET>.eventData`, and `eventCoefficients` (click-in full book). Per-event `eventCoefficients.{id}` for live MLB (sport 1, league 8). `live.events` is dead.
 
 - MLB is catalog **sport 1** (`#!/sport/1`). `https://plive.becoms.co/live/?#!/sport/220` is **Top Soccer**, not MLB.
+- Run-line name/ticker: negate the home `hdp` for the **away** side only (Brewers +2.5 label on −2.5 prices). Home labels stay as stored.
 - Trust the `live.sports` catalog (1 Baseball, 2 Basketball, 3 Football, …). Do not use the old Selenium map that had nfl=2 / nba=3.
 - Filter JSON still has `bettingBooks=[Kalshi]`; PLive take is a second venue in code. Same filters and dollar sizes. PLive is not a new filter.
 - **No BetBCK scrape.**

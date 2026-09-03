@@ -480,9 +480,16 @@ def _pick_matching_odds_row(mk: Dict[str, Any], mname: str, ref_row: Dict[str, A
         for r in rows:
             if isinstance(r, dict) and _numeric_close(r.get("line"), ref_row.get("line")):
                 return r
+    mk_name = str(mk.get("name") or "").upper()
+    if is_spread and "TOTAL" in mk_name:
+        return {}
     if is_spread and ref_row.get("hdp") is not None:
         for r in rows:
-            if isinstance(r, dict) and _numeric_close(r.get("hdp"), ref_row.get("hdp")):
+            if not isinstance(r, dict):
+                continue
+            if r.get("over") is not None and r.get("home") is None:
+                continue
+            if _numeric_close(r.get("hdp"), ref_row.get("hdp")):
                 return r
     # Same-line only for spread/total. Do not take row[0] (alt / flipped line).
     if is_total or is_spread:
@@ -781,7 +788,7 @@ def _market_names_match(a: str, b: str) -> bool:
         return True
     aliases = (
         ("ML", "MONEYLINE", "MONEY"),
-        ("SPREAD", "HANDICAP", "ASIANHANDICAP"),
+        ("SPREAD", "HANDICAP", "ASIANHANDICAP", "POINTSPREAD"),
         ("TOTAL", "TOTALS", "OVER/UNDER", "OU"),
     )
     for group in aliases:

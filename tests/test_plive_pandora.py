@@ -6,6 +6,7 @@ from plive_pandora import (
     EXPECTED_SYSTEM_EVENT_ROOMS,
     PLIVE_BOOK_NAME,
     PLIVE_LINE_SET,
+    PLIVE_MLB_LEAGUE_ID,
     PLIVE_PARTNER_ID,
     PLIVE_SPORT_CATALOG_FALLBACK,
     PlivePandoraFeed,
@@ -140,9 +141,7 @@ def test_handshake_matches_public_ui():
     assert emits[1][1] == {"partnerId": 113}
     topics = emits[2][1]
     assert "live.sports" in topics
-    assert "sports" in topics
-    assert "live.events" in topics
-    assert f"live.main.{PLIVE_LINE_SET}" in topics
+    assert "live.events" not in topics
     assert f"live.main.{PLIVE_LINE_SET}.eventData" in topics
     assert f"live.main.{PLIVE_LINE_SET}.eventCoefficients" in topics
     assert emits[3][1] == topics
@@ -206,6 +205,8 @@ def test_public_ui_topics_include_required_rooms():
     topics = public_ui_subscribe_topics()
     assert any(t.endswith(".eventData") for t in topics)
     assert any(t.endswith(".eventCoefficients") for t in topics)
+    assert "live.events" not in topics
+    assert coeff_room_for_event("199298371").endswith(".eventCoefficients.199298371")
 
 
 def test_event_data_s_tree_extracts_mlb_teams():
@@ -256,7 +257,10 @@ def test_event_data_s_tree_extracts_mlb_teams():
     assert "199992971" in mlb
     assert mlb["199992971"]["away"] == "Chicago Cubs"
     assert mlb["199992971"]["home"] == "Milwaukee Brewers"
+    assert mlb["199992971"].get("league_id") == PLIVE_MLB_LEAGUE_ID
+    assert store.wants_mlb_coeff(mlb["199992971"]) is True
     assert "188359511" in mlb  # still baseball; Odds-API team-match drops MiLB
+    assert store.wants_mlb_coeff(mlb["188359511"]) is False
     assert "1" not in mlb
 
 
@@ -352,7 +356,8 @@ def test_market3_is_not_ml_column():
     assert ml["odds"][0]["away"] == 2.10
 
 
-def test_align_plive_home_away_to_odds_api_fixture():
+def test_do_not_remap_plive_labels_to_odds_api():
+    """Odds-API fixture axis wins. Do not flip prices from Pandora t1/t2 names."""
     assert plive_orientation_swapped_vs_odds(
         "Chicago White Sox", "Houston Astros", "Houston Astros", "Chicago White Sox"
     )
@@ -368,9 +373,72 @@ def test_align_plive_home_away_to_odds_api_fixture():
         odds_away="Chicago White Sox",
     )
     sp = next(m for m in aligned if m["name"] == "Spread")
-    assert sp["odds"][0]["hdp"] == 1.5
-    assert sp["odds"][0]["home"] == 1.446
-    assert sp["odds"][0]["away"] == 2.65
+    assert sp["odds"][0]["hdp"] == -1.5
+    assert sp["odds"][0]["home"] == 2.65
+    assert sp["odds"][0]["away"] == 1.446
+    ml = next(m for m in aligned if m["name"] == "ML")
+    assert ml["odds"][0]["home"] == 2.10
+
+
+def test_event_199298371_pair_parse_and_away_label():
+    """Dump 199298371: nested [home, away] on market 6; Odds-API Sox @ Astros."""
+    from odds_ev_monitor import _decimal_for_side, _pick_qualifier_line_for_side
+
+    store = PliveStore()
+    eid = "199298371"
+    store.apply_message(
+        {
+            "isDiff": False,
+            "payload": {
+                "c": {
+                    "m": {
+                        "3": {"o": {"1": 2.61, "2": 1.462963}},
+                        "5": {"o": {"4.5": [3.79, 1.240385]}},
+                        "6": {
+                            "o": {
+                                "-1.5": {0: 8.86, 1: 1.045065},
+                                "1": [1.847458, 1.892857],
+                                "1.5": {1: [1.446429, 2.65]},
+                                "2.5": {0: 1.172712, 1: 4.6},
+                            }
+                        },
+                        "7": {"o": {"2.5": {0: 4.97, 1: 1.144928}}},
+                        "8": {"o": {"2.5": {0: 3.12, 1: 1.319489}}},
+                    }
+                }
+            },
+        },
+        event_name=f"live.main.{PLIVE_LINE_SET}.eventCoefficients.{eid}",
+    )
+    by_name = {m["name"]: m for m in store.markets_for_event(eid)}
+    assert "Spread" in by_name
+    rows = by_name["Spread"]["odds"]
+    # Alt +2.5 from click-in stays. Dead 8.86/−1.5 scalars do not.
+    assert any(abs(float(r["hdp"]) - 2.5) < 1e-9 for r in rows)
+    live15 = next(r for r in rows if abs(float(r["hdp"]) - 1.5) < 1e-9)
+    assert live15["home"] == 1.446429
+    assert live15["away"] == 2.65
+    assert all(r.get("home") != 8.86 for r in rows)
+    assert all(r.get("home") != 3.79 for r in rows)
+    assert all(r.get("home") != 4.97 for r in rows)
+    assert "ML" not in by_name or by_name["ML"]["odds"][0]["home"] != 2.61
+
+    # Odds-API fixture: White Sox @ Astros. Away label is −1.5, not +1.5.
+    odds_home, odds_away = "Houston Astros", "Chicago White Sox"
+    home_pick, home_qual, home_line = _pick_qualifier_line_for_side(
+        odds_home, odds_away, "Spread", "home", live15
+    )
+    away_pick, away_qual, away_line = _pick_qualifier_line_for_side(
+        odds_home, odds_away, "Spread", "away", live15
+    )
+    assert home_pick == odds_home
+    assert home_line == 1.5
+    assert home_qual == "+1.5"
+    assert away_pick == odds_away
+    assert away_line == -1.5
+    assert away_qual == "-1.5"
+    assert _decimal_for_side(live15, "home") == 1.446429
+    assert _decimal_for_side(live15, "away") == 2.65
 
 
 def test_merge_keeps_odds_api_plive_ml():

@@ -10,6 +10,7 @@ from ev_calculator import (
     spread_keep_on_labeled_side,
 )
 from odds_ev_monitor import (
+    _pick_matching_odds_row,
     _pick_qualifier_line_for_side,
     format_spread_qualifier,
     side_handicap,
@@ -32,6 +33,30 @@ def test_away_run_line_negates_home_hdp():
     assert side_handicap(1.5, "away") == -1.5
     assert side_handicap(1.5, "home") == 1.5
     assert format_spread_qualifier(-1.5) == "-1.5"
+
+
+def test_brewers_away_plus25_label_was_minus25_prices():
+    """Twins home +2.5 stays +2.5. Brewers away must paint −2.5, not +2.5."""
+    home_pick, home_qual, home_line = _pick_qualifier_line_for_side(
+        "Minnesota Twins",
+        "Milwaukee Brewers",
+        "Spread",
+        "home",
+        {"hdp": 2.5, "home": 1.45, "away": 2.70},
+    )
+    assert home_pick == "Minnesota Twins"
+    assert home_line == 2.5
+    assert home_qual == "+2.5"
+    away_pick, away_qual, away_line = _pick_qualifier_line_for_side(
+        "Minnesota Twins",
+        "Milwaukee Brewers",
+        "Spread",
+        "away",
+        {"hdp": 2.5, "home": 1.45, "away": 2.70},
+    )
+    assert away_pick == "Milwaukee Brewers"
+    assert away_line == -2.5
+    assert away_qual == "-2.5"
 
 
 def test_do_not_keep_on_painted_plus15_when_actual_is_minus15():
@@ -98,3 +123,19 @@ def test_poly_minus178_vs_minus104_same_sign_junk_not_invert():
         min_sharp_books=3,
     )
     assert "Poly" not in out["fair_names"]
+
+
+def test_spread_matcher_ignores_game_and_team_totals():
+    """Guard: market 5 / 7-8 prices must never attach to a Spread tile."""
+    totals = {
+        "name": "Totals",
+        "odds": [{"hdp": 4.5, "over": 3.79, "under": 1.24, "max": 4.5}],
+    }
+    team_total = {
+        "name": "Team Total",
+        "odds": [{"hdp": 2.5, "over": 4.25, "under": 1.14, "max": 2.5}],
+    }
+    ref = {"hdp": 2.5, "home": 1.45, "away": 2.70}
+    assert _pick_matching_odds_row(totals, "Spread", ref) == {}
+    assert _pick_matching_odds_row(team_total, "Spread", ref) == {}
+    assert _pick_matching_odds_row(totals, "Spread", {"hdp": 1.5}) == {}

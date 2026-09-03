@@ -8,8 +8,10 @@ Handshake matches the public live UI at https://plive.becoms.co/live/ :
   After CONNECT:
     1) setSocketMetadata {partnerId: 113, flavor: "live"}
     2) subscribeSystemEvents {partnerId: 113}
-    3) subscribe + getCache for live.sports / live.events /
-       live.main.<LINE_SET> eventData + eventCoefficients
+    3) subscribe + getCache for live.sports (names) and
+       live.main.<LINE_SET>.eventData (directory once). live.events is dead.
+    4) Keep eventCoefficients (click-in full book, including alt spreads)
+       and subscribe eventCoefficients.{eventId} per live MLB id.
 
 Bare connect is silent. Do not scrape BetBCK. Do not send cookies.
 
@@ -41,6 +43,7 @@ PLIVE_DISTRO = "main"
 # Public UI LINE_SET constant (live.main.<this>.eventData / eventCoefficients).
 PLIVE_LINE_SET = "U0VWU1NWUkJSMFU9"
 PLIVE_MLB_SPORT_ID = 1
+PLIVE_MLB_LEAGUE_ID = 8  # eventData path s[1][…][8] = MLB; not catalog sport 8 (Tennis)
 PLIVE_MLB_HASH = "#!/sport/1"
 PLIVE_TOP_SOCCER_SPORT_ID = 220
 PLIVE_TOP_SOCCER_HASH = "#!/sport/220"
@@ -147,15 +150,10 @@ def plive_event_coefficients_topic() -> str:
 
 
 def public_ui_subscribe_topics() -> List[str]:
-    """Rooms the public live UI subscribes after metadata (MLB-first set)."""
-    prefix = plive_line_prefix()
+    """Directory + click-in coeff prefix. ``live.events`` is dead."""
     flavor = (os.getenv("PLIVE_FLAVOR") or PLIVE_FLAVOR).strip() or PLIVE_FLAVOR
     return [
         f"{flavor}.sports",
-        "sports",
-        f"{flavor}.events",
-        "live.events",
-        prefix,
         plive_event_data_topic(),
         plive_event_coefficients_topic(),
         f"{flavor}.leagues",
@@ -181,9 +179,8 @@ def handshake_emits() -> List[Tuple[str, Any]]:
 EXPECTED_SYSTEM_EVENT_ROOMS = ("system-events", "notifications.partner.113")
 EXPECTED_SUBSCRIBED_ROOMS = (
     "live.sports",
-    "sports",
-    "live.main.U0VWU1NWUkJSMFU9",
-    "live.events",
+    f"live.main.{PLIVE_LINE_SET}.eventData",
+    f"live.main.{PLIVE_LINE_SET}.eventCoefficients",
 )
 
 
@@ -211,17 +208,15 @@ def _is_sports_topic(event_name: Optional[str]) -> bool:
 
 
 def _is_event_list_topic(event_name: Optional[str]) -> bool:
+    """``eventData`` is the slate directory. ``live.events`` is a dead room."""
     t = str(event_name or "")
     if not t:
         return False
     if "eventCoefficients" in t:
         return False
-    return (
-        t.endswith(".eventData")
-        or t.endswith(".events")
-        or t == "live.events"
-        or t == plive_line_prefix()
-    )
+    if t.endswith(".events") or t == "live.events":
+        return False
+    return t.endswith(".eventData")
 
 
 def parse_coeff_path(path: str) -> Optional[Dict[str, Any]]:
@@ -399,6 +394,15 @@ def walk_event_data_tree(
                 rec: Dict[str, Any] = {"id": eid, "away": away, "home": home}
                 if sport_id is not None:
                     rec["sportId"] = sport_id
+                if len(path) >= 2 and str(path[-2]).isdigit():
+                    rec["leagueId"] = int(path[-2])
+                for extra in node[2:]:
+                    if not isinstance(extra, dict):
+                        continue
+                    if extra.get("ip") is True:
+                        rec["finished"] = False
+                    elif extra.get("ip") is False or extra.get("finished") is True:
+                        rec["finished"] = True
                 yield eid, rec
         return
     if not isinstance(node, dict):
@@ -549,30 +553,9 @@ def align_plive_markets_to_odds_fixture(
     odds_home: str,
     odds_away: str,
 ) -> List[Dict[str, Any]]:
-    """Attach prices on the Odds-API home/away axis, not Pandora's swapped labels."""
-    if not plive_orientation_swapped_vs_odds(
-        str(plive_home or ""), str(plive_away or ""), odds_home, odds_away
-    ):
-        return list(markets or [])
-    out: List[Dict[str, Any]] = []
-    for mk in markets or []:
-        if not isinstance(mk, dict):
-            continue
-        name = str(mk.get("name") or "")
-        rows: List[Dict[str, Any]] = []
-        for row in mk.get("odds") or []:
-            if not isinstance(row, dict):
-                continue
-            flipped = dict(row)
-            if name in ("ML", "Spread"):
-                flipped["home"], flipped["away"] = row.get("away"), row.get("home")
-                if name == "Spread" and row.get("hdp") is not None:
-                    hf = _as_float(row.get("hdp"))
-                    if hf is not None:
-                        flipped["hdp"] = -hf
-            rows.append(flipped)
-        out.append({**mk, "odds": rows})
-    return out
+    """Odds-API home/away is the fixture. Do not flip from Pandora t1/t2 labels."""
+    del plive_home, plive_away, odds_home, odds_away
+    return list(markets or [])
 
 
 def merge_plive_market_lists(
@@ -642,6 +625,8 @@ class PliveStore:
             ev = {
                 "id": eid,
                 "sport_id": None,
+                "league_id": None,
+                "finished": False,
                 "home": None,
                 "away": None,
                 "coeffs": {},  # (market, outcome) -> {index: value}
@@ -670,7 +655,7 @@ class PliveStore:
             )
 
     def apply_event_catalog(self, data: Any) -> List[str]:
-        """Ingest eventData / live.events snapshot. MLB-first (sport 1)."""
+        """Ingest eventData directory. Sport 1 baseball; league 8 is MLB."""
         seen: List[str] = []
         want = int(self.sport_id)
         for eid, rec in iter_event_records(data):
@@ -712,6 +697,18 @@ class PliveStore:
             ev["home"] = home
         if away:
             ev["away"] = away
+        league = data.get("leagueId") or data.get("league_id") or data.get("li") or data.get("lg")
+        if isinstance(league, dict):
+            league = league.get("id") or league.get("leagueId")
+        if league is not None:
+            try:
+                ev["league_id"] = int(league)
+            except (TypeError, ValueError):
+                pass
+        if data.get("finished") is True:
+            ev["finished"] = True
+        elif data.get("finished") is False or data.get("ip") is True:
+            ev["finished"] = False
         self.generation += 1
 
     def set_coeff(self, eid: str, market: int, outcome: str, index: Optional[int], value: Any) -> None:
@@ -808,6 +805,20 @@ class PliveStore:
 
     def mlb_events(self) -> Dict[str, Dict[str, Any]]:
         return {k: v for k, v in self.events.items() if self.is_mlb_event(v)}
+
+    def wants_mlb_coeff(self, ev: Dict[str, Any]) -> bool:
+        """Live MLB (league 8) only. MiLB on sport 1 stays out when league is set."""
+        if ev.get("finished"):
+            return False
+        if not self.is_mlb_event(ev):
+            return False
+        lg = ev.get("league_id")
+        if lg is None:
+            return True
+        try:
+            return int(lg) == int(PLIVE_MLB_LEAGUE_ID)
+        except (TypeError, ValueError):
+            return True
 
     def markets_for_event(self, eid: str) -> List[Dict[str, Any]]:
         ev = self.events.get(str(eid))
@@ -1131,17 +1142,12 @@ class PlivePandoraFeed:
         print(f"[PLIVE] handshake emitted setSocketMetadata + subscribe/getCache ({len(topics)} rooms)")
 
     async def _subscribe_mlb_coefficients(self, sio: Any) -> None:
-        """Per-event coeff rooms — required for team names + live game lines."""
+        """Per-event click-in coeff rooms (full book, including alt spreads)."""
         want = int(self.store.sport_id)
         new_rooms: List[str] = []
         for eid, ev in self.store.events.items():
-            sid = ev.get("sport_id")
-            if sid is not None:
-                try:
-                    if int(sid) != want:
-                        continue
-                except (TypeError, ValueError):
-                    continue
+            if not self.store.wants_mlb_coeff(ev):
+                continue
             room = coeff_room_for_event(str(eid))
             if room in self._coeff_subscribed:
                 continue
@@ -1150,7 +1156,6 @@ class PlivePandoraFeed:
             new_rooms.append(room)
         if not new_rooms:
             return
-        # Cap so we stay on MLB first and do not flood soccer/NFL rooms.
         batch = new_rooms[:80]
         try:
             await sio.emit("subscribe", batch)
@@ -1263,7 +1268,7 @@ class PlivePandoraFeed:
                     self._record_ack(event_name, arg)
                     continue
                 self.ingest_raw(arg, event_name)
-            if _is_event_list_topic(event_name) or event_name in ("live.events", "sports"):
+            if _is_event_list_topic(event_name):
                 await self._subscribe_mlb_coefficients(sio)
 
         origin = (os.getenv("PLIVE_ORIGIN") or PLIVE_ORIGIN).strip()
