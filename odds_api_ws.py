@@ -22,7 +22,9 @@ Official contract (do not invent):
   only Totals.
 - Track ``seq``; reconnect with ``lastSeq`` (compacted latest-state replay).
 - On ``resync_required``: REST snapshot with ``includeSeq=true``, then reconnect.
-- Process updates asynchronously; exponential backoff on reconnect.
+- Process updates asynchronously; bounded exponential backoff + jitter on reconnect.
+- Close 1013 (try again later) must not reset backoff or fan out REST /odds/updated.
+- REST fallback is single-flight, cooldown-bounded, and fail-closed (no stale lines).
 
 The API key is read from ``ODDS_API_KEY`` only. Never log the raw key.
 """
@@ -31,9 +33,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from odds_api_client import (
@@ -55,6 +58,8 @@ MAX_LEAGUES = 20
 MAX_EVENT_IDS = 50
 ALLOWED_CHANNELS = ("odds", "scores", "status")
 ALLOWED_STATUS = ("live", "prematch")
+# Server asked us to back off — never treat these as a healthy session.
+WS_BACKOFF_CLOSE_CODES = frozenset({1013, 1008})
 
 _MLB_CLOCK_LOG_GAP_SEC = 30.0
 
@@ -130,6 +135,82 @@ def _parse_csv_values(raw: Any) -> List[str]:
 
 def _env_bool(name: str, default: str = "false") -> bool:
     return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_float(name: str, default: float, *, lo: float, hi: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, v))
+
+
+def ws_close_code(obj: Any) -> Optional[int]:
+    """Best-effort close code from a websockets exception, protocol frame, or socket."""
+    if obj is None:
+        return None
+    for attr in ("code", "close_code"):
+        raw = getattr(obj, attr, None)
+        if raw is not None and not callable(raw):
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                pass
+    for wrap_attr in ("rcvd", "sent"):
+        wrap = getattr(obj, wrap_attr, None)
+        if wrap is None:
+            continue
+        raw = getattr(wrap, "code", None)
+        if raw is None:
+            continue
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def is_odds_api_rate_limit_error(ex: BaseException) -> bool:
+    status = getattr(ex, "status", None)
+    if status is None:
+        status = getattr(ex, "status_code", None)
+    try:
+        if int(status) == 429:
+            return True
+    except (TypeError, ValueError):
+        pass
+    text = str(ex).lower()
+    if "429" not in text:
+        return False
+    return "too many" in text or "rate" in text or "try again later" in text
+
+
+def ws_reconnect_delay_sec(
+    attempt: int,
+    *,
+    close_code: Optional[int] = None,
+    rng: Optional[Callable[[], float]] = None,
+) -> float:
+    """Bounded exponential backoff with symmetric jitter.
+
+    Close 1013 uses a higher floor so 'try again later' cannot 1s-loop.
+    """
+    base = _env_float("ODDS_API_WS_RECONNECT_BASE_SEC", 2.0, lo=0.25, hi=120.0)
+    cap = _env_float("ODDS_API_WS_RECONNECT_MAX_SEC", 60.0, lo=1.0, hi=600.0)
+    jitter_frac = _env_float("ODDS_API_WS_RECONNECT_JITTER", 0.25, lo=0.0, hi=0.9)
+    if close_code in WS_BACKOFF_CLOSE_CODES:
+        base = max(base, _env_float("ODDS_API_WS_1013_BASE_SEC", 8.0, lo=1.0, hi=180.0))
+        cap = max(cap, _env_float("ODDS_API_WS_1013_MAX_SEC", 120.0, lo=8.0, hi=600.0))
+    n = max(1, int(attempt))
+    exp = min(cap, base * (2 ** (n - 1)))
+    pick = rng if rng is not None else random.random
+    u = float(pick())
+    u = min(1.0, max(0.0, u))
+    jitter = exp * jitter_frac * (2.0 * u - 1.0)
+    return max(0.25, min(cap, exp + jitter))
 
 
 def odds_api_ws_wanted() -> bool:
@@ -758,6 +839,13 @@ class OddsApiWsFeed:
         self.resyncing = False
         self.last_error: Optional[str] = None
         self._reconnect_attempts = 0
+        self._reconnect_lock = asyncio.Lock()
+        self._reconnecting = False
+        self._fallback_lock = asyncio.Lock()
+        self._fallback_cooldown_until = 0.0
+        self._fallback_rate_limited = False
+        self._session_started_at: Optional[float] = None
+        self.last_close_code: Optional[int] = None
         self._ws = None
         self._dirty = asyncio.Event()
         self.generation = 0
@@ -858,27 +946,65 @@ class OddsApiWsFeed:
             self.store.note_seq(seq)
         return docs
 
+    def fallback_cooling_down(self) -> bool:
+        return time.time() < float(self._fallback_cooldown_until or 0.0)
+
+    def _arm_fallback_cooldown(self, *, rate_limited: bool) -> None:
+        if rate_limited:
+            extra = _env_float("ODDS_API_REST_FALLBACK_429_COOLDOWN_SEC", 60.0, lo=5.0, hi=600.0)
+            self._fallback_rate_limited = True
+        else:
+            extra = _env_float("ODDS_API_REST_FALLBACK_COOLDOWN_SEC", 20.0, lo=1.0, hi=300.0)
+        self._fallback_cooldown_until = time.time() + extra
+        kind = "429" if rate_limited else "pass"
+        print(f"[ODDS-API WS] REST fallback cooldown {extra:.0f}s ({kind})")
+
+    def should_attempt_rest_fallback(self) -> bool:
+        """True only after a disconnect — not during first connect, not on cooldown."""
+        if not _env_bool("ODDS_API_REST_UPDATED_FALLBACK", "true"):
+            return False
+        if self.fallback_cooling_down():
+            return False
+        if not self.store.event_meta:
+            return False
+        if self.connected or self.healthy:
+            return False
+        return bool(self._reconnect_attempts > 0 or self.last_error)
+
     async def rest_updated_fallback(
         self,
         since: int,
         books: Optional[Sequence[str]] = None,
         sport: Optional[str] = None,
     ) -> int:
-        """Patch store from ``/odds/updated`` (REST fallback; one book per call)."""
-        n = 0
-        use = list(books) if books else odds_api_master_bookmakers()
-        for bm in use:
-            try:
-                docs = await self.rest.get_odds_updated(since, bm, sport=sport)
-            except Exception as ex:
-                print(f"[ODDS-API WS] [WARN] /odds/updated failed for {bm}: {ex}")
-                continue
-            if docs:
-                self.store.apply_rest_docs(docs)
-                n += len(docs)
-        if n:
-            self._mark_dirty()
-        return n
+        """Patch store from ``/odds/updated`` (REST fallback; one book per call).
+
+        Single-flight: concurrent callers wait, then see cooldown and skip.
+        A 429 stops the remaining book loop and arms a longer cooldown.
+        """
+        async with self._fallback_lock:
+            if self.fallback_cooling_down():
+                return 0
+            n = 0
+            rate_limited = False
+            use = list(books) if books else odds_api_master_bookmakers()
+            for bm in use:
+                try:
+                    docs = await self.rest.get_odds_updated(since, bm, sport=sport)
+                except Exception as ex:
+                    if is_odds_api_rate_limit_error(ex):
+                        print(f"[ODDS-API WS] [WARN] /odds/updated 429 for {bm} — stopping book loop")
+                        rate_limited = True
+                        break
+                    print(f"[ODDS-API WS] [WARN] /odds/updated failed for {bm}: {ex}")
+                    continue
+                if docs:
+                    self.store.apply_rest_docs(docs)
+                    n += len(docs)
+            self._arm_fallback_cooldown(rate_limited=rate_limited)
+            if n:
+                self._mark_dirty()
+            return n
 
     async def _process_loop(self) -> None:
         while self._running:
@@ -969,6 +1095,19 @@ class OddsApiWsFeed:
         except Exception as ex:
             print(f"[ODDS-API WS] [WARN] handoff snapshot failed (connecting without lastSeq): {ex}")
 
+    def _should_reset_reconnect_backoff(self, *, had_welcome: bool) -> bool:
+        """Reset only after a real healthy session — never after 1013 / brief flaps."""
+        code = self.last_close_code
+        if code in WS_BACKOFF_CLOSE_CODES:
+            return False
+        if not had_welcome:
+            return False
+        started = self._session_started_at
+        if started is None:
+            return False
+        need = _env_float("ODDS_API_WS_HEALTHY_RESET_SEC", 15.0, lo=1.0, hi=300.0)
+        return (time.time() - started) >= need
+
     async def _run_loop(self) -> None:
         await self.maybe_select_books()
         first = True
@@ -976,25 +1115,45 @@ class OddsApiWsFeed:
             if first:
                 await self._handoff_snapshot()
                 first = False
-            url = self.current_url()
-            print(f"[ODDS-API WS] connecting {redact_ws_url(url)}")
-            try:
-                await self._connect_once(url)
-                self._reconnect_attempts = 0
-            except asyncio.CancelledError:
-                break
-            except Exception as ex:
-                self.last_error = str(ex)
-                print(f"[ODDS-API WS] [WARN] connection ended: {ex}")
-            self.connected = False
-            self.welcome_ok = False
+            # One connection per API key. A second process kicking us off looks like 1013.
+            async with self._reconnect_lock:
+                if self._reconnecting:
+                    continue
+                self._reconnecting = True
+                url = self.current_url()
+                print(f"[ODDS-API WS] connecting {redact_ws_url(url)}")
+                had_welcome = False
+                try:
+                    await self._connect_once(url)
+                except asyncio.CancelledError:
+                    self._reconnecting = False
+                    break
+                except Exception as ex:
+                    self.last_error = str(ex)
+                    code = ws_close_code(ex)
+                    if code is not None:
+                        self.last_close_code = code
+                    print(f"[ODDS-API WS] [WARN] connection ended: {ex}")
+                else:
+                    self.last_error = None
+                finally:
+                    had_welcome = bool(self.welcome_ok)
+                    self.connected = False
+                    self.welcome_ok = False
+                    self._reconnecting = False
             if not self._running:
                 break
+            if self._should_reset_reconnect_backoff(had_welcome=had_welcome):
+                self._reconnect_attempts = 0
             self._reconnect_attempts += 1
-            delay = min(30.0, 1.0 * (2 ** max(0, self._reconnect_attempts - 1)))
+            delay = ws_reconnect_delay_sec(
+                self._reconnect_attempts,
+                close_code=self.last_close_code,
+            )
             print(
-                f"[ODDS-API WS] reconnect in {delay:.0f}s "
-                f"(attempt {self._reconnect_attempts}, lastSeq={self.store.last_seq})"
+                f"[ODDS-API WS] reconnect in {delay:.1f}s "
+                f"(attempt {self._reconnect_attempts}, lastSeq={self.store.last_seq}, "
+                f"close={self.last_close_code})"
             )
             try:
                 await asyncio.sleep(delay)
@@ -1007,31 +1166,53 @@ class OddsApiWsFeed:
             import websockets
 
             opener = websockets.connect
-        async with opener(url) as ws:
-            self._ws = ws
-            self.connected = True
-            self.last_error = None
-            async for raw in ws:
-                if not self._running:
-                    break
-                try:
-                    if isinstance(raw, bytes):
-                        raw = raw.decode("utf-8")
-                    msg = json.loads(raw)
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    continue
-                if not isinstance(msg, dict):
-                    continue
-                # Enqueue so receive is not blocked by EV / REST work.
-                try:
-                    self._queue.put_nowait(msg)
-                except asyncio.QueueFull:
-                    await self._queue.put(msg)
+        close_code: Optional[int] = None
+        try:
+            async with opener(url) as ws:
+                self._ws = ws
+                self.connected = True
+                self._session_started_at = time.time()
+                self.last_error = None
+                self.last_close_code = None
+                async for raw in ws:
+                    if not self._running:
+                        break
+                    try:
+                        if isinstance(raw, bytes):
+                            raw = raw.decode("utf-8")
+                        msg = json.loads(raw)
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        continue
+                    if not isinstance(msg, dict):
+                        continue
+                    # Enqueue so receive is not blocked by EV / REST work.
+                    try:
+                        self._queue.put_nowait(msg)
+                    except asyncio.QueueFull:
+                        await self._queue.put(msg)
+                close_code = ws_close_code(ws)
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:
+            close_code = ws_close_code(ex) or close_code
+            raise
+        finally:
             self._ws = None
+            if close_code is not None:
+                self.last_close_code = close_code
 
 
 _shared_feed: Optional[OddsApiWsFeed] = None
 _shared_feed_lock = asyncio.Lock()
+_recovery_lock: Optional[asyncio.Lock] = None
+
+
+def _get_recovery_lock() -> asyncio.Lock:
+    """Process-wide single-flight for REST recovery (monitors + dashboard)."""
+    global _recovery_lock
+    if _recovery_lock is None:
+        _recovery_lock = asyncio.Lock()
+    return _recovery_lock
 
 
 async def get_shared_odds_ws_feed() -> Optional[OddsApiWsFeed]:
@@ -1070,6 +1251,14 @@ def odds_docs_from_ws(event_ids: Sequence[int]) -> Optional[List[Dict[str, Any]]
     return feed.store.merged_docs(event_ids)
 
 
+def _updated_since_window_sec() -> int:
+    since_env = os.getenv("ODDS_API_UPDATED_SINCE_SEC", "60")
+    try:
+        return max(5, min(90, int(since_env)))
+    except ValueError:
+        return 60
+
+
 async def resolve_odds_docs(
     rest_client: Any,
     event_ids: Sequence[int],
@@ -1079,7 +1268,12 @@ async def resolve_odds_docs(
 ) -> Tuple[List[Dict[str, Any]], str]:
     """
     WS-first odds fetch. Returns ``(docs, source)`` where source is
-    ``websocket`` | ``rest_updated`` | ``rest_multi``.
+    ``websocket`` | ``rest_updated`` | ``rest_multi`` | ``unavailable``.
+
+    When the WebSocket is enabled but down, recovery is single-flight REST
+    ``/odds/updated`` with cooldown. Rate limits and cooldown fail closed
+    (empty docs) instead of serving stale store lines or hammering
+    ``/odds/multi``.
     """
     ids = [int(x) for x in event_ids]
     ws_docs = odds_docs_from_ws(ids)
@@ -1088,20 +1282,26 @@ async def resolve_odds_docs(
 
     books = list(bookmakers) if bookmakers else odds_api_master_bookmakers()
     feed = peek_shared_odds_ws_feed()
-    # REST fallback: /odds/updated when we have a recent store clock, else /odds/multi.
-    since_env = os.getenv("ODDS_API_UPDATED_SINCE_SEC", "60")
-    try:
-        since_window = max(5, min(90, int(since_env)))
-    except ValueError:
-        since_window = 60
-    if feed is not None and feed.store.event_meta and _env_bool("ODDS_API_REST_UPDATED_FALLBACK", "true"):
-        since = int(time.time()) - since_window
-        try:
-            n = await feed.rest_updated_fallback(since, books)
+
+    if odds_api_ws_wanted():
+        async with _get_recovery_lock():
+            ws_docs = odds_docs_from_ws(ids)
+            if ws_docs is not None:
+                return ws_docs, "websocket"
+            feed = peek_shared_odds_ws_feed()
+            if feed is None or not feed.should_attempt_rest_fallback():
+                return [], "unavailable"
+            since = int(time.time()) - _updated_since_window_sec()
+            try:
+                n = await feed.rest_updated_fallback(since, books)
+            except Exception as ex:
+                print(f"[ODDS-API WS] [WARN] updated fallback failed: {ex}")
+                if is_odds_api_rate_limit_error(ex):
+                    feed._arm_fallback_cooldown(rate_limited=True)
+                return [], "unavailable"
             if n > 0:
                 return feed.store.merged_docs(ids), "rest_updated"
-        except Exception as ex:
-            print(f"[ODDS-API WS] [WARN] updated fallback failed: {ex}")
+            return [], "unavailable"
 
     docs = await rest_client.get_odds_multi(ids, books, odds_cache_ttl=odds_cache_ttl)
     if feed is not None:
