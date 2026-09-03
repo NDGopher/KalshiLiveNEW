@@ -517,6 +517,28 @@ def is_live_plive_row(row: Any) -> bool:
     return True
 
 
+def is_live_plive_side(row: Any, side: str) -> bool:
+    """Live Pandora price for this exact side. Draw needs the 1X2 market, not market-3 ML."""
+    if not is_live_plive_row(row):
+        return False
+    key = {
+        "home": "home",
+        "away": "away",
+        "draw": "draw",
+        "over": "over",
+        "under": "under",
+    }.get(str(side or "").strip().lower())
+    if not key:
+        return False
+    if key == "draw" and row.get("plive_draw_market") is None:
+        return False
+    try:
+        dec = float(row.get(key))
+    except (TypeError, ValueError):
+        return False
+    return dec > 1.0
+
+
 def _market_is_live_plive(market: Any) -> bool:
     if not isinstance(market, dict):
         return False

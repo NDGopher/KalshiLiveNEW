@@ -25,6 +25,7 @@ from plive_pandora import (
     PlivePandoraFeed,
     PliveStore,
     is_live_plive_row,
+    is_live_plive_side,
     merge_plive_into_docs,
     merge_plive_market_lists,
     parse_soccer_1x2_outcome,
@@ -192,6 +193,223 @@ def test_kortrijk_draw_live_311_not_kalshi_400():
     assert _am(row["draw"]) == 311
     assert _am(row["draw"]) != 400
     assert row.get("plive_draw_market") == 1
+
+
+def _hearts_draw_vb(kalshi_am: int = 335) -> dict:
+    kalshi = american_to_decimal(kalshi_am)
+    return {
+        "event": {
+            "home": "Hibernian FC",
+            "away": "Heart of Midlothian FC",
+            "league": "Scotland Premiership",
+            "sport": {"slug": "football"},
+        },
+        "market": {"name": "ML", "home": 1.85, "draw": kalshi, "away": 4.2},
+        "betSide": "draw",
+        "bookmakerOdds": {
+            "draw": kalshi,
+            "home": 1.85,
+            "away": 4.2,
+            "href": "https://kalshi.com/markets/KXTEST-HEARTS-DRAW",
+        },
+        "_live_broad_scan": True,
+        "_ev_source": "live_event_scan",
+        "_canonical_kalshi_row": {"home": 1.85, "draw": kalshi, "away": 4.2},
+    }
+
+
+def _hearts_books(*, kalshi_am: int = 335, plive_draw=None, live: bool = False) -> dict:
+    kalshi = american_to_decimal(kalshi_am)
+    pack = american_to_decimal(240)
+    plive_row = {"home": 1.85, "away": 4.2, "draw": kalshi}
+    if plive_draw is not None:
+        plive_row["draw"] = (
+            plive_draw if isinstance(plive_draw, float) else american_to_decimal(int(plive_draw))
+        )
+    if live:
+        plive_row.update(
+            {
+                "plive_live": True,
+                "plive_market": 1,
+                "plive_draw_market": 1,
+                "market_type": "game_winner",
+            }
+        )
+    return {
+        "home": "Hibernian FC",
+        "away": "Heart of Midlothian FC",
+        "sport": {"slug": "football"},
+        "league": {"name": "Scotland Premiership"},
+        "live": True,
+        "bookmakers": {
+            "Kalshi": [{"name": "ML", "odds": [{"home": 1.85, "draw": kalshi, "away": 4.2}]}],
+            "PLive": [{"name": "ML", "odds": [plive_row]}],
+            "Betfair Exchange": [{"name": "ML", "odds": [{"home": 1.80, "draw": pack, "away": 4.4}]}],
+            "Bet365": [{"name": "ML", "odds": [{"home": 1.82, "draw": pack, "away": 4.3}]}],
+            "FanDuel": [{"name": "ML", "odds": [{"home": 1.84, "draw": pack, "away": 4.2}]}],
+        },
+    }
+
+
+def test_hearts_draw_32_kalshi_335_is_take_not_copied_plive():
+    """Primary: Hearts 32' 0-1. Two filters painted PLive-take +335. Real PLive +270.
+
+    Kalshi +335 is the take if +EV. PLive is a comparison book at +270, not the take.
+    Soccer Live must not invent a PLive-take from Kalshi.
+    """
+    mon = _gameline_mon()
+    vb = _hearts_draw_vb(335)
+    copied = _hearts_books(kalshi_am=335, plive_draw=335, live=False)
+    assert mon._value_bet_to_normalized_bet(vb, copied, take_book="PLive") is None
+    kalshi_copied = mon._value_bet_to_normalized_bet(vb, copied, take_book="Kalshi")
+    if kalshi_copied is not None:
+        assert kalshi_copied["take_book"] == "Kalshi"
+        assert int(kalshi_copied["odds"]) == 335
+        tiles = [t["book"] for t in kalshi_copied["displayBooks"][kalshi_copied["selection"]]]
+        assert "PLive" not in tiles
+
+    live_270 = _hearts_books(kalshi_am=335, plive_draw=270, live=True)
+    plive = mon._value_bet_to_normalized_bet(vb, live_270, take_book="PLive")
+    kalshi_card = mon._value_bet_to_normalized_bet(vb, live_270, take_book="Kalshi")
+    if plive is not None:
+        assert int(plive["odds"]) == 270
+        assert int(plive["odds"]) != 335
+        assert plive["take_book"] == "PLive"
+    if kalshi_card is not None:
+        assert kalshi_card["take_book"] == "Kalshi"
+        assert int(kalshi_card["odds"]) == 335
+        plive_tile = [
+            t for t in kalshi_card["displayBooks"][kalshi_card["selection"]] if t["book"] == "PLive"
+        ]
+        assert plive_tile and int(plive_tile[0]["odds"]) == 270
+        assert int(plive_tile[0]["odds"]) != 335
+
+    painted = _build_display_books_payload(
+        "Draw",
+        live_270["bookmakers"],
+        "ML",
+        "draw",
+        ["Kalshi", "PLive", "FanDuel"],
+        335,
+        {"draw": american_to_decimal(335)},
+        take_book="Kalshi",
+    )
+    plive_tile = [r for r in painted["Draw"] if r["book"] == "PLive"]
+    assert plive_tile and int(plive_tile[0]["odds"]) == 270
+    assert int(plive_tile[0]["odds"]) != 335
+
+
+def test_celta_draw_plive_249_vs_kalshi_317():
+    """Celta 9' 0-0: PLive tile +317 was Kalshi. Real PLive Draw is +249."""
+    mon = _gameline_mon()
+    kalshi = american_to_decimal(317)
+    live = american_to_decimal(249)
+    vb = {
+        "event": {
+            "home": "Celta de Vigo",
+            "away": "Getafe CF",
+            "league": "Spain La Liga",
+            "sport": {"slug": "football"},
+        },
+        "market": {"name": "ML", "home": 1.9, "draw": kalshi, "away": 4.0},
+        "betSide": "draw",
+        "bookmakerOdds": {"draw": kalshi, "home": 1.9, "away": 4.0, "href": "https://kalshi.com/x"},
+        "_live_broad_scan": True,
+        "_ev_source": "live_event_scan",
+        "_canonical_kalshi_row": {"home": 1.9, "draw": kalshi, "away": 4.0},
+    }
+    overlay = {
+        "home": "Celta de Vigo",
+        "away": "Getafe CF",
+        "sport": {"slug": "football"},
+        "bookmakers": {
+            "Kalshi": [{"name": "ML", "odds": [{"home": 1.9, "draw": kalshi, "away": 4.0}]}],
+            "PLive": [{"name": "ML", "odds": [{"home": 1.9, "draw": kalshi, "away": 4.0}]}],
+            "Betfair Exchange": [{"name": "ML", "odds": [{"home": 1.85, "draw": american_to_decimal(230), "away": 4.2}]}],
+            "Bet365": [{"name": "ML", "odds": [{"home": 1.88, "draw": american_to_decimal(230), "away": 4.1}]}],
+            "FanDuel": [{"name": "ML", "odds": [{"home": 1.90, "draw": american_to_decimal(230), "away": 4.0}]}],
+        },
+    }
+    assert mon._value_bet_to_normalized_bet(vb, overlay, take_book="PLive") is None
+    live_row = {
+        "home": 1.85,
+        "away": 4.20,
+        "draw": live,
+        "plive_market": 1,
+        "plive_draw_market": 1,
+        "plive_live": True,
+        "market_type": "game_winner",
+    }
+    live_doc = {
+        **overlay,
+        "bookmakers": {**overlay["bookmakers"], "PLive": [{"name": "ML", "odds": [live_row]}]},
+    }
+    plive = mon._value_bet_to_normalized_bet(vb, live_doc, take_book="PLive")
+    if plive is not None:
+        assert int(plive["odds"]) == 249
+        assert int(plive["odds"]) != 317
+    painted = _build_display_books_payload(
+        "Draw",
+        live_doc["bookmakers"],
+        "ML",
+        "draw",
+        ["Kalshi", "PLive", "FanDuel"],
+        317,
+        {"draw": kalshi},
+        take_book="Kalshi",
+    )
+    plive_tile = [r for r in painted["Draw"] if r["book"] == "PLive"]
+    assert plive_tile and int(plive_tile[0]["odds"]) == 249
+    assert int(plive_tile[0]["odds"]) != 317
+
+
+def test_live_ml_without_1x2_draw_does_not_invent_plive_take():
+    """Market-3 home/away is live. That is not a PLive Draw take. Kalshi Draw can still print."""
+    mon = _gameline_mon()
+    vb = _hearts_draw_vb(335)
+    doc = _hearts_books(kalshi_am=335, plive_draw=335, live=False)
+    doc["bookmakers"]["PLive"] = [
+        {
+            "name": "ML",
+            "odds": [
+                {
+                    "home": 1.40,
+                    "away": 8.00,
+                    "draw": american_to_decimal(335),
+                    "plive_live": True,
+                    "plive_market": 3,
+                    "market_type": "game_winner",
+                }
+            ],
+        }
+    ]
+    assert is_live_plive_row(doc["bookmakers"]["PLive"][0]["odds"][0])
+    assert not is_live_plive_side(doc["bookmakers"]["PLive"][0]["odds"][0], "draw")
+    assert mon._value_bet_to_normalized_bet(vb, doc, take_book="PLive") is None
+    painted = _build_display_books_payload(
+        "Draw",
+        doc["bookmakers"],
+        "ML",
+        "draw",
+        ["Kalshi", "PLive"],
+        335,
+        {"draw": american_to_decimal(335)},
+        take_book="Kalshi",
+    )
+    assert all(r["book"] != "PLive" for r in painted["Draw"])
+
+
+def test_hearts_draw_store_is_270_not_335():
+    store = _kortrijk_store(draw_am=270)
+    store.apply_meta(
+        "2201001",
+        {"sportId": 5, "home": "Hibernian FC", "away": "Heart of Midlothian FC", "ip": True},
+    )
+    ml = next(m for m in store.markets_for_event("2201001") if m["name"] == "ML")
+    row = ml["odds"][0]
+    assert is_live_plive_side(row, "draw")
+    assert _am(row["draw"]) == 270
+    assert _am(row["draw"]) != 335
 
 
 def test_hearts_draw_does_not_copy_kalshi_317():
@@ -674,6 +892,33 @@ def test_both_takes_print_when_prices_differ():
     assert int(kalshi["odds"]) != int(plive["odds"])
 
 
+def test_hearts_two_filters_one_kalshi_take_no_cloned_plive():
+    from dashboard import (
+        DEFAULT_FILTER_NAME,
+        SOCCER_FILTER_NAME,
+        dedupe_listed_alert_rows,
+    )
+
+    kalshi_base = {
+        "teams": "Heart of Midlothian FC @ Hibernian FC",
+        "market_type": "Moneyline",
+        "pick": "Draw",
+        "qualifier": None,
+        "line": None,
+        "take_book": "Kalshi",
+        "match_failed": False,
+        "ticker": "KXTEST-HEARTS-DRAW",
+        "odds": 335,
+    }
+    soccer = {**kalshi_base, "id": "s", "ev_percent": 10.46, "filter_name": SOCCER_FILTER_NAME}
+    allsports = {**kalshi_base, "id": "a", "ev_percent": 9.53, "filter_name": DEFAULT_FILTER_NAME}
+    visible = dedupe_listed_alert_rows([soccer, allsports])
+    assert len(visible) == 1
+    assert visible[0]["take_book"] == "Kalshi"
+    assert visible[0]["odds"] == 335
+    assert visible[0]["filter_name"] == DEFAULT_FILTER_NAME
+
+
 def test_leuven_two_filters_one_card_per_take():
     from dashboard import (
         DEFAULT_FILTER_NAME,
@@ -753,21 +998,32 @@ def test_create_alert_id_ignores_filter_name():
 
     common = {
         "market": "Moneyline",
-        "teams": "Oud-Heverlee Leuven @ KAA Gent",
+        "teams": "Heart of Midlothian FC @ Hibernian FC",
         "selection": "Draw",
         "line": None,
-        "odds": 285,
-        "ev": 0.96,
+        "odds": 335,
+        "ev": 9.53,
         "limit": 0,
-        "ticker": "PLIVE|leuven|Draw|None",
-        "take_book": "PLive",
-        "ev_source": "plive_take",
+        "ticker": "KXTEST-HEARTS-DRAW",
+        "take_book": "Kalshi",
+        "ev_source": "odds_api_value_bets",
     }
     a = EvAlert(common)
     a.filter_name = "Soccer Live (2 Sharps)"
-    b = EvAlert({**common, "ev": 0.46})
+    b = EvAlert({**common, "ev": 4.20, "ev_source": "live_event_scan"})
     b.filter_name = "Kalshi All Sports (3 Sharps Live)"
     assert create_alert_id(a) == create_alert_id(b)
-    c = EvAlert({**common, "take_book": "Kalshi", "ticker": "KXTEST", "ev_source": "live_event_scan"})
-    c.filter_name = a.filter_name
-    assert create_alert_id(a) != create_alert_id(c)
+    cloned_plive = EvAlert(
+        {**common, "take_book": "PLive", "ticker": "PLIVE|Hearts|Draw|None", "ev_source": "plive_take"}
+    )
+    cloned_plive.filter_name = a.filter_name
+    assert create_alert_id(a) != create_alert_id(cloned_plive)
+    soccer_plive = EvAlert(
+        {**common, "take_book": "PLive", "ticker": "PLIVE|Hearts|Draw|None", "ev": 10.46}
+    )
+    soccer_plive.filter_name = "Soccer Live (2 Sharps)"
+    allsports_plive = EvAlert(
+        {**common, "take_book": "PLive", "ticker": "PLIVE|Hearts|Draw|None", "ev": 9.53}
+    )
+    allsports_plive.filter_name = "Kalshi All Sports (3 Sharps Live)"
+    assert create_alert_id(soccer_plive) == create_alert_id(allsports_plive)

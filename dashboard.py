@@ -2319,12 +2319,10 @@ def create_alert_id(alert: EvAlert) -> str:
     import hashlib
     # One card per event+market+side+line+take. Two dashboard filters must
     # not print two EVs for the same take. Kalshi and PLive stay separate.
-    ev_source = getattr(alert, "ev_source", "") or "odds_api_value_bets"
+    # Do not hash ev_source: live scan vs value-bets is the same take.
     take_book = getattr(alert, "take_book", "") or "Kalshi"
-    # Same edge from API feed vs local scan must not collide; keep legacy IDs for default feed.
-    src_part = f"|{ev_source}" if ev_source != "odds_api_value_bets" else ""
     take_part = f"|{take_book}" if str(take_book).lower() != "kalshi" else ""
-    key = f"{alert.ticker}|{alert.pick}|{alert.qualifier}|{alert.market_type}{src_part}{take_part}"
+    key = f"{alert.ticker}|{alert.pick}|{alert.qualifier}|{alert.market_type}{take_part}"
     # Use MD5 hash and take first 10 digits for consistent ID
     hash_obj = hashlib.md5(key.encode('utf-8'))
     hash_hex = hash_obj.hexdigest()
