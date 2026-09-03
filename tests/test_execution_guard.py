@@ -333,6 +333,7 @@ def test_dashboard_and_client_wire_the_guard():
     assert "expected_price_cents or 50" not in dash
     assert "attempting fallback matching for manual bet" not in dash
     assert "public_ok=True" in client
+    assert client.count('_headers_for("GET", path, public_ok=True)') >= 5
     assert "Kalshi credentials required to place orders" in client
     assert "function canPlaceKalshiBet" in js
     assert "canPlaceKalshiBet(alert)" in js
