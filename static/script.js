@@ -645,7 +645,7 @@ function isCardTakeBook(bookName, alert) {
 
 function parseAmericanOddsValue(value) {
     if (value == null || value === '' || value === 'N/A') return null;
-    const n = parseInt(String(value).replace(/[+]/g, ''), 10);
+    const n = parseInt(String(value).replace(/[+]/g, '').replace(/[−–—]/g, '-'), 10);
     if (!Number.isFinite(n) || n === 0) return null;
     return n;
 }
@@ -709,32 +709,22 @@ function orderBooksTakeFirst(books, alert) {
 
 /**
  * Tile paint lock: take=green (left), on-pack strictly better=red, worse=unshaded.
- * Skip: empty, real sign-flip, or better-and-off-pack (|implied-take|>10c).
- * Worse recs always paint (even if >10c). Poly on-pack better is red.
+ * Skip (omit, do not gray) when isJunkVsKalshi: |implied-take|>10c OR real sign-flip.
+ * Any book (Poly, NV, BF, …). Pick'em +113 vs −110 is not junk and still paints.
  * Green is the betting book (Kalshi or PLive), not the best price.
  */
 function tilePaintState(bookName, bookOdds, alert, takeAm) {
     if (!bookTileHasLine(bookOdds)) {
         return { skip: true, take: false, better: false };
     }
-    if (takeAm != null && isOppositeSideVsTake(bookOdds, takeAm)) {
-        return { skip: true, take: false, better: false };
-    }
-    if (
-        takeAm != null
-        && isPolymarketBook(bookName)
-        && !isCardTakeBook(bookName, alert)
-        && isJunkVsKalshi(bookOdds, takeAm)
-    ) {
-        return { skip: true, take: false, better: false };
-    }
     const take = isCardTakeBook(bookName, alert);
-    const strictlyBetter = !take && takeAm != null && bookAmericanIsBetter(bookOdds, takeAm);
-    const junk = takeAm != null && isJunkVsKalshi(bookOdds, takeAm);
-    if (!take && strictlyBetter && junk) {
+    const bookAm = parseAmericanOddsValue(bookOdds);
+    const takeN = takeAm == null ? null : parseAmericanOddsValue(takeAm);
+    if (!take && takeN != null && bookAm != null && isJunkVsKalshi(bookAm, takeN)) {
         return { skip: true, take: false, better: false };
     }
-    return { skip: false, take: take, better: strictlyBetter && !junk };
+    const strictlyBetter = !take && takeN != null && bookAm != null && bookAmericanIsBetter(bookAm, takeN);
+    return { skip: false, take: take, better: strictlyBetter };
 }
 
 function parseFreshnessTs(value) {
@@ -856,7 +846,7 @@ function createAlertCard(alert) {
                     return;
                 }
                 const paint = tilePaintState(bookName, bookOdds, alert, takeAm);
-                // Opposite-side junk (Poly +170 vs a minus take): do not render.
+                // Junk vs take: omit the tile (not gray). Poly −455 vs +163 is both 10c and sign-flip.
                 if (paint.skip) {
                     return;
                 }

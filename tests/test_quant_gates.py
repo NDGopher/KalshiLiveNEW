@@ -217,8 +217,11 @@ def test_keep_royals_plus163_two_way():
         take_book="Kalshi",
     )
     assert "Poly" not in out["fair_names"]
+    assert "PLive" not in out["fair_names"]
     assert out["plus_alert"] is True
     assert 4.0 <= out["ev_percent"] <= 14.0
+    # Rec pack (Better +134 / DK +105 / FD +116 / 365 +100 / CZ +110) ≈ +9.59%.
+    assert abs(out["ev_percent"] - 9.59) < 1.5
 
 
 def test_keep_twins_plus203_band():

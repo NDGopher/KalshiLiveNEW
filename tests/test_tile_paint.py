@@ -47,20 +47,38 @@ const twinsBooks = [
 const twinsTake = takeAmericanFromAlert(twinsAlert, twinsBooks);
 const twins = {};
 for (const b of twinsBooks) twins[b.book] = tilePaintState(b.book, b.odds, twinsAlert, twinsTake);
+const royalsAlert = { take_book: 'Kalshi', book_price: 163 };
+const royalsBooks = [
+  {book:'Kalshi', odds:163},
+  {book:'Betfair Exchange', odds:134},
+  {book:'DraftKings', odds:105},
+  {book:'FanDuel', odds:116},
+  {book:'Bet365', odds:100},
+  {book:'Caesars', odds:110},
+  {book:'PLive', odds:118},
+  {book:'Polymarket', odds:-455},
+];
+const royalsTake = takeAmericanFromAlert(royalsAlert, royalsBooks);
+const royals = {};
+for (const b of royalsBooks) royals[b.book] = tilePaintState(b.book, b.odds, royalsAlert, royalsTake);
 console.log(JSON.stringify({
   tigersTake, tigers, tigersOrder: orderBooksTakeFirst(tigersBooks, tigersAlert).map(b=>b.book),
   twinsTake, twins, twinsOrder: orderBooksTakeFirst(twinsBooks, twinsAlert).map(b=>b.book),
+  royalsTake, royals,
   noFallbackKalshi: isCardTakeBook('Kalshi', {take_book:'PLive'}),
   missingTakeDoesNotGreenKalshi: isCardTakeBook('Kalshi', {}),
   kalshiTakeGreensKalshi: isCardTakeBook('Kalshi', {take_book:'Kalshi'}),
   oppSkip: tilePaintState('Polymarket', 170, {take_book:'PLive'}, -285).skip,
   junkSignFlipSkip: tilePaintState('Pinnacle', -455, {take_book:'Kalshi'}, 163).skip,
-  nvWorseNotSkipped: tilePaintState('NoVig', 178, {take_book:'PLive'}, 306),
-  junk10cDoesNotSkipWorse: isJunkVsKalshi(178, 306) === true
-    && tilePaintState('NoVig', 178, {take_book:'PLive'}, 306).skip === false,
+  nvWorseJunkSkip: tilePaintState('NoVig', 178, {take_book:'PLive'}, 306),
+  junk10cSkipsWorse: isJunkVsKalshi(178, 306) === true
+    && tilePaintState('NoVig', 178, {take_book:'PLive'}, 306).skip === true,
   onPackPolyPaints: tilePaintState('Polymarket', 158, {take_book:'Kalshi'}, 163),
   junkPoly455Skip: tilePaintState('Polymarket', -455, {take_book:'Kalshi'}, 163).skip,
+  junkPolyUnicodeSkip: tilePaintState('Polymarket', '−455', {take_book:'Kalshi'}, 163).skip,
   junkPoly178Skip: tilePaintState('Polymarket', -178, {take_book:'Kalshi'}, -104).skip,
+  pickemNotJunk: isJunkVsKalshi(-110, 113) === false
+    && tilePaintState('FanDuel', -110, {take_book:'Kalshi'}, 113).skip === false,
   polyOnPackRed: tilePaintState('Polymarket', 335, {take_book:'PLive'}, 306),
   polyJunkSkip: tilePaintState('Polymarket', -455, {take_book:'Kalshi'}, 163),
   bfJunkSkip: tilePaintState('Betfair Exchange', 567, {take_book:'Kalshi'}, 163),
@@ -113,17 +131,36 @@ def test_twins_plive_paint_poly_on_pack_red():
     assert tw["Polymarket"] == {"skip": False, "take": False, "better": True}
     assert tw["DraftKings"] == {"skip": False, "take": False, "better": False}
     assert tw["FanDuel"] == {"skip": False, "take": False, "better": False}
-    assert tw["NoVig"] == {"skip": False, "take": False, "better": False}
+    assert tw["NoVig"] == {"skip": True, "take": False, "better": False}
     assert data["twinsOrder"][0] == "PLive"
-    assert data["nvWorseNotSkipped"] == {"skip": False, "take": False, "better": False}
-    assert data["junk10cDoesNotSkipWorse"] is True
+    assert data["nvWorseJunkSkip"] == {"skip": True, "take": False, "better": False}
+    assert data["junk10cSkipsWorse"] is True
     assert data["onPackPolyPaints"] == {"skip": False, "take": False, "better": False}
     assert data["junkPoly455Skip"] is True
+    assert data["junkPolyUnicodeSkip"] is True
     assert data["junkPoly178Skip"] is True
+    assert data["pickemNotJunk"] is True
     assert data["polyOnPackRed"] == {"skip": False, "take": False, "better": True}
     assert data["polyJunkSkip"]["skip"] is True
     assert data["bfJunkSkip"]["skip"] is True
     assert data["liqEmpty"] == "-"
+
+
+def test_royals_poly_minus455_skip_paint_not_gray():
+    """Royals ML +163: Poly −455 is junk (44c + sign-flip). Omit the tile. Keep rec-pack POWER."""
+    data = _eval_paint()
+    if data is None:
+        pytest.skip("node not available")
+    r = data["royals"]
+    assert data["royalsTake"] == 163
+    assert r["Kalshi"] == {"skip": False, "take": True, "better": False}
+    assert r["Polymarket"] == {"skip": True, "take": False, "better": False}
+    assert r["PLive"] == {"skip": False, "take": False, "better": False}
+    assert r["Betfair Exchange"] == {"skip": False, "take": False, "better": False}
+    assert r["DraftKings"] == {"skip": False, "take": False, "better": False}
+    assert r["FanDuel"] == {"skip": False, "take": False, "better": False}
+    assert r["Bet365"] == {"skip": False, "take": False, "better": False}
+    assert r["Caesars"] == {"skip": False, "take": False, "better": False}
 
 
 def test_worse_css_full_opacity():

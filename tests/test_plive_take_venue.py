@@ -342,6 +342,36 @@ def test_on_pack_poly_in_devig_and_display():
     assert any("poly" in n.lower() for n in tiles)
 
 
+def test_royals_ml_plus163_omits_junk_poly_keeps_plive_tile():
+    """Screenshot board: Poly −455 omitted. PLive +118 on-pack paints. Rec pack stays."""
+    take_am = 163
+    opp = american_to_decimal(-180)
+    payload = _build_display_books_payload(
+        "Royals",
+        {
+            "Betfair Exchange": [{"name": "ML", "odds": [{"home": american_to_decimal(134), "away": opp}]}],
+            "DraftKings": [{"name": "ML", "odds": [{"home": american_to_decimal(105), "away": opp}]}],
+            "FanDuel": [{"name": "ML", "odds": [{"home": american_to_decimal(116), "away": opp}]}],
+            "Bet365": [{"name": "ML", "odds": [{"home": american_to_decimal(100), "away": opp}]}],
+            "Caesars": [{"name": "ML", "odds": [{"home": american_to_decimal(110), "away": opp}]}],
+            "PLive": [{"name": "ML", "odds": [{"home": american_to_decimal(118), "away": opp}]}],
+            "Polymarket": [{"name": "ML", "odds": [{"home": american_to_decimal(-455), "away": opp}]}],
+            "Pinnacle": [{"name": "ML", "odds": [{"home": american_to_decimal(-455), "away": opp}]}],
+        },
+        "ML",
+        "home",
+        ["Kalshi", "Betfair Exchange", "DraftKings", "FanDuel", "Bet365", "Caesars", "PLive", "Polymarket", "Pinnacle"],
+        take_am,
+        {},
+        take_book="Kalshi",
+    )
+    names = [r["book"] for r in payload["Royals"]]
+    assert all("poly" not in n.lower() for n in names)
+    assert all("pinnacle" not in n.lower() for n in names)
+    assert any(n == "PLive" for n in names)
+    assert any("fair" in n.lower() or n == "Betfair Exchange" for n in names)
+
+
 def test_junk_poly_minus455_vs_plus163_no_tile_no_power():
     mon = _gameline_monitor()
     take = american_to_decimal(317)

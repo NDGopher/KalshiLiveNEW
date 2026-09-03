@@ -249,7 +249,7 @@ def is_junk_vs_kalshi(
     *,
     gap: float = JUNK_VS_KALSHI_CENTS,
 ) -> bool:
-    """Display and fair share this test. True → gray tile and drop from POWER/AVERAGE.
+    """Display and fair share this test. True → skip-paint (not gray) and drop from POWER.
 
     Junk if |implied − take implied| > 10 cents, or a real (sided) sign flip.
     Pick'em plus/minus around 50% (+113 vs −110) is not junk.
@@ -496,8 +496,8 @@ def filter_sharp_panel(
     """Drop unmatched, incomplete, spiked, off-market, and sign-flipped quotes.
 
     Each book is ``{name, american, decimal_pick, decimal_opp, match_failed?}``.
-    Junk screening is name-agnostic so a PLive tile can still render (gray if
-    junk, red if better and inside 10c). PLive is stripped later from fair.
+    Junk screening is name-agnostic: junk is omitted from the tile (not grayed).
+    On-pack better stays red. PLive is stripped later from fair.
 
     When ``kalshi_american`` is set, egregious quotes use ``is_junk_vs_kalshi``
     (10c from take or a real sign flip) — not a global median.

@@ -1234,8 +1234,8 @@ def _build_display_books_payload(
         d = _decimal_for_side(row, bet_side)
         if d and d > 1.0:
             am = decimal_to_american(float(d))
-            # Junk Poly: skip the tile (not gray). On-pack Poly may paint.
-            if is_polymarket_book(nm) and is_junk_vs_kalshi(am, int(kalshi_am)):
+            # Junk vs take: skip the tile (not gray). Any book, including Poly.
+            if is_junk_vs_kalshi(am, int(kalshi_am)):
                 continue
             canon = _norm_book(str(nm))
             blob: Dict[str, Any] = {
