@@ -709,13 +709,22 @@ function orderBooksTakeFirst(books, alert) {
 
 /**
  * Tile paint lock: take=green (left), same-side strictly better=red, worse=unshaded.
- * Skip only empty tiles or sign-flip junk. Never skip a worse rec.
+ * Skip empty tiles or sign-flip junk. Never skip a worse rec — except junk Poly
+ * (10c or sign-flip), which skip-paints instead of going gray.
  */
 function tilePaintState(bookName, bookOdds, alert, takeAm) {
     if (!bookTileHasLine(bookOdds)) {
         return { skip: true, take: false, better: false };
     }
     if (takeAm != null && isOppositeSideVsTake(bookOdds, takeAm)) {
+        return { skip: true, take: false, better: false };
+    }
+    if (
+        takeAm != null
+        && isPolymarketBook(bookName)
+        && !isCardTakeBook(bookName, alert)
+        && isJunkVsKalshi(bookOdds, takeAm)
+    ) {
         return { skip: true, take: false, better: false };
     }
     const take = isCardTakeBook(bookName, alert);

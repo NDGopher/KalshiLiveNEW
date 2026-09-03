@@ -1770,7 +1770,7 @@ def _is_plive_take_alert(alert: EvAlert) -> bool:
 
 
 async def handle_plive_take_display_alert(alert: EvAlert) -> None:
-    """PLive take card: display-only. No Kalshi match. No auto-bet. Same min-EV hide."""
+    """PLive take card: same keep/kill as Kalshi. No Kalshi ticker match. No auto-bet."""
     global active_alerts, dashboard_min_ev, selected_dashboard_filters
     filter_name = getattr(alert, "filter_name", "") or ""
     if filter_name and filter_name not in selected_dashboard_filters:
@@ -4376,7 +4376,7 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
             await cleanup_submarket()
             return
         if str(alert_data.get("take_book") or getattr(alert, "take_book", "") or "").lower() == "plive":
-            print(f"[AUTO-BET] SKIP: Alert {alert_id} - PLive take cards are display-only")
+            print(f"[AUTO-BET] SKIP: Alert {alert_id} - PLive take does not auto-bet on Kalshi")
             await cleanup_submarket()
             return
         

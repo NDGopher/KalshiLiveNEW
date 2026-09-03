@@ -19,6 +19,32 @@ from odds_ev_monitor import (
 from tests.test_sharp_panel_filter import _book
 
 
+def test_marlins_away_at_kc_paints_minus15_not_plus15():
+    """Marlins @ KC: home-centric hdp +1.5 → away Marlins is −1.5. Home Twins +2.5 stays."""
+    away_pick, away_qual, away_line = _pick_qualifier_line_for_side(
+        "Kansas City Royals",
+        "Miami Marlins",
+        "Spread",
+        "away",
+        {"hdp": 1.5, "home": 1.45, "away": 2.70},
+    )
+    assert away_pick == "Miami Marlins"
+    assert away_line == -1.5
+    assert away_qual == "-1.5"
+    twins_pick, twins_qual, twins_line = _pick_qualifier_line_for_side(
+        "Minnesota Twins",
+        "Milwaukee Brewers",
+        "Spread",
+        "home",
+        {"hdp": 2.5, "home": 1.45, "away": 2.70},
+    )
+    assert twins_pick == "Minnesota Twins"
+    assert twins_line == 2.5
+    assert twins_qual == "+2.5"
+    assert side_handicap(2.5, "home") == 2.5
+    assert side_handicap(1.5, "away") == -1.5
+
+
 def test_away_run_line_negates_home_hdp():
     """White Sox @ Astros: home hdp +1.5 → away Sox is −1.5, not painted +1.5."""
     pick, qual, line = _pick_qualifier_line_for_side(
@@ -143,6 +169,23 @@ def test_poly_minus178_vs_minus104_same_sign_junk_not_invert():
         min_sharp_books=3,
     )
     assert "Poly" not in out["fair_names"]
+
+
+def test_on_pack_poly_stays_in_power():
+    """On-pack Poly (+158 vs take +163) is a sharp — in POWER names."""
+    take = 163
+    books = [
+        _book("FD", 156),
+        _book("DK", 160),
+        _book("NV", 150),
+        _book("Polymarket", 158),
+    ]
+    assert is_junk_vs_kalshi(158, take) is False
+    surviving = filter_sharp_panel(books, kalshi_american=take)
+    assert "Polymarket" in {b["name"] for b in surviving}
+    out = evaluate_sharp_panel_ev(books, take, min_sharp_books=3)
+    assert any(is_polymarket_book(n) for n in out["fair_names"])
+    assert "Polymarket" in out["fair_names"]
 
 
 def test_spread_matcher_ignores_game_and_team_totals():

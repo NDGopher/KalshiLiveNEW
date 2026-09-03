@@ -21,7 +21,7 @@ const fs = require('fs');
 const src = fs.readFileSync('static/script.js','utf8');
 function escapeHtml(t){return String(t||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 eval(src.slice(src.indexOf('function normalizeBookKey'), src.indexOf('function bookMatchesDevigOrSharp')));
-const names = ['Bet365','Betfair Exchange','Betfair','BetMGM','Caesars','NoVig','Novig','Circa','Circa Sports','BookMaker','PLive'];
+const names = ['Bet365','Betfair Exchange','Betfair','BetMGM','Caesars','NoVig','Novig','Circa','Circa Sports','BookMaker','PLive','Polymarket','Poly'];
 const out = {};
 for (const n of names) {
   out[n] = {abbrev: uniqueBookAbbrev(n), paths: resolveBookLogoPaths(n)};
@@ -100,5 +100,8 @@ def test_resolver_runtime_unique_abbrevs():
     assert data["Caesars"]["paths"][0].endswith("Caesars.png")
     assert data["NoVig"]["paths"] == ["/logos/NV.png"]
     assert data["PLive"]["abbrev"] == "PLV"
+    assert data["Polymarket"]["abbrev"] == "PM"
+    assert data["Polymarket"]["abbrev"] != "PL"
+    assert data["Poly"]["abbrev"] != "PL"
     assert data["emptyCirca"] is True
     assert data["circaWithLine"] is True

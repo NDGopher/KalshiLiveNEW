@@ -19,15 +19,15 @@ Debug / multi-sharp:
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 # Fair probability above this on POWER devig uses AVERAGE implied instead (debug + three-method EV).
 _POWER_FAIR_CLIP_HI = 0.99
 _POWER_FAIR_CLIP_LO = 0.01
 
 # Sharp-panel screen (Kalshi All Sports POWER+AVERAGE). Junk uses the quote, not
-# the book name. PLive is never POWER/AVERAGE fair. Kalshi may be fair on a
-# PLive take card only.
+# the book name. PLive is never POWER/AVERAGE fair. Polymarket is a sharp when
+# on-pack; junk Poly is dropped. Kalshi may be fair on a PLive take card only.
 SHARP_ABS_AMERICAN_CAP = 1000
 SHARP_OUTLIER_IMPLIED_FLOOR = 0.08
 SHARP_OUTLIER_MAD_MULT = 2.5
@@ -46,6 +46,8 @@ SHARP_EGREGIOUS_GAP = JUNK_VS_KALSHI_CENTS
 # or when Kalshi is not best — never alone (KEEP Astros −133 vs NV −139 is ~1c).
 TIED_REC_CENTS = 0.015
 BETTER_BOOKS_KILL = 3
+# Hide the card when 2+ of {Betfair Exchange, Polymarket, Novig} beat the take.
+EXCHANGE_BETTER_KILL = 2
 MEDIAN_GATE_TOL = 0.005
 # Identity band. KEEP boards with ~8c of juice (57c vs 65c) must not match this.
 TIGHT_CLUSTER_BAND = 0.04
@@ -331,18 +333,27 @@ def is_novig_book(name: Any) -> bool:
     return key in {"novig", "nv"} or key.startswith("novig")
 
 
+def is_betfair_exchange_book(name: Any) -> bool:
+    """Betfair Exchange / BFX / BF. Not a lone 'BE' (too ambiguous)."""
+    key = _book_name_key(name)
+    return "betfair" in key or key in {"bfx", "bf"}
+
+
+def is_exchange_kill_book(name: Any) -> bool:
+    return (
+        is_betfair_exchange_book(name)
+        or is_polymarket_book(name)
+        or is_novig_book(name)
+    )
+
+
 def exclude_plive_from_fair(books: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [b for b in (books or []) if not is_plive_book(b.get("name"))]
 
 
 def exclude_from_fair(books: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """PLive and Polymarket never enter POWER/AVERAGE. No Poly sign-flip / invert."""
-    out: List[Dict[str, Any]] = []
-    for b in books or []:
-        if is_plive_book(b.get("name")) or is_polymarket_book(b.get("name")):
-            continue
-        out.append(b)
-    return out
+    """PLive never enters POWER/AVERAGE. On-pack Poly stays; junk is filtered earlier."""
+    return [b for b in (books or []) if not is_plive_book(b.get("name"))]
 
 
 def spread_keep_on_labeled_side(
@@ -373,11 +384,11 @@ def fair_books_excluding_take(
     books: List[Dict[str, Any]],
     take_book: str = "Kalshi",
 ) -> List[Dict[str, Any]]:
-    """Fair/devig set: never PLive, never Polymarket, never the take venue."""
+    """Fair/devig set: never PLive, never the take venue. Poly stays when on-pack."""
     take = _book_name_key(take_book or "Kalshi")
     out: List[Dict[str, Any]] = []
     for b in books or []:
-        if is_plive_book(b.get("name")) or is_polymarket_book(b.get("name")):
+        if is_plive_book(b.get("name")):
             continue
         if _book_name_key(b.get("name")) == take:
             continue
@@ -519,6 +530,63 @@ def count_better_than_kalshi(survivors: List[Dict[str, Any]], kalshi_american: i
     return n
 
 
+def is_exchange_comparable_vs_take(book_american: int, take_american: int) -> bool:
+    """Quotes that may count toward the 2-exchange hide.
+
+    Sign-flip and plus-money 10c+ gaps are junk (NV +317 / BF +567 vs +144).
+    Same-sign favorites that are strictly better still count even past 10c
+    (Astros −204 vs NV −130).
+    """
+    if is_real_sign_flip(book_american, take_american):
+        return False
+    if not is_junk_vs_kalshi(book_american, take_american):
+        return True
+    return int(book_american) < 0 and int(take_american) < 0
+
+
+def exchange_better_venues(
+    books: List[Dict[str, Any]],
+    take_american: int,
+) -> Set[str]:
+    """Distinct {betfair, polymarket, novig} that are strictly better after junk.
+
+    Reads the raw eligible board, not the 10c-trimmed POWER survivors, so a
+    much better favorite (NV −130 vs −204) still counts.
+    """
+    venues: Set[str] = set()
+    for book in _eligible_sharp_books(books):
+        try:
+            am = int(book.get("american"))
+        except (TypeError, ValueError):
+            continue
+        if not is_exchange_comparable_vs_take(am, int(take_american)):
+            continue
+        if not american_is_strictly_better(am, int(take_american)):
+            continue
+        if is_betfair_exchange_book(book.get("name")):
+            venues.add("betfair")
+        elif is_polymarket_book(book.get("name")):
+            venues.add("polymarket")
+        elif is_novig_book(book.get("name")):
+            venues.add("novig")
+    return venues
+
+
+def count_exchange_better_than_take(
+    survivors: List[Dict[str, Any]],
+    take_american: int,
+) -> int:
+    return len(exchange_better_venues(survivors, take_american))
+
+
+def exchange_better_kill(
+    survivors: List[Dict[str, Any]],
+    take_american: int,
+) -> bool:
+    """True when 2+ of {Betfair Exchange, Polymarket, Novig} beat the take."""
+    return count_exchange_better_than_take(survivors, take_american) >= EXCHANGE_BETTER_KILL
+
+
 def power_average_fair_prob(
     survivors: List[Dict[str, Any]],
     calc: Optional[EVCalculator] = None,
@@ -563,6 +631,7 @@ def apply_ev_hard_gates(
     *,
     used_fallback: bool = False,
     min_sharp_books: int = 3,
+    exchange_source: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Median / tight-cluster / 3-better / fallback gates. Math, not UI hide."""
     reasons: List[str] = []
@@ -620,6 +689,11 @@ def apply_ev_hard_gates(
         allow_plus = False
         reasons.append("nv_better")
 
+    if exchange_better_kill(exchange_source if exchange_source is not None else survivors, kalshi_american):
+        ev = min(ev, 0.0)
+        allow_plus = False
+        reasons.append("exchange_better")
+
     # tied_rec never fires alone. KEEP Astros −133 vs NV −139 is ~1c and Kalshi is best.
     tied_gap = nearest_non_junk_implied_gap(survivors, kalshi_american)
     tied_rec = tied_gap is not None and tied_gap <= TIED_REC_CENTS + 1e-12
@@ -668,11 +742,21 @@ def evaluate_sharp_panel_ev(
     ev = 0.0
     if used_fallback:
         gated = apply_ev_hard_gates(
-            0.0, kalshi_american, fair_eligible, used_fallback=True, min_sharp_books=min_sharp_books
+            0.0,
+            kalshi_american,
+            fair_eligible,
+            used_fallback=True,
+            min_sharp_books=min_sharp_books,
+            exchange_source=books,
         )
     elif len(fair_eligible) < int(min_sharp_books):
         gated = apply_ev_hard_gates(
-            0.0, kalshi_american, fair_eligible, used_fallback=False, min_sharp_books=min_sharp_books
+            0.0,
+            kalshi_american,
+            fair_eligible,
+            used_fallback=False,
+            min_sharp_books=min_sharp_books,
+            exchange_source=books,
         )
     else:
         fair_src = fair_books_for_panel(fair_eligible, kalshi_american, take_book=take_book)
@@ -686,7 +770,12 @@ def evaluate_sharp_panel_ev(
             fair = sum(fairs) / float(len(fairs)) if fairs else None
         ev = calc.ev_percent_vs_kalshi(fair, price_cents) if fair is not None else -999.0
         gated = apply_ev_hard_gates(
-            ev, kalshi_american, fair_eligible, used_fallback=False, min_sharp_books=min_sharp_books
+            ev,
+            kalshi_american,
+            fair_eligible,
+            used_fallback=False,
+            min_sharp_books=min_sharp_books,
+            exchange_source=books,
         )
     hdp_gate = spread_keep_on_labeled_side(
         painted_hdp=painted_side_hdp,

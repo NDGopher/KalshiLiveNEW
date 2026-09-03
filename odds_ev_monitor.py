@@ -50,6 +50,7 @@ from ev_calculator import (
     fair_books_for_panel,
     filter_sharp_panel,
     format_ev_percent_display,
+    is_junk_vs_kalshi,
     is_polymarket_book,
     power_average_fair_prob,
     spread_keep_on_labeled_side,
@@ -395,6 +396,7 @@ def fair_sharp_names(sharps: List[str], take_book: str = "Kalshi") -> List[str]:
     """Configured rec pack for fair/devig.
 
     Never PLive. Never the take venue. Kalshi is allowed only on a PLive card.
+    Polymarket stays — junk Poly is dropped later by is_junk_vs_kalshi.
     """
     take = _norm_book(str(take_book or "")).lower()
     out: List[str] = []
@@ -404,8 +406,6 @@ def fair_sharp_names(sharps: List[str], take_book: str = "Kalshi") -> List[str]:
         if not n or n in seen:
             continue
         if n == "plive" or n == take:
-            continue
-        if is_polymarket_book(raw) or is_polymarket_book(n):
             continue
         if n == "kalshi" and take != "plive":
             continue
@@ -1178,11 +1178,15 @@ def _build_display_books_payload(
                     row = {**row, "home": ndh, "away": nda}
         d = _decimal_for_side(row, bet_side)
         if d and d > 1.0:
+            am = decimal_to_american(float(d))
+            # Junk Poly: skip the tile (not gray). On-pack Poly may paint.
+            if is_polymarket_book(nm) and is_junk_vs_kalshi(am, int(kalshi_am)):
+                continue
             canon = _norm_book(str(nm))
             blob: Dict[str, Any] = {
                 "book": canon,
                 "book_key": "".join(ch.lower() for ch in canon if ch.isalnum()),
-                "odds": decimal_to_american(float(d)),
+                "odds": am,
                 "limit": float(_row_limit_hint(row) or 0.0),
             }
             ts = row.get("updated_at") or row.get("book_updated_at")
@@ -2631,6 +2635,7 @@ class OddsEVMonitor:
         panels: List[Tuple[float, float, str]] = []
         triples: List[Tuple[float, float, float, str]] = []
         surviving_books: List[Dict[str, Any]] = []
+        panel_books: List[Dict[str, Any]] = []
         used_fallback_fair = False
 
         ref_for_sharps = canon_vb or (k_row if k_row else None)
@@ -2822,6 +2827,7 @@ class OddsEVMonitor:
                 fair_books_excluding_take(surviving_books, take_canon),
                 used_fallback=used_fallback_fair,
                 min_sharp_books=min_sharp,
+                exchange_source=panel_books or surviving_books,
             )
             ev_percent = float(gated["ev_percent"])
             if used_fallback_fair or not gated["plus_alert"]:

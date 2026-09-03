@@ -28,12 +28,14 @@ from ev_calculator import (
     decimal_to_american,
     evaluate_sharp_panel_ev,
     exclude_plive_from_fair,
+    exchange_better_kill,
     fair_books_excluding_take,
     fair_books_for_panel,
     filter_sharp_panel,
     is_junk_vs_kalshi,
     is_novig_book,
     is_plive_book,
+    is_polymarket_book,
     is_real_sign_flip,
     novig_better_than_take,
 )
@@ -598,3 +600,84 @@ def test_long_plus_tight_pack_two_way_power_not_fake_seven():
     assert out["raw_ev_percent"] < 7.0
     assert out["ev_percent"] < 7.0
     assert "nv_better" not in out["reasons"]
+
+
+def test_astros_ml_two_exchange_hides_card():
+    """Kill: Astros ML take −204 vs BF −163 and NV −130 — 2 exchanges better."""
+    take = -204
+    books = [
+        _book("Betfair Exchange", -163),
+        _book("NoVig", -130),
+        _book("FD", -200),
+        _book("DK", -198),
+        _book("CZ", -195),
+    ]
+    # NV −130 is >10c vs −204 so it drops from POWER, but still counts for hide.
+    assert exchange_better_kill(books, take) is True
+    out = evaluate_sharp_panel_ev(books, take, min_sharp_books=3)
+    assert out["plus_alert"] is False
+    assert "exchange_better" in out["reasons"]
+
+
+def test_junk_nv_bf_does_not_trigger_exchange_kill():
+    """Junk NV +317 / BF +567 vs a +144 take must not hide the card."""
+    take = 144
+    books = [
+        _book("NoVig", 317),
+        _book("Betfair Exchange", 567),
+        _book("FD", 110),
+        _book("DK", 115),
+        _book("CZ", 100),
+    ]
+    assert is_junk_vs_kalshi(317, take) is True
+    assert is_junk_vs_kalshi(567, take) is True
+    assert exchange_better_kill(books, take) is False
+    out = evaluate_sharp_panel_ev(books, take, min_sharp_books=3)
+    assert "exchange_better" not in out["reasons"]
+    assert out["plus_alert"] is True
+
+
+def test_dk_fd_cz_better_only_still_prints():
+    """Soft books better than take do not trigger the 2-exchange hide."""
+    take = 144
+    books = [
+        _book("DK", 155),
+        _book("FD", 150),
+        _book("CZ", 135),
+        _book("NoVig", 128),
+        _book("Betfair Exchange", 120),
+    ]
+    assert exchange_better_kill(books, take) is False
+    out = evaluate_sharp_panel_ev(books, take, min_sharp_books=3)
+    assert "exchange_better" not in out["reasons"]
+
+
+def test_twins_plus15_kalshi_plus144_keep():
+    """Keep: Twins +1.5 Kalshi +144 — show the card."""
+    take = 144
+    books = [
+        _book("FD", 110),
+        _book("DK", 115),
+        _book("CZ", 100),
+        _book("NoVig", 90),
+        _book("Betfair Exchange", 80),
+    ]
+    out = evaluate_sharp_panel_ev(books, take, min_sharp_books=3)
+    assert exchange_better_kill(books, take) is False
+    assert out["plus_alert"] is True
+    assert out["ev_percent"] > 0.0
+
+
+def test_junk_poly_minus455_vs_plus163_out_of_power():
+    """Junk Poly −455 vs take +163 is out of POWER (sign-flip / >10c)."""
+    take = 163
+    books = [
+        _book("FD", 156),
+        _book("DK", 160),
+        _book("NV", 150),
+        _book("Polymarket", -455, 350),
+    ]
+    assert is_junk_vs_kalshi(-455, take) is True
+    out = evaluate_sharp_panel_ev(books, take, min_sharp_books=3)
+    assert all(not is_polymarket_book(n) for n in out["fair_names"])
+    assert "Polymarket" not in out["fair_names"]

@@ -74,6 +74,9 @@ console.log(JSON.stringify({
   nvWorseNotSkipped: tilePaintState('NoVig', 178, {take_book:'PLive'}, 306),
   junk10cDoesNotSkipWorse: isJunkVsKalshi(178, 306) === true
     && tilePaintState('NoVig', 178, {take_book:'PLive'}, 306).skip === false,
+  onPackPolyPaints: tilePaintState('Polymarket', 158, {take_book:'Kalshi'}, 163),
+  junkPoly455Skip: tilePaintState('Polymarket', -455, {take_book:'Kalshi'}, 163).skip,
+  junkPoly178Skip: tilePaintState('Polymarket', -178, {take_book:'Kalshi'}, -104).skip,
 }));
 """
     proc = subprocess.run(
@@ -150,6 +153,9 @@ def test_paint_lock_worse_recs_stay_visible_unshaded():
     assert data["twinsOrder"][0] == "PLive"
     assert data["nvWorseNotSkipped"] == {"skip": False, "take": False, "better": False}
     assert data["junk10cDoesNotSkipWorse"] is True
+    assert data["onPackPolyPaints"] == {"skip": False, "take": False, "better": False}
+    assert data["junkPoly455Skip"] is True
+    assert data["junkPoly178Skip"] is True
 
 
 def test_worse_rec_css_is_full_opacity_not_red():
