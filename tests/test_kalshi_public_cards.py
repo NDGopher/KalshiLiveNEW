@@ -26,9 +26,12 @@ EVENT_TICKER = "KXMLBGAME-26SEP03DETMINE"
 SPREAD_TICKER = "KXMLBSPREAD-26SEP03DETMINE-MIN1"
 TOTAL_TICKER = "KXMLBTOTAL-26SEP03DETMINE-85"
 
-# Public yes_ask 0.455 → ~+120. Rec pack around -140 is +EV vs that take.
-KALSHI_HOME_ASK = "0.4550"
-KALSHI_AWAY_ASK = "0.5600"
+# Same-sign favorite as the rec pack (-142/-141/-139). -133 is +EV and
+# inside the 10¢ junk screen used by filter_sharp_panel.
+KALSHI_HOME_DEC = american_to_decimal(-133)
+KALSHI_AWAY_DEC = american_to_decimal(125)
+KALSHI_HOME_ASK = f"{1.0 / KALSHI_HOME_DEC:.4f}"
+KALSHI_AWAY_ASK = f"{1.0 / KALSHI_AWAY_DEC:.4f}"
 
 
 def _public_mlb_markets() -> list:
