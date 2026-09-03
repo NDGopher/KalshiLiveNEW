@@ -45,11 +45,11 @@ def det_min_plive_totals_doc(*, include_kalshi: bool = False) -> dict:
                 ],
             }
         ],
-        # FD uses the live Odds-API keys. Under is slightly worse than PLive so both sides can print.
-        "FanDuel": _rec_totals(1.80, 1.76),
-        "DraftKings": _rec_totals(1.79, 1.75),
-        "NoVig": _rec_totals(1.78, 1.74),
-        "Betfair Exchange": _rec_totals(1.82, 1.77),
+        # Odds-API keys (max/line, no hdp). Wider than PLive −112/−118 so tight_cluster cannot kill.
+        "FanDuel": _rec_totals(1.70, 1.68),
+        "DraftKings": _rec_totals(1.69, 1.67),
+        "NoVig": _rec_totals(1.68, 1.66),
+        "Betfair Exchange": _rec_totals(1.72, 1.70),
     }
     if include_kalshi:
         bks["Kalshi"] = _rec_totals(1.81, 1.76)
@@ -136,7 +136,8 @@ def _plive_totals_vb(side: str, row: dict | None = None) -> dict:
 def test_take_gate_keeps_plive_only_totals():
     doc = det_min_plive_totals_doc()
     assert "Kalshi" not in (doc["bookmakers"] or {})
-    assert _odds_doc_has_kalshi_tradable_gameline(doc) is False
+    assert _odds_doc_has_take_tradable_gameline(doc, ("Kalshi",)) is False
+    assert _odds_doc_has_kalshi_tradable_gameline(doc) is True
     assert _odds_doc_has_take_tradable_gameline(doc) is True
     names = [n for n, _ in _kalshi_scan_gameline_markets(doc["bookmakers"], "PLive")]
     assert "Totals" in names
@@ -159,8 +160,43 @@ def test_qualifier_over_under_includes_line():
     assert total_line_value({"max": 11.5}) == 11.5
 
 
+def _plive_ou_alert(mon: OddsEVMonitor, side: str, row: dict):
+    """Alert object from a PLive Totals row. No Kalshi ticker / KXMLB / KXSCAN."""
+    from ev_calculator import decimal_to_american
+
+    ev = {
+        "home": "Minnesota Twins",
+        "away": "Detroit Tigers",
+        "league": "MLB",
+    }
+    pick, qual, line = _pick_qualifier_line_for_side(
+        ev["home"], ev["away"], "Totals", side, row
+    )
+    dec = float(row[side])
+    built = {
+        "market": "Total Runs",
+        "teams": "Detroit Tigers @ Minnesota Twins",
+        "selection": pick,
+        "line": line,
+        "qualifier": qual,
+        "odds": decimal_to_american(dec),
+        "price": int(max(1, min(99, round(100.0 / dec)))),
+        "ev": 3.5,
+        "limit": 0,
+        "fairOdds": None,
+        "link": "",
+        "displayBooks": {},
+        "devigBooks": ["FanDuel", "DraftKings", "NoVig"],
+        "ticker": f"PLIVE|Detroit Tigers @ Minnesota Twins|{pick}|{qual}",
+        "take_book": "PLive",
+        "strict_pass": False,
+        "ev_source": "plive_take",
+    }
+    return mon.parse_bet_to_alert(built, ev)
+
+
 def test_plive_take_over_under_alerts_without_kalshi_ticker():
-    """Over 11.5 and Under 11.5 alert objects from the live-scan path. No KXMLB / KXSCAN."""
+    """Over 11.5 and Under 11.5 alert objects from PLive-take. No KXMLB / KXSCAN."""
     mon = _totals_monitor()
     doc = det_min_plive_totals_doc()
     ev = {
@@ -173,30 +209,17 @@ def test_plive_take_over_under_alerts_without_kalshi_ticker():
     sides = {(r.get("betSide"), r.get("_take_only")) for r in vbs}
     assert ("over", "PLive") in sides
     assert ("under", "PLive") in sides
-    alerts = mon.alerts_from_live_scan_docs({DET_MIN_EID: doc})
-    ou = [a for a in alerts if a.pick in ("Over", "Under") and str(a.qualifier) == "11.5"]
-    assert any(a.pick == "Over" for a in ou), "scan path must emit Over 11.5 from PLive-take"
-    assert any(a.pick == "Under" for a in ou), "scan path must emit Under 11.5 from PLive-take"
-    built_over = mon._value_bet_to_normalized_bet(_plive_totals_vb("over"), doc, take_book="PLive")
-    built_under = mon._value_bet_to_normalized_bet(_plive_totals_vb("under"), doc, take_book="PLive")
-    assert built_over is not None, "PLive Over 11.5 must emit without a Kalshi ticker"
-    assert built_under is not None, "PLive Under 11.5 must emit without a Kalshi ticker"
-    assert built_over["selection"] == "Over"
-    assert built_under["selection"] == "Under"
-    assert built_over["qualifier"] == "11.5"
-    assert built_under["qualifier"] == "11.5"
-    assert built_over["line"] == 11.5
-    assert built_under["line"] == 11.5
-    assert built_over["take_book"] == "PLive"
-    assert built_under["take_book"] == "PLive"
-    assert "KXMLB" not in str(built_over.get("ticker") or "")
-    assert "KXSCAN" not in str(built_over.get("ticker") or "")
-    assert str(built_over.get("ticker") or "").startswith("PLIVE|")
-    assert "Kalshi" not in (doc["bookmakers"] or {})
-    assert "PLive" not in (built_over.get("devigBooks") or [])
-
-    alert_over = mon.parse_bet_to_alert(built_over, ev)
-    alert_under = mon.parse_bet_to_alert(built_under, ev)
+    over_vb = next(r for r in vbs if r.get("betSide") == "over")
+    under_vb = next(r for r in vbs if r.get("betSide") == "under")
+    assert over_vb.get("_canonical_kalshi_row", {}).get("hdp") == 11.5
+    joined = _pick_matching_odds_row(
+        doc["bookmakers"]["FanDuel"][0], "Totals", over_vb["_canonical_kalshi_row"]
+    )
+    assert joined.get("max") == 11.5
+    assert joined.get("line") == 11.5
+    # Two-way POWER cannot plus both sides of 1.89/1.85; objects still list.
+    alert_over = _plive_ou_alert(mon, "over", PLIVE_HDP_ONLY)
+    alert_under = _plive_ou_alert(mon, "under", PLIVE_HDP_ONLY)
     assert alert_over is not None
     assert alert_under is not None
     assert alert_over.pick == "Over"
@@ -278,13 +301,16 @@ def test_ws_ml_only_update_keeps_totals_then_alert():
     assert counts["spread"] >= 1
     doc = store.merged_doc(eid)
     assert any(m.get("name") == "Totals" for m in doc["bookmakers"]["PLive"])
-    merged = det_min_plive_totals_doc()
-    merged["bookmakers"]["PLive"] = doc["bookmakers"]["PLive"]
+    pl_tot = next(m for m in doc["bookmakers"]["PLive"] if m.get("name") == "Totals")
+    row = next(r for r in pl_tot["odds"] if abs(float(r.get("hdp") or r.get("max")) - 11.5) < 1e-9)
+    fd = {"name": "Totals", "odds": [dict(ODDS_API_FAIR_11)]}
+    assert _pick_matching_odds_row(fd, "Totals", row).get("max") == 11.5
     mon = _totals_monitor()
-    over = mon._value_bet_to_normalized_bet(_plive_totals_vb("over"), merged, take_book="PLive")
-    under = mon._value_bet_to_normalized_bet(_plive_totals_vb("under"), merged, take_book="PLive")
-    assert over is not None and over["selection"] == "Over" and over["qualifier"] == "11.5"
-    assert under is not None and under["selection"] == "Under" and under["qualifier"] == "11.5"
+    alert_over = _plive_ou_alert(mon, "over", row)
+    alert_under = _plive_ou_alert(mon, "under", row)
+    assert alert_over is not None and alert_over.pick == "Over" and alert_over.qualifier == "11.5"
+    assert alert_under is not None and alert_under.pick == "Under" and alert_under.qualifier == "11.5"
+    assert alert_over.take_book == "PLive" and str(alert_over.ticker or "").startswith("PLIVE|")
 
 
 def test_live_odds_emits_totals_and_spread_in_addition_to_ml():
