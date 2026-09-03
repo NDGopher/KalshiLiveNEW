@@ -376,6 +376,18 @@ class _TTLCache:
         async with self._lock:
             self._data[key] = (time.time() + ttl, value)
 
+    async def peek(self, key: str) -> Optional[Any]:
+        """Return the cached value even if expired. Does not evict.
+
+        Used as a fail-open slate when ``/events/live`` 429s. Odds
+        recovery must still fail closed — do not use this for prices.
+        """
+        async with self._lock:
+            ent = self._data.get(key)
+            if not ent:
+                return None
+            return ent[1]
+
     async def get_valid(self, key: str) -> Optional[Any]:
         async with self._lock:
             ent = self._data.get(key)
@@ -383,7 +395,7 @@ class _TTLCache:
                 return None
             exp, val = ent
             if exp < time.time():
-                del self._data[key]
+                # Keep the expired entry for /events/live 429 slate fallback.
                 return None
             return val
 
@@ -775,17 +787,39 @@ class OddsAPIClient:
         cached = await self._cache_events.get_valid(key)
         if cached is not None:
             return cached
+        stale = await self._cache_events.peek(key)
         params: Dict[str, Any] = {}
         if api_s:
             params["sport"] = api_s
-        data = await self._get_json(
-            "/events/live",
-            params,
-            cache=self._cache_events,
-            cache_key=key,
-            ttl=self._live_events_ttl,
-        )
+        try:
+            data = await self._get_json(
+                "/events/live",
+                params,
+                cache=self._cache_events,
+                cache_key=key,
+                ttl=self._live_events_ttl,
+            )
+        except Exception as ex:
+            if isinstance(stale, list) and stale:
+                print(
+                    f"[ODDS-API] [WARN] /events/live failed ({ex}); "
+                    f"using cached slate n={len(stale)}"
+                )
+                return stale
+            raise
         return data if isinstance(data, list) else []
+
+    async def peek_cached_live_events(
+        self,
+        sport: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Last ``/events/live`` slate, including an expired cache entry."""
+        api_s: Optional[str] = None
+        if sport and str(sport).strip().lower() not in ("", "all"):
+            api_s = sport_slug_query_for_api(str(sport))
+        key = f"events:live:{api_s or 'all'}"
+        cached = await self._cache_events.peek(key)
+        return list(cached) if isinstance(cached, list) else []
 
     async def get_odds_updated(
         self,
