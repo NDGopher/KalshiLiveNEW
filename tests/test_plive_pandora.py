@@ -56,8 +56,8 @@ def test_json_patch_builds_mlb_moneyline():
         {
             "isDiff": True,
             "payload": [
-                {"op": "replace", "path": "/c/m/10/o/1/1", "value": 1.85},
-                {"op": "replace", "path": "/c/m/10/o/2/1", "value": 2.05},
+                {"op": "replace", "path": "/c/m/3/o/1/1", "value": 1.85},
+                {"op": "replace", "path": "/c/m/3/o/2/1", "value": 2.05},
             ],
         },
         event_name=f"live.main.xxx.eventCoefficients.{eid}",
@@ -89,18 +89,18 @@ def test_totals_and_spread_two_way():
 
 def test_replace_not_merge_markets():
     store = PliveStore()
-    store.set_coeff("7", 10, "1", 1, 1.9)
-    store.set_coeff("7", 10, "2", 1, 2.0)
+    store.set_coeff("7", 3, "1", 1, 1.9)
+    store.set_coeff("7", 3, "2", 1, 2.0)
     assert store.markets_for_event("7")[0]["odds"][0]["home"] == 1.9
-    store.set_coeff("7", 10, "1", 1, 1.7)
+    store.set_coeff("7", 3, "1", 1, 1.7)
     assert store.markets_for_event("7")[0]["odds"][0]["home"] == 1.7
 
 
 def test_team_match_to_odds_doc():
     store = PliveStore()
     store.apply_meta("99", {"home": "New York Yankees", "away": "Boston Red Sox", "sportId": 1})
-    store.set_coeff("99", 10, "1", 1, 1.8)
-    store.set_coeff("99", 10, "2", 1, 2.1)
+    store.set_coeff("99", 3, "1", 1, 1.8)
+    store.set_coeff("99", 3, "2", 1, 2.1)
     eid = match_plive_event_to_odds_doc(
         store.mlb_events(), "New York Yankees", "Boston Red Sox"
     )
@@ -366,7 +366,7 @@ def test_game_period_markets_ml_spread_totals():
                 "id": 199992971,
                 "c": {
                     "m": {
-                        "10": {"o": {"1": 1.29, "2": 3.45}},
+                        "3": {"o": {"1": 1.29, "2": 3.45}},
                         "5": {"o": {"14.5": [1.80, 1.94]}, "r": 14.5},
                         "6": {"o": {"-2": [1.93, 1.81]}, "r": -2},
                     }
@@ -393,8 +393,8 @@ def test_status_snapshot_reports_priced_mlb():
     feed.connected = True
     feed._running = True
     feed.store.apply_meta("99", {"home": "New York Yankees", "away": "Boston Red Sox", "sportId": 1})
-    feed.store.set_coeff("99", 10, "1", 1, 1.8)
-    feed.store.set_coeff("99", 10, "2", 1, 2.1)
+    feed.store.set_coeff("99", 3, "1", 1, 1.8)
+    feed.store.set_coeff("99", 3, "2", 1, 2.1)
     snap = feed.status_snapshot()
     assert snap["connected"] is True
     assert snap["partner_id"] == 113
@@ -443,15 +443,21 @@ def test_event_data_199298371_is_home_then_away():
     ) == "199298371"
 
 
-def test_market3_is_not_ml_column():
+def test_market3_is_game_winner_not_first5():
+    """Market 3 idx1 is Game Winner. Market 10 (first-5 / other) must not paint ML."""
     store = PliveStore()
+    store.set_coeff("e", 3, "1", 0, 3.89)
     store.set_coeff("e", 3, "1", 1, 2.61)
+    store.set_coeff("e", 3, "2", 0, 2.20)
     store.set_coeff("e", 3, "2", 1, 1.463)
     store.set_coeff("e", 10, "1", 1, 1.69)
     store.set_coeff("e", 10, "2", 1, 2.10)
     ml = next(m for m in store.markets_for_event("e") if m["name"] == "ML")
-    assert ml["odds"][0]["home"] == 1.69
-    assert ml["odds"][0]["away"] == 2.10
+    assert ml["odds"][0]["home"] == 2.61
+    assert ml["odds"][0]["away"] == 1.463
+    assert ml["odds"][0].get("plive_market") == 3
+    assert ml["odds"][0]["home"] != 1.69
+    assert ml["odds"][0]["home"] != 3.89
 
 
 def test_do_not_remap_plive_labels_to_odds_api():
@@ -529,8 +535,10 @@ def test_event_199298371_live_ws_dump_pair_and_away_sign():
     assert all(r.get("home") not in (3.79, 4.97, 3.12, 4.25, 4.1) for r in rows)
     assert all(r.get("away") not in (4.97, 3.12, 4.25, 4.1) for r in rows)
     assert all(r.get("plive_market") == 6 for r in rows)
-    # Market 3 is the real ML (+111 / -148) but must not replace Odds-API PLive ML.
-    assert "ML" not in by_name or by_name["ML"]["odds"][0].get("home") != 2.11
+    # Market 3 Game Winner (+111 / -148) is the live ML take.
+    assert "ML" in by_name
+    assert by_name["ML"]["odds"][0]["home"] == 2.11
+    assert abs(float(by_name["ML"]["odds"][0]["away"]) - 1.675676) < 1e-9
 
     odds_home, odds_away = "Houston Astros", "Chicago White Sox"
     # Home-centric: Astros −1.5 stays −1.5. Away Sox on hdp −1.5 is +1.5.
@@ -553,7 +561,8 @@ def test_event_199298371_live_ws_dump_pair_and_away_sign():
     existing_ml = [{"name": "ML", "odds": [{"home": 1.662, "away": 2.14}]}]
     merged = merge_plive_market_lists(existing_ml, store.markets_for_event(eid))
     ml = next(m for m in merged if m["name"] == "ML")
-    assert ml["odds"][0]["home"] == 1.662
+    assert ml["odds"][0]["home"] == 2.11
+    assert ml["odds"][0]["home"] != 1.662
 
 
 def test_event_199295331_market5_totals_not_on_spread():
@@ -714,3 +723,91 @@ def test_event_199298371_sox_tt_over_325_never_on_spread():
     plive_tiles = [r for r in painted["Houston Astros"] if str(r.get("book")) == "PLive"]
     assert plive_tiles == []
     assert all(int(r.get("odds") or 0) != 325 for r in painted["Houston Astros"])
+
+
+def test_stl_lad_market3_game_winner_is_176_not_289():
+    """2026-09-02 ~11:30 CT: public UI Cardinals +176 / Dodgers −242.
+
+    idx0 +289 and market-10 first-5 must not become the ML take. Live market 3
+    replaces a stale Odds-API PLive ML that still says +289.
+    """
+    from ev_calculator import american_to_decimal, decimal_to_american
+
+    store = PliveStore()
+    eid = "199312002"
+    lad = american_to_decimal(-242)
+    stl = american_to_decimal(176)
+    fake_289 = american_to_decimal(289)
+    store.apply_message(
+        {
+            "isDiff": False,
+            "payload": {
+                "s": {
+                    "1": {
+                        "2": {
+                            "8": {
+                                eid: [
+                                    ["Los Angeles Dodgers", "", "", 2],
+                                    ["St. Louis Cardinals", "", "", 1],
+                                    1788392100,
+                                    None,
+                                    {"ip": True},
+                                ]
+                            }
+                        }
+                    }
+                }
+            },
+        },
+        event_name=f"live.main.{PLIVE_LINE_SET}.eventData",
+    )
+    store.apply_message(
+        {
+            "isDiff": False,
+            "payload": {
+                "c": {
+                    "m": {
+                        "3": {
+                            "o": {
+                                "1": {0: 1.55, 1: lad},
+                                "2": {0: fake_289, 1: stl},
+                            }
+                        },
+                        "10": {"o": {"1": {"1": 1.80}, "2": {"1": fake_289}}},
+                        "5": {"o": {"9.5": [1.91, 1.91]}},
+                        "6": {"o": {"1.5": {0: 1.80, 1: 2.00}}},
+                        "7": {"o": {"4.5": {0: 1.90, 1: 1.90}}},
+                    }
+                }
+            },
+        },
+        event_name=f"live.main.{PLIVE_LINE_SET}.eventCoefficients.{eid}",
+    )
+    ev = store.events[eid]
+    assert ev["home"] == "Los Angeles Dodgers"
+    assert ev["away"] == "St. Louis Cardinals"
+    ml = next(m for m in store.markets_for_event(eid) if m["name"] == "ML")
+    assert decimal_to_american(ml["odds"][0]["home"]) == -242
+    assert decimal_to_american(ml["odds"][0]["away"]) == 176
+    assert decimal_to_american(ml["odds"][0]["away"]) != 289
+    assert ml["odds"][0].get("plive_market") == 3
+
+    stale = [{"name": "ML", "odds": [{"home": american_to_decimal(-150), "away": fake_289}]}]
+    merged = merge_plive_market_lists(stale, store.markets_for_event(eid))
+    take_away = decimal_to_american(next(m for m in merged if m["name"] == "ML")["odds"][0]["away"])
+    assert take_away == 176
+    assert take_away != 289
+
+    # Later patch: idx1 moves with the board. idx0 staying at 3.89 must not win.
+    store.apply_message(
+        {
+            "isDiff": True,
+            "payload": [
+                {"op": "replace", "path": "/c/m/3/o/2/1", "value": stl},
+                {"op": "replace", "path": "/c/m/3/o/2/0", "value": fake_289},
+            ],
+        },
+        event_name=f"live.main.{PLIVE_LINE_SET}.eventCoefficients.{eid}",
+    )
+    later = next(m for m in store.markets_for_event(eid) if m["name"] == "ML")
+    assert decimal_to_american(later["odds"][0]["away"]) == 176

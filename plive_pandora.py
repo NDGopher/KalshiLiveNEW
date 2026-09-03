@@ -74,12 +74,16 @@ _EVENT_HASH_RE = re.compile(r"#!?/event/(\d+)", re.I)
 #   /c/m/{market}/o/{outcome}/{index}
 # Market 6 run line: each outcome is a HOME handicap. [idx0, idx1] is a
 # 2-way pair (~7% hold), NOT [money price, decimal]. Both slots are decimals.
-# Market 3 ML: idx1 is the true decimal. Do not overwrite Odds-API PLive ML.
+# Market 3 = Game Winner ML. idx1 is the public-UI decimal. Do not treat
+# [idx0, idx1] as a 2-way pair. idx0 is not the take price. Live market 3
+# replaces stale Odds-API PLive ML. Markets 10/9/1 are not Game Winner
+# (first-5 / other) and must not paint a ML card.
 # Market 5 = game totals. 7/8 = team totals (click-in only) — never on Spread.
 # eventData list is [home, away] (stadium home first).
 # Sox @ Astros 199298371 Game tab: Astros −1.5 is unpriced. The only +325
 # on that event is Chicago White Sox Total Over 2.5 (market 7/8), not a run line.
-_DEFAULT_ML_MARKETS = (10, 9, 1)
+PLIVE_ML_MARKET = 3
+_DEFAULT_ML_MARKETS = (3,)
 _DEFAULT_SPREAD_MARKETS = (6,)
 _DEFAULT_TOTAL_MARKETS = (5,)
 _TEAM_TOTAL_MARKETS = (7, 8)
@@ -269,11 +273,21 @@ def _as_float(v: Any) -> Optional[float]:
 
 
 def _decimal_from_slot(slots: Dict[int, Any]) -> Optional[float]:
-    """ML / totals: prefer index 1 (true decimal on market 3). Not used for market 6 pairs."""
+    """Totals / non-ML: prefer index 1, then 0. Not used for market 6 pairs."""
     for idx in (1, 0):
-        f = _as_float(slots.get(idx))
+        f = _as_float(slots.get(idx) if slots.get(idx) is not None else slots.get(str(idx)))
         if f is not None and f > 1.0:
             return f
+    return None
+
+
+def _ml_decimal_from_slot(slots: Dict[int, Any]) -> Optional[float]:
+    """Market 3 Game Winner: idx1 only. idx0 is not a 2-way pair and is not the UI price."""
+    if not isinstance(slots, dict):
+        return None
+    f = _as_float(slots.get(1) if slots.get(1) is not None else slots.get("1"))
+    if f is not None and f > 1.0:
+        return f
     return None
 
 
@@ -636,17 +650,22 @@ def merge_plive_market_lists(
     existing: Optional[List[Dict[str, Any]]],
     incoming: Optional[List[Dict[str, Any]]],
 ) -> List[Dict[str, Any]]:
-    """Odds-API PLive ML stays. Overlay run line (Spread) and game totals only."""
+    """Live market-3 Game Winner replaces Odds-API / stale PLive ML. Overlay Spread/Totals."""
+    incoming_ml = any(
+        isinstance(m, dict) and str(m.get("name")) == "ML" for m in (incoming or [])
+    )
     by_name: Dict[str, Dict[str, Any]] = {}
     for m in existing or []:
-        if isinstance(m, dict) and m.get("name"):
-            by_name[str(m.get("name"))] = m
+        if not isinstance(m, dict) or not m.get("name"):
+            continue
+        name = str(m.get("name"))
+        if name == "ML" and incoming_ml:
+            continue
+        by_name[name] = m
     for m in incoming or []:
         if not isinstance(m, dict) or not m.get("name"):
             continue
         name = str(m.get("name"))
-        if name == "ML" and "ML" in by_name:
-            continue
         if name in ("Spread", "Totals", "ML"):
             by_name[name] = m
     return sanitize_plive_markets(list(by_name.values()))
@@ -812,7 +831,10 @@ class PliveStore:
         ev = self._event(eid)
         key = (int(market), str(outcome))
         slots = ev["coeffs"].setdefault(key, {})
-        if index is None:
+        if isinstance(value, (list, tuple)) and len(value) >= 2 and index in (None, 0):
+            slots[0] = value[0]
+            slots[1] = value[1]
+        elif index is None:
             slots[1] = value
         else:
             slots[int(index)] = value
@@ -926,13 +948,17 @@ class PliveStore:
     def _markets_from_coeffs(self, coeffs: Dict[Tuple[int, str], Dict[int, Any]]) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
 
-        # Moneyline: outcomes 1/home vs 2/away (2-way MLB).
+        # Game Winner (market 3): outcomes 1/home vs 2/away. idx1 only.
         for mk in self.ml_markets:
+            if int(mk) in _TEAM_TOTAL_MARKETS or int(mk) in self.total_markets:
+                continue
+            if int(mk) == PLIVE_RUN_LINE_MARKET:
+                continue
             home = away = None
             for (market, outcome), slots in coeffs.items():
                 if market != mk:
                     continue
-                dec = _decimal_from_slot(slots)
+                dec = _ml_decimal_from_slot(slots) if int(mk) == PLIVE_ML_MARKET else _decimal_from_slot(slots)
                 if dec is None:
                     continue
                 oc = str(outcome).lower()
@@ -941,7 +967,19 @@ class PliveStore:
                 elif oc in ("2", "away", "a"):
                     away = dec
             if home and away:
-                out.append({"name": "ML", "odds": [{"home": home, "away": away}]})
+                out.append(
+                    {
+                        "name": "ML",
+                        "odds": [
+                            {
+                                "home": home,
+                                "away": away,
+                                "plive_market": int(mk),
+                                "market_type": "game_winner",
+                            }
+                        ],
+                    }
+                )
                 break
 
         # Run line only (market 6). Team totals 7/8 and game totals 5 never land here.
@@ -1505,7 +1543,7 @@ def merge_plive_into_docs(docs: List[Dict[str, Any]]) -> int:
             bks = doc["bookmakers"]
         existing = bks.get(book) if isinstance(bks.get(book), list) else []
         if not markets:
-            # Leave Odds-API PLive ML in place. Do not invent or wipe.
+            # No live coeff match — do not invent. Existing Odds-API PLive stays.
             continue
         incoming_spread = any(str(m.get("name")) == "Spread" for m in markets if isinstance(m, dict))
         merged = merge_plive_market_lists(existing, markets)

@@ -405,3 +405,91 @@ def test_dashboard_plive_take_is_not_display_only():
     assert 'take_part = f"|{take_book}"' in src
     assert "auto_bet_enabled = False" in src
     assert "sharps_list.append(_extra_bk)" not in src
+
+
+def test_stl_lad_alert_take_is_176_not_stale_289():
+    """If the public UI shows Cardinals +176, the card must not emit +289."""
+    from ev_calculator import american_to_decimal, decimal_to_american
+    from plive_pandora import PLIVE_LINE_SET, PliveStore, merge_plive_market_lists
+
+    store = PliveStore()
+    eid = "199312002"
+    lad = american_to_decimal(-242)
+    stl = american_to_decimal(176)
+    fake_289 = american_to_decimal(289)
+    store.apply_message(
+        {
+            "isDiff": False,
+            "payload": {
+                "c": {
+                    "m": {
+                        "3": {"o": {"1": {0: 1.55, 1: lad}, "2": {0: fake_289, 1: stl}}},
+                        "10": {"o": {"1": {"1": 1.80}, "2": {"1": fake_289}}},
+                    }
+                }
+            },
+        },
+        event_name=f"live.main.{PLIVE_LINE_SET}.eventCoefficients.{eid}",
+    )
+    live_ml = store.markets_for_event(eid)
+    stale_odds_api = [{"name": "ML", "odds": [{"home": american_to_decimal(-150), "away": fake_289}]}]
+    plive_mk = merge_plive_market_lists(stale_odds_api, live_ml)
+    mon = OddsEVMonitor(auth_token=None)
+    mon.set_filter(
+        {
+            "betTypes": ["GAMELINES"],
+            "minRoi": 0,
+            "devigFilter": {
+                "sharps": ["FanDuel", "DraftKings", "NoVig"],
+                "method": "POWER",
+                "type": "AVERAGE",
+                "minEv": 0,
+                "minSharpBooks": 3,
+                "hold": [{"book": "Any", "max": 20}],
+            },
+            "oddsRanges": [{"book": "Any", "min": -500, "max": 500}],
+            "minLimits": [{"book": "Kalshi", "min": 0}],
+            "minSharpLimits": [],
+            "displayBooks": ["Kalshi", "FanDuel", "DraftKings", "NoVig", "PLive"],
+        }
+    )
+    pack_away = american_to_decimal(155)
+    pack_home = american_to_decimal(-185)
+    vb = {
+        "event": {"home": "Los Angeles Dodgers", "away": "St. Louis Cardinals", "league": "MLB"},
+        "market": {"name": "ML", "home": pack_home, "away": pack_away},
+        "betSide": "away",
+        "bookmakerOdds": {
+            "home": pack_home,
+            "away": pack_away,
+            "href": "https://kalshi.com/markets/KXTEST",
+        },
+        "expectedValue": 0.0,
+        "_canonical_kalshi_row": {"home": pack_home, "away": pack_away},
+    }
+    odds_doc = {
+        "id": 88,
+        "home": "Los Angeles Dodgers",
+        "away": "St. Louis Cardinals",
+        "bookmakers": {
+            "Kalshi": [{"name": "ML", "odds": [{"home": pack_home, "away": pack_away}]}],
+            "PLive": plive_mk,
+            "FanDuel": [{"name": "ML", "odds": [{"home": pack_home, "away": pack_away}]}],
+            "DraftKings": [{"name": "ML", "odds": [{"home": american_to_decimal(-188), "away": american_to_decimal(158)}]}],
+            "NoVig": [{"name": "ML", "odds": [{"home": american_to_decimal(-190), "away": american_to_decimal(160)}]}],
+        },
+    }
+    plive = mon._value_bet_to_normalized_bet(vb, odds_doc, take_book="PLive")
+    assert plive is not None
+    assert plive["take_book"] == "PLive"
+    assert int(plive["odds"]) == 176
+    assert int(plive["odds"]) != 289
+    left = (plive["displayBooks"][plive["selection"]] or [])[0]
+    assert left["book"] == "PLive"
+    assert int(left["odds"]) == 176
+    assert all(int(r.get("odds") or 0) != 289 for r in (plive["displayBooks"][plive["selection"]] or []))
+    alert = mon.parse_bet_to_alert(plive, odds_doc)
+    assert alert is not None
+    assert int(alert.odds.replace("+", "")) == 176
+    assert "+289" not in str(alert.odds)
+    assert decimal_to_american(stl) == 176
