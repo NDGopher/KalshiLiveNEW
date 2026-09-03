@@ -50,8 +50,8 @@ def yankees_angels_1_5_doc(*, plive_under: bool = True) -> dict:
     }
 
 
-def cardinals_dodgers_stale_10_5_doc() -> dict:
-    """Over 10.5 PLive +378 vs FD +410; live main total is 7."""
+def cardinals_dodgers_alt_10_5_doc() -> dict:
+    """Alt Over 10.5 PLive +378 vs FD +410 on the same strike. Board also has o7."""
     return {
         "id": STL_LAD_EID,
         "home": "Los Angeles Dodgers",
@@ -236,8 +236,9 @@ def test_e_both_sisters_must_not_both_plus():
     assert pair == []
 
 
-def test_cardinals_stale_10_5_vs_live_7_hides():
-    doc = cardinals_dodgers_stale_10_5_doc()
+def test_cardinals_alt_10_5_hides_on_take_not_best_not_o7():
+    """O10.5 is a valid alt. Hide because FD +410 beats PLive +378, not because o7 exists."""
+    doc = cardinals_dodgers_alt_10_5_doc()
     mon = _ou_monitor()
     vb = {
         "event": {
@@ -268,3 +269,97 @@ def test_cardinals_stale_10_5_vs_live_7_hides():
         and is_plus_print_ev(getattr(a, "ev_percent", None))
         for a in alerts
     )
+
+
+def _dual_strike_doc(*, plive_10_best: bool) -> dict:
+    """Same game: O7 pack at −110 and O10.5 alt. Each strike is its own two-way."""
+    rec_7 = _totals_row(7.0, -110, -110)
+    rec_10 = _totals_row(10.5, -110, -110)
+    take_7 = _totals_row(7.0, 105, -120)
+    take_10 = (
+        _totals_row(10.5, 105, -120)
+        if plive_10_best
+        else _totals_row(10.5, 378, -480)
+    )
+    rec_10_fd = rec_10 if plive_10_best else _totals_row(10.5, 410, -520)
+    return {
+        "id": STL_LAD_EID,
+        "home": "Los Angeles Dodgers",
+        "away": "St. Louis Cardinals",
+        "league": "MLB",
+        "bookmakers": {
+            "PLive": [{"name": "Totals", "odds": [take_7, take_10]}],
+            "FanDuel": [{"name": "Totals", "odds": [rec_7, rec_10_fd]}],
+            "DraftKings": [{"name": "Totals", "odds": [rec_7, rec_10]}],
+            "NoVig": [{"name": "Totals", "odds": [rec_7, rec_10]}],
+        },
+    }
+
+
+def test_o105_keep_independent_of_o7_on_same_game():
+    """O10.5 +105 vs −110 pack KEEPs even though the board also has o7."""
+    doc = _dual_strike_doc(plive_10_best=True)
+    alerts = _built_evs(doc)
+    plus = [
+        a
+        for a in alerts
+        if is_plus_print_ev(getattr(a, "ev_percent", None))
+        and str(getattr(a, "take_book", "")).lower() == "plive"
+    ]
+    over_10 = [
+        a
+        for a in plus
+        if str(a.pick).lower() == "over" and abs(float(a.qualifier) - 10.5) < 1e-9
+    ]
+    assert over_10, [(a.pick, a.qualifier, a.ev_percent) for a in alerts]
+    assert float(over_10[0].ev_percent) > 0
+
+
+def test_o105_hide_independent_of_o7_keep():
+    """O10.5 take-not-best hides; O7 take-best can still KEEP on the same game."""
+    doc = _dual_strike_doc(plive_10_best=False)
+    alerts = _built_evs(doc)
+    plus = [
+        a
+        for a in alerts
+        if is_plus_print_ev(getattr(a, "ev_percent", None))
+        and str(getattr(a, "take_book", "")).lower() == "plive"
+    ]
+    over_10 = [
+        a
+        for a in plus
+        if str(a.pick).lower() == "over" and abs(float(a.qualifier) - 10.5) < 1e-9
+    ]
+    over_7 = [
+        a
+        for a in plus
+        if str(a.pick).lower() == "over" and abs(float(a.qualifier) - 7.0) < 1e-9
+    ]
+    assert over_10 == []
+    assert over_7, [(a.pick, a.qualifier, a.ev_percent) for a in alerts]
+
+
+def test_mlb_stale_rec_out_of_power_no_certified_break():
+    """A 3h rec is out of POWER. MLB cannot certify timeout/halftime."""
+    import time
+
+    from odds_ev_monitor import _rec_quote_in_power
+
+    now = time.time()
+    stale = now - 3 * 3600
+    mlb = {"league": "MLB", "sport": "baseball", "statusDetail": "4th inning"}
+    assert _rec_quote_in_power(stale, mlb, now) is False
+    assert _rec_quote_in_power(None, mlb, now) is True
+    nba_halt = {
+        "league": "NBA",
+        "sport": "basketball",
+        "statusDetail": "Halftime",
+        "clock": {"running": False},
+    }
+    assert _rec_quote_in_power(stale, nba_halt, now) is True
+    nba_live = {
+        "league": "NBA",
+        "sport": "basketball",
+        "clock": {"running": True},
+    }
+    assert _rec_quote_in_power(stale, nba_live, now) is False

@@ -84,7 +84,12 @@ from plive_pandora import (
     peek_shared_plive_feed,
     plive_wanted,
 )
-from stoppage_gate import live_take_blocked_by_stoppage, merge_event_clock_fields
+from stoppage_gate import (
+    is_baseball_event,
+    live_take_blocked_by_stoppage,
+    merge_event_clock_fields,
+    stoppage_allows_live_take,
+)
 
 _DOTENV_BOOTSTRAP_DONE = False
 _MONITOR_MASTER_BOOKS_LOGGED = False
@@ -477,6 +482,15 @@ def _numeric_close(a: Any, b: Any, tol: float = 1e-5) -> bool:
         return abs(float(a) - float(b)) <= tol
     except (TypeError, ValueError):
         return False
+
+
+def _scan_strike_key(row: Optional[Dict[str, Any]], mname: str = "") -> Optional[float]:
+    """Each totals/spread strike is its own two-way. O7 and O10.5 must not collapse."""
+    if _market_is_total(mname):
+        return total_line_value(row)
+    if _market_is_spread(mname) and isinstance(row, dict):
+        return _float_hdp(row.get("hdp"))
+    return None
 
 
 def total_line_value(row: Optional[Dict[str, Any]]) -> Optional[float]:
@@ -1120,7 +1134,7 @@ def _book_updated_epoch_seconds(value: Any) -> Optional[float]:
 
 
 def _is_live_fresh_quote(value: Any, now_ts: Optional[float] = None) -> bool:
-    """Missing ts stays eligible (fixtures). Quotes older than 45s are out of POWER."""
+    """Missing ts stays eligible (fixtures). Quotes older than 45s are stale."""
     epoch = _book_updated_epoch_seconds(value)
     if epoch is None:
         return True
@@ -1128,33 +1142,35 @@ def _is_live_fresh_quote(value: Any, now_ts: Optional[float] = None) -> bool:
     return (now - epoch) <= float(LIVE_REC_POWER_MAX_AGE_SEC) + 1e-9
 
 
-def _fresh_board_books(books: List[Dict[str, Any]], now_ts: Optional[float] = None) -> List[Dict[str, Any]]:
-    return [b for b in (books or []) if _is_live_fresh_quote(b.get("book_updated_at"), now_ts)]
+def _rec_quote_in_power(
+    value: Any,
+    event: Optional[Dict[str, Any]] = None,
+    now_ts: Optional[float] = None,
+) -> bool:
+    """Stale recs are out of POWER unless a certified timeout/halftime.
+
+    MLB has no stoppage field — never certify a baseball break.
+    Display tiles may still paint; they do not enter fair.
+    """
+    if _is_live_fresh_quote(value, now_ts):
+        return True
+    ev = event if isinstance(event, dict) else {}
+    if is_baseball_event(ev):
+        return False
+    allowed, _reason = stoppage_allows_live_take(ev)
+    return bool(allowed)
 
 
-def _consensus_primary_totals_line(bks: Optional[Dict[str, Any]], *, skip_book: str = "") -> Optional[float]:
-    """Modal first Totals line among rec books. Used to drop a stale take line (10.5 vs 7)."""
-    from collections import Counter
-
-    if not isinstance(bks, dict):
-        return None
-    skip = _norm_book(str(skip_book or "")).lower()
-    firsts: List[float] = []
-    for sn, markets in bks.items():
-        if skip and _norm_book(str(sn)).lower() == skip:
-            continue
-        mk = _find_market_block(markets if isinstance(markets, list) else [], "Totals")
-        if not mk:
-            continue
-        lv = total_line_value(_first_odds_row(mk) or {})
-        if lv is not None:
-            firsts.append(float(lv))
-    if len(firsts) < 2:
-        return None
-    mode, n = Counter(firsts).most_common(1)[0]
-    if n < 2:
-        return None
-    return float(mode)
+def _fresh_board_books(
+    books: List[Dict[str, Any]],
+    now_ts: Optional[float] = None,
+    event: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    return [
+        b
+        for b in (books or [])
+        if _rec_quote_in_power(b.get("book_updated_at"), event, now_ts)
+    ]
 
 
 def drop_both_plus_total_alerts(alerts: List[Any]) -> List[Any]:
@@ -2199,7 +2215,15 @@ class OddsEVMonitor:
                             }
                         )
             seen_sides = {
-                (str(r.get("eventId")), str(r.get("_scan_mname") or "").upper(), str(r.get("betSide") or "").lower())
+                (
+                    str(r.get("eventId")),
+                    str(r.get("_scan_mname") or "").upper(),
+                    str(r.get("betSide") or "").lower(),
+                    _scan_strike_key(
+                        r.get("_canonical_kalshi_row") or r.get("market") or {},
+                        str(r.get("_scan_mname") or ""),
+                    ),
+                )
                 for r in scan_rows
                 if r.get("eventId") == eid
                 and extract_kalshi_ticker_from_href(
@@ -2215,7 +2239,7 @@ class OddsEVMonitor:
                     if not isinstance(p_row, dict):
                         continue
                     for bet_side in sides:
-                        key = (str(eid), mu, bet_side)
+                        key = (str(eid), mu, bet_side, _scan_strike_key(p_row, mname))
                         if key in seen_sides:
                             continue
                         dec = _decimal_for_side(p_row, bet_side)
@@ -2729,6 +2753,7 @@ class OddsEVMonitor:
         take_book: str = "Kalshi",
     ) -> Optional[Dict[str, Any]]:
         ev_obj = vb.get("event") or {}
+        clock_ev = _clock_event_for_value_bet(vb, odds_doc)
         home = str(ev_obj.get("home") or "")
         away = str(ev_obj.get("away") or "")
         teams = f"{away} @ {home}" if away and home else ""
@@ -2817,17 +2842,10 @@ class OddsEVMonitor:
             return None
         if k_dec is None or k_dec <= 1.0:
             return None
-        # Totals: missing sister = no card. Stale take line vs live consensus (10.5 vs 7) = hide.
+        # Totals: missing sister = no card. Each strike (O7 / O10.5) is its own two-way.
+        # Do not drop O10.5 because the board also has o7 — that is a valid alt.
         if _market_is_total(mname):
             if not _two_way_pick_opp_decimals(k_row or {}, bet_side):
-                return None
-            take_line = total_line_value(k_row)
-            consensus = _consensus_primary_totals_line(bks, skip_book=take_canon)
-            if (
-                take_line is not None
-                and consensus is not None
-                and abs(float(take_line) - float(consensus)) >= 1.0 - 1e-9
-            ):
                 return None
         price_cents = int(max(1, min(99, round(100.0 / k_dec))))
 
@@ -2931,7 +2949,7 @@ class OddsEVMonitor:
                     rec_ts = row.get("updated_at") or row.get("book_updated_at")
                     if rec_ts is None and isinstance(odds_doc, dict):
                         rec_ts = (odds_doc.get("book_updated_at") or {}).get(sn)
-                    if not _is_live_fresh_quote(rec_ts):
+                    if not _rec_quote_in_power(rec_ts, clock_ev):
                         continue
                     panels.append((d_pick, d_opp, sn))
                 panel_books: List[Dict[str, Any]] = [
@@ -3065,7 +3083,7 @@ class OddsEVMonitor:
                 ts = (odds_doc.get("book_updated_at") or {}).get(blob.get("name"))
                 if ts is not None:
                     blob["book_updated_at"] = ts
-        board_books = _fresh_board_books(board_books)
+        board_books = _fresh_board_books(board_books, event=clock_ev)
         if used_fallback_fair:
             return None
         if surviving_books or board_books:
