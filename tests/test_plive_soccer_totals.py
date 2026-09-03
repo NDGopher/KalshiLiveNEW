@@ -259,10 +259,10 @@ def test_dashboard_take_matches_raw_under_186():
         "bookmakers": {
             "PLive": [plive_mk],
             "Betfair Exchange": [
-                {"name": "Totals", "odds": [{"max": 2.5, "over": 2.05, "under": 1.72}]}
+                {"name": "Totals", "odds": [{"max": 2.5, "over": 1.55, "under": 2.40}]}
             ],
-            "Bet365": [{"name": "Totals", "odds": [{"max": 2.5, "over": 2.08, "under": 1.74}]}],
-            "FanDuel": [{"name": "Totals", "odds": [{"max": 2.5, "over": 2.06, "under": 1.73}]}],
+            "Bet365": [{"name": "Totals", "odds": [{"max": 2.5, "over": 1.56, "under": 2.38}]}],
+            "FanDuel": [{"name": "Totals", "odds": [{"max": 2.5, "over": 1.54, "under": 2.42}]}],
         },
     }
     vbs = mon.live_scan_value_bets_from_docs({9002: doc})

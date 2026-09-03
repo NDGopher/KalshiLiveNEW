@@ -532,20 +532,15 @@ def parse_soccer_total_outcome(outcome: Any) -> Tuple[Optional[float], Optional[
 
 
 def _soccer_total_side_take_decimal(slots: Any) -> Optional[float]:
-    """Side-named soccer total: idx0 is the take. Do not use MLB idx1 preference.
+    """Side-named soccer total: idx0 is the take. idx1 is never Over/Under.
 
-    When both slots are populated and look like a real OU pair, the outcome
-    cannot be a single side — fail closed rather than guess.
+    Independent of MLB Game Winner (idx1). If only idx1 is populated (patch
+    with a single live slot), use that sole price.
     """
     a = _slot_decimal(slots, 0)
-    b = _slot_decimal(slots, 1)
-    if a is not None and b is not None:
-        if _valid_ou_hold(a, b):
-            return None
-        return a
     if a is not None:
         return a
-    return b
+    return _slot_decimal(slots, 1)
 
 
 def _explicit_total_line_from_slots(slots: Any, *, soccer: bool) -> Optional[float]:
