@@ -319,15 +319,15 @@ odds_ev_monitor = None  # primary monitor (first selected dashboard filter)
 # Sharps: all subscribed books except Kalshi unless ODDS_API_DEVIG_SHARPS is set (filter JSON can still override).
 DEFAULT_FILTER_NAME = "Kalshi All Sports (3 Sharps Live)"
 _DEFAULT_SHARPS_ORDER = [
-    "Circa", "BookMaker", "Novig", "ProphetX", "SportTrade",
-    "FanDuel", "DraftKings", "Polymarket", "Betfair",
+    "Circa", "BookMaker", "NoVig", "ProphetX", "SportTrade",
+    "FanDuel", "DraftKings", "Polymarket", "Betfair Exchange",
 ]
 DEFAULT_FILTER_PAYLOAD = {
     "state": "ND",
     "bettingBooks": ["Kalshi"],
     "displayBooks": [
         "Kalshi", "FanDuel", "Circa", "BookMaker", "DraftKings",
-        "Novig", "ProphetX", "SportTrade", "Polymarket", "Betfair",
+        "NoVig", "ProphetX", "SportTrade", "Polymarket", "Betfair Exchange",
     ],
     "leagues": [
         "SOCCER_ALL", "TENNIS_ALL", "BASKETBALL_ALL", "FOOTBALL_ALL",
@@ -352,13 +352,13 @@ DEFAULT_FILTER_PAYLOAD = {
     "minSharpLimits": [
         {"book": "BookMaker", "min": 250},
         {"book": "Circa", "min": 250},
-        {"book": "Novig", "min": 200},
+        {"book": "NoVig", "min": 200},
         {"book": "ProphetX", "min": 200},
         {"book": "SportTrade", "min": 200},
         {"book": "DraftKings", "min": 200},
         {"book": "FanDuel", "min": 200},
         {"book": "Polymarket", "min": 0},
-        {"book": "Betfair", "min": 0},
+        {"book": "Betfair Exchange", "min": 0},
     ],
     "linkType": "DESKTOP_BETSLIP",
 }
@@ -371,7 +371,7 @@ CBB_FILTER_PAYLOAD = {
     "bettingBooks": ["Kalshi"],
     "displayBooks": [
         "Kalshi", "FanDuel", "Circa", "BookMaker", "DraftKings",
-        "Novig", "ProphetX", "SportTrade", "Polymarket", "Betfair",
+        "NoVig", "ProphetX", "SportTrade", "Polymarket", "Betfair Exchange",
     ],
     "leagues": ["NCAAB"],
     "excludedCategories": ["1st Quarter", "2nd Quarter", "3rd Quarter", "4th Quarter", "1st Half", "2nd Half"],
@@ -381,7 +381,7 @@ CBB_FILTER_PAYLOAD = {
     "middleFilters": [{"sport": "Any", "minHold": 0, "minMiddle": 0}],
     "sortOrder": "ROI",
     "devigFilter": {
-        "sharps": ["FanDuel", "DraftKings", "BookMaker", "ProphetX", "Novig", "SportTrade", "Polymarket", "Betfair"],
+        "sharps": ["FanDuel", "DraftKings", "BookMaker", "ProphetX", "NoVig", "SportTrade", "Polymarket", "Betfair Exchange"],
         "method": "WORST_CASE",
         "type": "AVERAGE",
         "minEv": 0,
@@ -392,14 +392,14 @@ CBB_FILTER_PAYLOAD = {
     "oddsRanges": [{"book": "Any", "min": -500, "max": 500}],
     "minLimits": [{"book": "Any", "min": 25}, {"book": "Kalshi", "min": 75}],
     "minSharpLimits": [
-        {"book": "Novig", "min": 1000},
+        {"book": "NoVig", "min": 1000},
         {"book": "ProphetX", "min": 1000},
         {"book": "SportTrade", "min": 1000},
         {"book": "FanDuel", "min": 200},
         {"book": "DraftKings", "min": 200},
         {"book": "BookMaker", "min": 250},
         {"book": "Polymarket", "min": 0},
-        {"book": "Betfair", "min": 0},
+        {"book": "Betfair Exchange", "min": 0},
     ],
     "linkType": "DESKTOP_BETSLIP",
 }
@@ -1830,20 +1830,17 @@ async def handle_new_alert(alert: EvAlert):
                     except Exception as e:
                         print(f"      Error extracting team codes: {e}")
             
-            print(f"   Alert will still be shown on dashboard for manual betting, but auto-betting is disabled")
+            print(f"   Unmatched card omitted from the alert list (failed_auto_bet / alert_match_failed only)")
             
-            # Build basic alert_data even when matching fails (for manual betting)
             alert_id = create_alert_id(alert)
             filter_name = getattr(alert, 'filter_name', '')
             
-            # Extract sharp books from filter (for frontend display)
             sharp_books = []
             if filter_name and filter_name in saved_filters:
                 filter_payload = saved_filters[filter_name]
                 if 'devigFilter' in filter_payload and 'sharps' in filter_payload['devigFilter']:
                     sharp_books = filter_payload['devigFilter']['sharps']
             
-            # Build basic alert data (without market matching)
             price_cents = getattr(alert, 'price_cents', None)
             if price_cents is None:
                 price_cents = market_matcher.parse_odds_to_price_cents(alert.odds)
@@ -1882,26 +1879,11 @@ async def handle_new_alert(alert: EvAlert):
                 'ev_source': getattr(alert, 'ev_source', 'odds_api_value_bets'),
             }
             
-            # Store in active_alerts (for dashboard display)
-            active_alerts[alert_id] = alert_data
-            
-            # Emit to dashboard (for manual betting) - skip auto-betting
+            # Do not store unmatched rows on the live list and do not emit new_alert.
             alert_filter_name = getattr(alert, 'filter_name', None) or alert_data.get('filter_name')
-            
-            if alert_filter_name and alert_filter_name not in selected_dashboard_filters:
-                print(f"[ALERT] SKIP: Alert from filter '{alert_filter_name}' not in selected dashboard filters")
-                return
-            
-            show_unmatched = alert.ev_percent >= dashboard_min_ev or not getattr(alert, 'strict_pass', True)
-            if show_unmatched:
-                print(
-                    f"[ALERT] ✅ Emitting unmatched alert to dashboard: EV {alert.ev_percent:.2f}% "
-                    f"(min {dashboard_min_ev:.2f}% or diagnostic strict_pass=False)"
-                )
+            if unmatched_alert_should_emit_new_alert(alert_data):
                 socketio.emit('new_alert', alert_data)
-                print(f"New alert (unmatched): {alert.teams} - {alert.pick} ({alert.ev_percent:.2f}% EV)")
-            else:
-                print(f"❌ Filtered unmatched alert (EV {alert.ev_percent:.2f}% < min {dashboard_min_ev:.2f}%)")
+            fanout_unmatched_alert(socketio.emit, alert_data)
             
             # Skip auto-betting since matching failed
             # CRITICAL: Log ALL high-EV alerts (>= 10%) that fail matching, regardless of filter selection
@@ -2234,6 +2216,12 @@ async def handle_new_alert(alert: EvAlert):
             'last_seen': time.time(),  # Track when alert was last seen for stale detection
             'strict_pass': getattr(alert, 'strict_pass', True),
             'ev_source': getattr(alert, 'ev_source', 'odds_api_value_bets'),
+            'book_updated_at': getattr(alert, 'book_updated_at', None) or {},
+            'kalshi_last_trade_ts': getattr(alert, 'kalshi_last_trade_ts', None) or (
+                (match_result.get('market') or {}).get('last_trade_ts')
+                or (match_result.get('market') or {}).get('last_trade_time')
+                or (match_result.get('market') or {}).get('updated_time')
+            ),
         }
         
         # CRITICAL: Check if this alert_id is already being processed (prevent duplicate processing)
@@ -2379,12 +2367,12 @@ async def handle_new_alert(alert: EvAlert):
             return
         
         print(f"[ALERT] Processing alert: {alert.teams} - {alert.pick} ({alert.ev_percent:.2f}% EV, dashboard_min_ev={dashboard_min_ev:.2f}%)")
-        show_matched = alert.ev_percent >= dashboard_min_ev or not getattr(alert, 'strict_pass', True)
+        show_matched = alert.ev_percent >= dashboard_min_ev
         if show_matched:
             # Emit to all connected clients IMMEDIATELY (don't wait for orderbook)
             print(
                 f"[ALERT] ✅ Emitting to frontend: EV {alert.ev_percent:.2f}% "
-                f"(min {dashboard_min_ev:.2f}% or diagnostic strict_pass=False)"
+                f"(min {dashboard_min_ev:.2f}%)"
             )
             socketio.emit('new_alert', alert_data)
             print(f"New alert: {alert.teams} - {alert.pick} ({alert.ev_percent:.2f}% EV)")
@@ -3594,7 +3582,7 @@ def run_monitor_loop():
                 
                 # Filter by dashboard min EV before emitting update
                 global dashboard_min_ev
-                show_update = alert.ev_percent >= dashboard_min_ev or not getattr(alert, 'strict_pass', True)
+                show_update = alert.ev_percent >= dashboard_min_ev
                 if show_update:
                     # Check if values actually changed (avoid logging every refresh)
                     old_ev = alert_data.get('ev_percent', 0)
@@ -3622,8 +3610,8 @@ def run_monitor_loop():
                     if ev_changed or liq_changed:
                         print(f"Updated alert: {alert.teams} - {alert.pick} (EV: {alert.ev_percent:.2f}%)")
                 else:
-                    # EV dropped below threshold — remove unless diagnostic display candidate
-                    if getattr(alert, 'strict_pass', True) and alert_id in active_alerts:
+                    # EV dropped below the dashboard floor — hide the whole card.
+                    if alert_id in active_alerts:
                         del active_alerts[alert_id]
                         socketio.emit('remove_alert', {'id': alert_id})
                         print(f"Removed alert (EV {alert.ev_percent:.2f}% < min {dashboard_min_ev:.2f}%): {alert.teams} - {alert.pick}")
@@ -3957,12 +3945,56 @@ def serve_logo(filename):
     return send_from_directory(logos_dir, filename)
 
 
+def is_unlisted_match_failed(row: Dict) -> bool:
+    """Unmatched Kalshi cards must not appear on GET /api/alerts or the live list."""
+    if not isinstance(row, dict):
+        return True
+    if row.get("match_failed") is True:
+        return True
+    ticker = row.get("ticker")
+    if ticker in (None, "") and row.get("match_failure_reason"):
+        return True
+    return False
+
+
+def listed_active_alerts(source=None):
+    src = active_alerts if source is None else source
+    if isinstance(src, dict):
+        rows = list(src.values())
+    else:
+        rows = list(src or [])
+    out = [r for r in rows if not is_unlisted_match_failed(r)]
+    floor = float(dashboard_min_ev or 0.0)
+    return [r for r in out if float(r.get("ev_percent") or 0.0) >= floor]
+
+
+def unmatched_alert_should_emit_new_alert(_alert_data=None) -> bool:
+    """Unmatched cards stay off the live list. alert_match_failed + failed_auto_bet only."""
+    return False
+
+
+def fanout_unmatched_alert(emit_fn, alert_data: Dict) -> Dict[str, Any]:
+    """Emit alert_match_failed only. Never new_alert. Never store on the list."""
+    payload = {
+        "teams": alert_data.get("teams"),
+        "pick": alert_data.get("pick"),
+        "market_type": alert_data.get("market_type"),
+        "reason": alert_data.get("match_failure_reason") or "Could not find matching submarket",
+        "ev_percent": alert_data.get("ev_percent"),
+        "alert_id": alert_data.get("id"),
+    }
+    if emit_fn is not None:
+        emit_fn("alert_match_failed", payload)
+    return {"stored": False, "emitted": ["alert_match_failed"], "emit_new_alert": False}
+
+
 @app.route('/api/alerts', methods=['GET'])
 def get_alerts():
-    """Get all active alerts"""
+    """Get active alerts. match_failed / unmatched rows are omitted."""
+    visible = listed_active_alerts()
     return jsonify({
-        'alerts': list(active_alerts.values()),
-        'count': len(active_alerts)
+        'alerts': visible,
+        'count': len(visible)
     })
 
 
@@ -5330,7 +5362,8 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
             # This multiplies the market-type specific amount
             if not is_nhl_over:
                 devig_books = getattr(alert, 'devig_books', []) or alert_data.get('devig_books', [])
-                if devig_books and 'ProphetX' in devig_books and 'Novig' in devig_books:
+                _devig_l = {str(b).strip().lower() for b in (devig_books or [])}
+                if 'prophetx' in _devig_l and 'novig' in _devig_l:
                     base_amount = bet_amount  # Store before multiplier
                     bet_amount = bet_amount * px_novig_multiplier
                     print(f"[AUTO-BET] ProphetX + Novig detected - applying {px_novig_multiplier}x multiplier: ${base_amount:.2f} -> ${bet_amount:.2f}")
@@ -8708,7 +8741,7 @@ def handle_connect():
     """Handle client connection"""
     print(f"Client connected: {request.sid}")
     # Send current alerts to new client
-    emit('alerts_update', {'alerts': list(active_alerts.values())})
+    emit('alerts_update', {'alerts': listed_active_alerts()})
 
 
 @socketio.on('disconnect')

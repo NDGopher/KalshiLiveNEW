@@ -21,7 +21,7 @@ const fs = require('fs');
 const src = fs.readFileSync('static/script.js','utf8');
 function escapeHtml(t){return String(t||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 eval(src.slice(src.indexOf('function normalizeBookKey'), src.indexOf('function bookMatchesDevigOrSharp')));
-const names = ['Bet365','Betfair Exchange','Betfair','BetMGM','Caesars','NoVig','Novig','Circa','Circa Sports','BookMaker'];
+const names = ['Bet365','Betfair Exchange','Betfair','BetMGM','Caesars','NoVig','Novig','Circa','Circa Sports','BookMaker','PLive'];
 const out = {};
 for (const n of names) {
   out[n] = {abbrev: uniqueBookAbbrev(n), paths: resolveBookLogoPaths(n)};
@@ -46,8 +46,16 @@ console.log(JSON.stringify(out));
 
 
 def test_no_two_letter_substring_fallback():
+    assert "bookName.substring" not in JS
     assert "substring(0, 2)" not in JS
-    assert "substring(0,2)" not in JS
+    assert "const bookLogos" in JS
+    assert "'NoVig': '/logos/NV.png'" in JS
+    assert "'Novig': '/logos/NV.png'" in JS
+    start = JS.index("function uniqueBookAbbrev")
+    end = JS.index("function abbrevBookTile")
+    assert "slice(0, 2)" not in JS[start:end]
+    assert "slice(0,2)" not in JS[start:end]
+    assert "substring" not in JS[start:end]
 
 
 def test_logo_paths_are_named_files_not_two_letter():
@@ -56,15 +64,15 @@ def test_logo_paths_are_named_files_not_two_letter():
     assert "'/logos/BetMGM.png'" in JS
     assert "'/logos/Caesars.png'" in JS
     assert "'/logos/NV.png'" in JS
-    assert "bet365:" in JS
-    assert "betfairexchange:" in JS
-    assert "novig:" in JS
-    assert "circasports:" in JS
+    assert "'Bet365': '/logos/Bet365.png'" in JS
+    assert "'Betfair Exchange': '/logos/Betfair.png'" in JS
+    assert "'NoVig': '/logos/NV.png'" in JS
+    assert "'Circa Sports': '/logos/Circa.png'" in JS
 
 
 def test_betmgm_never_bookmaker_bm():
-    start = JS.index("betmgm:")
-    end = JS.index("caesars:")
+    start = JS.index("'BetMGM':")
+    end = JS.index("'Caesars':")
     assert "/logos/BM.png" not in JS[start:end]
 
 
@@ -91,5 +99,6 @@ def test_resolver_runtime_unique_abbrevs():
     assert "/logos/BM.png" not in data["BetMGM"]["paths"]
     assert data["Caesars"]["paths"][0].endswith("Caesars.png")
     assert data["NoVig"]["paths"] == ["/logos/NV.png"]
+    assert data["PLive"]["abbrev"] == "PLV"
     assert data["emptyCirca"] is True
     assert data["circaWithLine"] is True

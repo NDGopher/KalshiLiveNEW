@@ -37,8 +37,10 @@ SHARP_SIGN_FLIP_CLUSTER = 0.04
 # use a global median on a bimodal board (that drops the close rec).
 SHARP_ADJACENT_SEED = 0.04
 SHARP_ADJACENT_GROW = 0.03
-# Far cluster / 10c+ vs the Kalshi-adjacent pack (egregious, not DK +228 vs +245).
-SHARP_EGREGIOUS_GAP = 0.10
+# One egregious screen: |implied(book) − implied(Kalshi)| > 10 cents, or sign flip.
+# Replaces a global-median / pack-median outlier screen. DK +228 vs +245 (~1.5c) stays.
+JUNK_VS_KALSHI_CENTS = 0.10
+SHARP_EGREGIOUS_GAP = JUNK_VS_KALSHI_CENTS
 BETTER_BOOKS_KILL = 3
 MEDIAN_GATE_TOL = 0.005
 # Identity band. KEEP boards with ~8c of juice (57c vs 65c) must not match this.
@@ -157,6 +159,40 @@ def _book_implied(book: Dict[str, Any]) -> float:
     return 1.0 / float(book["decimal_pick"])
 
 
+def implied_prob_from_american(american: int) -> Optional[float]:
+    dec = american_to_decimal(int(american))
+    if dec <= 1.0:
+        return None
+    return 1.0 / dec
+
+
+def is_sign_flip_american(book_american: int, kalshi_american: int) -> bool:
+    """Plus vs minus on the same pick (NV −154 vs Kalshi +186). Even money is not a flip."""
+    b, k = int(book_american), int(kalshi_american)
+    if b == 0 or k == 0:
+        return False
+    return (b > 0) != (k > 0)
+
+
+def is_junk_vs_kalshi(
+    book_american: int,
+    kalshi_american: int,
+    *,
+    gap: float = JUNK_VS_KALSHI_CENTS,
+) -> bool:
+    """Display and fair share this test. True → gray tile and drop from POWER/AVERAGE.
+
+    Junk if the book flips sign vs Kalshi, or |implied − Kalshi implied| > 10 cents.
+    """
+    if is_sign_flip_american(book_american, kalshi_american):
+        return True
+    bp = implied_prob_from_american(book_american)
+    kp = implied_prob_from_american(kalshi_american)
+    if bp is None or kp is None:
+        return True
+    return abs(bp - kp) > float(gap) + 1e-12
+
+
 def kalshi_adjacent_pack(
     books: List[Dict[str, Any]],
     kalshi_american: int,
@@ -240,30 +276,18 @@ def filter_sharp_panel(
     Name is ignored (PLive / NV / DK use the same screen). Surviving rows keep
     their original keys so the caller can still read decimals / american.
 
-    When ``kalshi_american`` is set, outliers are judged vs the Kalshi-adjacent
-    pack — not a global median (a steam cluster must not eat the close rec).
+    When ``kalshi_american`` is set, egregious quotes use ``is_junk_vs_kalshi``
+    (10c from Kalshi or sign flip) — not a global median.
     """
     eligible = _eligible_sharp_books(books)
     if not eligible:
         return []
 
     if kalshi_american is not None:
-        pack = kalshi_adjacent_pack(eligible, int(kalshi_american))
-        pack_imps = [_book_implied(b) for b in pack]
-        pack_med = _median_floats(pack_imps) if pack_imps else None
-        kd = american_to_decimal(int(kalshi_american))
-        k_imp = (1.0 / kd) if kd > 1.0 else None
-        ref = pack_med if pack_med is not None else k_imp
-        sided = k_imp is not None and abs(k_imp - 0.5) >= SHARP_SIGN_FLIP_CLUSTER
+        # 10c-from-Kalshi (or sign flip) is the only egregious screen — not a global median.
         surviving: List[Dict[str, Any]] = []
         for book in eligible:
-            p = _book_implied(book)
-            # Wrong sign vs Kalshi on a sided board (NV -154 on a +186 pack).
-            if sided and k_imp is not None and (p - 0.5) * (k_imp - 0.5) < 0:
-                continue
-            # Stale/wrong-line favorite spike: implied 10c+ above the close pack.
-            # Do not drop better (lower-implied) books — those feed the 3-better kill.
-            if ref is not None and p > ref + SHARP_EGREGIOUS_GAP:
+            if is_junk_vs_kalshi(int(book["american"]), int(kalshi_american)):
                 continue
             surviving.append(book)
         return surviving
@@ -298,7 +322,11 @@ def fair_books_for_panel(survivors: List[Dict[str, Any]], kalshi_american: int) 
     3-better). It must not pull fair. If no adjacent pack exists, fall back to
     same-sign survivors, then the full set.
     """
-    rows = list(survivors or [])
+    rows = [
+        b
+        for b in (survivors or [])
+        if not is_junk_vs_kalshi(int(b.get("american") or 0), int(kalshi_american))
+    ]
     if not rows:
         return []
     pack = kalshi_adjacent_pack(rows, int(kalshi_american))

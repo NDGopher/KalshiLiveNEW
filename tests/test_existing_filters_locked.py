@@ -70,3 +70,15 @@ def test_ten_odds_api_books_include_bet365_not_bookmaker_eu():
         "NoVig",
     ]
     assert "BookMaker.eu" not in books
+
+
+def test_payload_leftovers_use_canonical_book_names():
+    src = _src()
+    assert '"book": "Betfair"' not in src
+    assert '"book": "Novig"' not in src
+    assert '"Betfair Exchange"' in src
+    assert '"NoVig"' in src
+    assert "auto_bet_enabled = False" in src
+    assert "show_matched = alert.ev_percent >= dashboard_min_ev" in src
+    assert "show_update = alert.ev_percent >= dashboard_min_ev" in src
+    assert "or not getattr(alert, 'strict_pass', True)" not in src

@@ -22,6 +22,7 @@ from ev_calculator import (
     decimal_to_american,
     evaluate_sharp_panel_ev,
     filter_sharp_panel,
+    is_junk_vs_kalshi,
 )
 
 
@@ -106,15 +107,14 @@ def _three_better_minus_drop_board():
 
 
 def _three_better_plus_drop_board():
-    """Plus take-venue with four strictly better plus-money survivors."""
+    """Plus take-venue with three strictly better books still inside 10c."""
     return 122, [
-        _book("U1", -117),
-        _book("U2", 192),
+        _book("U1", 140),
+        _book("U2", 145),
         _book("U3", 107),
-        _book("U4", 220),
-        _book("U5", -125),
-        _book("U6", 152),
-        _book("U7", 223),
+        _book("U4", 150),
+        _book("U5", 110),
+        _book("U6", 115),
     ]
 
 
@@ -201,7 +201,7 @@ def test_drop_offsign_rec_on_plus_pack_kills_fat_plus():
     kalshi, books = _plus_money_offsign_drop_board()
     raw_names = {b["name"] for b in books}
     assert "S6" in raw_names
-    surviving = filter_sharp_panel(books)
+    surviving = filter_sharp_panel(books, kalshi_american=kalshi)
     assert "S6" not in {b["name"] for b in surviving}
     out = evaluate_sharp_panel_ev(books, kalshi, min_sharp_books=3)
     assert out["ev_percent"] < 8.0
@@ -365,3 +365,33 @@ def test_bimodal_steam_does_not_eat_close_rec():
     out = evaluate_sharp_panel_ev(books, kalshi, min_sharp_books=3)
     assert out["ev_percent"] < 8.0
     assert out["plus_alert"] is False or out["ev_percent"] <= 5.5
+
+
+def test_junk_vs_kalshi_ten_cent_or_sign_flip():
+    """Anonymous boards. One threshold vs Kalshi — do not pin tickers."""
+    assert is_junk_vs_kalshi(122, 245) is True  # ~16c
+    assert is_junk_vs_kalshi(138, 245) is True  # ~13c
+    assert is_junk_vs_kalshi(228, 245) is False  # ~1.5c stays
+    assert is_junk_vs_kalshi(-139, -133) is False  # ~1c keep, not red (−139 worse)
+    assert is_junk_vs_kalshi(-270, -133) is True  # ~16c
+    assert is_junk_vs_kalshi(-154, 186) is True  # sign flip even if someone measures <10c
+
+
+def test_plus245_drops_far_shorts_not_small_gap():
+    """Kalshi +245 vs +228 pack; +122/+138 are junk and must not print a fat plus."""
+    kalshi = 245
+    books = [
+        _book("CloseA", 228),
+        _book("CloseB", 240),
+        _book("CloseC", 245),
+        _book("FarA", 122),
+        _book("FarB", 138),
+    ]
+    surviving = filter_sharp_panel(books, kalshi_american=kalshi)
+    names = {b["name"] for b in surviving}
+    assert {"CloseA", "CloseB", "CloseC"}.issubset(names)
+    assert "FarA" not in names
+    assert "FarB" not in names
+    out = evaluate_sharp_panel_ev(books, kalshi, min_sharp_books=3)
+    assert out["ev_percent"] < 8.0
+    assert out["raw_ev_percent"] < 11.0

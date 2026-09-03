@@ -966,7 +966,12 @@ def _build_display_books_payload(
     k_row: Dict[str, Any],
 ) -> Dict[str, List[Dict[str, Any]]]:
     rows_out: List[Dict[str, Any]] = [
-        {"book": "Kalshi", "odds": kalshi_am, "limit": float(_row_limit_hint(k_row) or 0.0)}
+        {
+            "book": "Kalshi",
+            "book_key": "kalshi",
+            "odds": kalshi_am,
+            "limit": float(_row_limit_hint(k_row) or 0.0),
+        }
     ]
     if not bks or not isinstance(bks, dict):
         return {pick: rows_out}
@@ -1009,8 +1014,10 @@ def _build_display_books_payload(
                     row = {**row, "home": ndh, "away": nda}
         d = _decimal_for_side(row, bet_side)
         if d and d > 1.0:
+            canon = _norm_book(str(nm))
             blob: Dict[str, Any] = {
-                "book": _norm_book(str(nm)),
+                "book": canon,
+                "book_key": "".join(ch.lower() for ch in canon if ch.isalnum()),
                 "odds": decimal_to_american(float(d)),
                 "limit": float(_row_limit_hint(row) or 0.0),
             }

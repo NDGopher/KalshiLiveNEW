@@ -1279,7 +1279,8 @@ body.dark .book-cell.kalshi-book {
     background: rgba(31, 213, 154, 0.15);
 }
 
-.book-cell.grayed-out {
+.book-cell.grayed-out,
+.book-cell.junk-tile {
     opacity: 0.4;
     background: var(--bg-tertiary);
     border-color: var(--border);
