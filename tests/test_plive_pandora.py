@@ -174,3 +174,84 @@ def test_public_ui_topics_include_required_rooms():
     topics = public_ui_subscribe_topics()
     assert any(t.endswith(".eventData") for t in topics)
     assert any(t.endswith(".eventCoefficients") for t in topics)
+
+
+def test_event_data_s_tree_extracts_mlb_teams():
+    store = PliveStore()
+    store.apply_message(
+        {
+            "isDiff": False,
+            "payload": {
+                "db": {"x": 1},
+                "s": {
+                    "1": {
+                        "2": {
+                            "8": {
+                                "199992971": [
+                                    ["Chicago Cubs", "", "", 1],
+                                    ["Milwaukee Brewers", "", "", 2],
+                                    1788392100,
+                                    None,
+                                    {"ip": True},
+                                ]
+                            },
+                            "3415": {
+                                "188359511": [
+                                    ["Nashville Sounds", "", ""],
+                                    ["Louisville Bats", "", ""],
+                                    1,
+                                ]
+                            },
+                        }
+                    },
+                    "220": {
+                        "1": {
+                            "9": {
+                                "1": [
+                                    ["Arsenal", "", ""],
+                                    ["Chelsea", "", ""],
+                                    1,
+                                ]
+                            }
+                        }
+                    },
+                },
+            },
+        },
+        event_name=f"live.main.{PLIVE_LINE_SET}.eventData",
+    )
+    mlb = store.mlb_events()
+    assert "199992971" in mlb
+    assert mlb["199992971"]["away"] == "Chicago Cubs"
+    assert mlb["199992971"]["home"] == "Milwaukee Brewers"
+    assert "188359511" in mlb  # still baseball; Odds-API team-match drops MiLB
+    assert "1" not in mlb
+
+
+def test_game_period_markets_ml_spread_totals():
+    store = PliveStore()
+    store.apply_message(
+        {
+            "isDiff": False,
+            "payload": {
+                "id": 199992971,
+                "c": {
+                    "m": {
+                        "3": {"o": {"1": 1.29, "2": 3.45}},
+                        "5": {"o": {"14.5": [1.80, 1.94]}, "r": 14.5},
+                        "6": {"o": {"-2": [1.93, 1.81]}, "r": -2},
+                    }
+                },
+            },
+        },
+        event_name=f"live.main.{PLIVE_LINE_SET}.eventCoefficients.199992971",
+    )
+    by_name = {m["name"]: m for m in store.markets_for_event("199992971")}
+    assert by_name["ML"]["odds"][0]["home"] == 1.29
+    assert by_name["ML"]["odds"][0]["away"] == 3.45
+    assert by_name["Totals"]["odds"][0]["hdp"] == 14.5
+    assert by_name["Totals"]["odds"][0]["over"] == 1.80
+    assert by_name["Totals"]["odds"][0]["under"] == 1.94
+    assert by_name["Spread"]["odds"][0]["hdp"] == -2.0
+    assert by_name["Spread"]["odds"][0]["home"] == 1.93
+    assert by_name["Spread"]["odds"][0]["away"] == 1.81

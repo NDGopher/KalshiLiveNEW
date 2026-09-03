@@ -68,9 +68,11 @@ _SPORT_HASH_RE = re.compile(r"#!?/sport/(\d+)", re.I)
 # index 0 ≈ money price, index 1 ≈ decimal odds (see Unified README).
 # Defaults from that subscriber's MLB-looking examples (market 10 ML, 5 totals)
 # plus common 2-way handicap = 2. Override with env if the tree differs.
-_DEFAULT_ML_MARKETS = (10, 1)
-_DEFAULT_SPREAD_MARKETS = (2,)
-_DEFAULT_TOTAL_MARKETS = (5, 3)
+# Live catalog game period ``c.m`` (not the old UnifiedBetting guess of 10/1):
+#   3 = 2-way moneyline, 6 = spread (pair odds), 5 = totals (pair odds).
+_DEFAULT_ML_MARKETS = (3, 9, 10, 1)
+_DEFAULT_SPREAD_MARKETS = (6, 2)
+_DEFAULT_TOTAL_MARKETS = (5,)
 
 
 def _env_bool(name: str, default: str = "false") -> bool:
@@ -298,9 +300,50 @@ def _looks_like_event(rec: Dict[str, Any]) -> bool:
     return bool(home and away)
 
 
+def _team_name_from_row(row: Any) -> Optional[str]:
+    if isinstance(row, str) and row.strip():
+        return row.strip()
+    if isinstance(row, (list, tuple)) and row:
+        return _team_name_from_row(row[0])
+    if isinstance(row, dict):
+        return _first_name(row)
+    return None
+
+
+def walk_event_data_tree(
+    node: Any,
+    *,
+    sport_id: Optional[int] = None,
+    path: Optional[List[str]] = None,
+) -> Iterable[Tuple[str, Dict[str, Any]]]:
+    """Walk ``payload.s[sport][…][eventId] = [awayRow, homeRow, …]``."""
+    path = path or []
+    if isinstance(node, list) and len(node) >= 2 and isinstance(node[0], (list, tuple, dict, str)):
+        away = _team_name_from_row(node[0])
+        home = _team_name_from_row(node[1])
+        if away and home and path:
+            eid = path[-1]
+            if eid.isdigit():
+                rec: Dict[str, Any] = {"id": eid, "away": away, "home": home}
+                if sport_id is not None:
+                    rec["sportId"] = sport_id
+                yield eid, rec
+        return
+    if not isinstance(node, dict):
+        return
+    for key, val in node.items():
+        sid = sport_id
+        if not path:
+            try:
+                sid = int(key)
+            except (TypeError, ValueError):
+                sid = sport_id
+        yield from walk_event_data_tree(val, sport_id=sid, path=path + [str(key)])
+
+
 def iter_event_records(data: Any, *, _depth: int = 0) -> Iterable[Tuple[str, Dict[str, Any]]]:
     """Walk an eventData / live.events snapshot for id + team records."""
-    if _depth > 6 or data is None:
+    if _depth > 8 or data is None:
         return
     if isinstance(data, list):
         for item in data:
@@ -312,12 +355,22 @@ def iter_event_records(data: Any, *, _depth: int = 0) -> Iterable[Tuple[str, Dic
     if inner is not None and inner is not data:
         yield from iter_event_records(inner, _depth=_depth + 1)
         return
+    if isinstance(data.get("s"), dict):
+        yield from walk_event_data_tree(data["s"])
+        return
     if data.get("isDiff") and isinstance(data.get("payload"), list):
-        # Diff of event list: only apply replace/add objects that look like events.
         for op in data["payload"]:
-            if not isinstance(op, dict):
+            if not isinstance(op, dict) or op.get("op") not in ("add", "replace"):
                 continue
             val = op.get("value")
+            path = [p for p in str(op.get("path") or "").split("/") if p]
+            if isinstance(val, list) and path and path[0] == "s":
+                try:
+                    sid = int(path[1])
+                except (IndexError, ValueError):
+                    sid = None
+                yield from walk_event_data_tree(val, sport_id=sid, path=path[1:])
+                continue
             if isinstance(val, dict) and _looks_like_event(val):
                 eid = str(val.get("id") or val.get("eventId") or val.get("ei") or "")
                 if eid:
@@ -331,6 +384,9 @@ def iter_event_records(data: Any, *, _depth: int = 0) -> Iterable[Tuple[str, Dic
     for key, val in data.items():
         if key in ("payload", "parsedPayload", "topicInfo", "ti"):
             yield from iter_event_records(val, _depth=_depth + 1)
+            continue
+        if key == "s" and isinstance(val, dict):
+            yield from walk_event_data_tree(val)
             continue
         if isinstance(val, dict) and _looks_like_event(val):
             eid = str(val.get("id") or val.get("eventId") or val.get("ei") or key)
@@ -626,7 +682,7 @@ class PliveStore:
                 out.append({"name": "ML", "odds": [{"home": home, "away": away}]})
                 break
 
-        # Spread: outcome is the home handicap (e.g. -1.5) or home/away pair + hdp slot.
+        # Spread: outcome is the home handicap (e.g. -1.5) or a [home, away] pair.
         spread_rows: List[Dict[str, Any]] = []
         for mk in self.spread_markets:
             by_line: Dict[float, Dict[str, float]] = {}
@@ -640,6 +696,19 @@ class PliveStore:
                     continue
                 oc = str(outcome)
                 ocl = oc.lower()
+                pair_home = _as_float(slots.get(0))
+                pair_away = _as_float(slots.get(1))
+                line = _as_float(oc)
+                if (
+                    line is not None
+                    and pair_home is not None
+                    and pair_away is not None
+                    and pair_home > 1.0
+                    and pair_away > 1.0
+                ):
+                    by_line.setdefault(line, {})["home"] = pair_home
+                    by_line.setdefault(line, {})["away"] = pair_away
+                    continue
                 if ocl in ("1", "home", "h"):
                     home_dec = dec
                     h = _as_float(slots.get(2) or slots.get("hdp"))
@@ -648,7 +717,6 @@ class PliveStore:
                 elif ocl in ("2", "away", "a"):
                     away_dec = dec
                 else:
-                    line = _as_float(oc)
                     if line is None:
                         continue
                     by_line.setdefault(line, {})["home"] = dec
@@ -659,10 +727,14 @@ class PliveStore:
                 )
             else:
                 for line, sides in by_line.items():
+                    if "home" in sides and "away" in sides:
+                        spread_rows.append(
+                            {"hdp": line, "home": sides["home"], "away": sides["away"]}
+                        )
+                        continue
                     if "home" not in sides:
                         continue
                     opp = by_line.get(-line, {})
-                    # If we only have one side, skip (need two-way for EV).
                     away_s = opp.get("home")
                     if away_s is None:
                         continue
@@ -683,7 +755,19 @@ class PliveStore:
                 if dec is None:
                     continue
                 ocl = str(outcome).lower()
-                line = _as_float(slots.get(2) or slots.get("hdp") or slots.get("max"))
+                pair_over = _as_float(slots.get(0))
+                pair_under = _as_float(slots.get(1))
+                line = _as_float(slots.get(2) or slots.get("hdp") or slots.get("max")) or _as_float(ocl)
+                if (
+                    line is not None
+                    and pair_over is not None
+                    and pair_under is not None
+                    and pair_over > 1.0
+                    and pair_under > 1.0
+                ):
+                    by_line.setdefault(float(line), {})["over"] = pair_over
+                    by_line[float(line)]["under"] = pair_under
+                    continue
                 side = None
                 if "over" in ocl or ocl in ("o", "3"):
                     side = "over"
@@ -729,6 +813,7 @@ class PlivePandoraFeed:
         self.generation = 0
         self._coeff_subscribed: Set[str] = set()
         self._ack_names: Set[str] = set()
+        self._bound_rooms: Set[str] = set()
 
     @property
     def healthy(self) -> bool:
@@ -783,13 +868,31 @@ class PlivePandoraFeed:
             return []
         return self.store.markets_for_event(eid)
 
+    def _bind_room(self, sio: Any, room: str) -> None:
+        """Binary snapshots arrive on the room name, not on the catch-all ``*``."""
+        if not room or room in self._bound_rooms:
+            return
+        self._bound_rooms.add(room)
+
+        @sio.on(room)
+        def _on_room(data: Any, _room: str = room) -> None:
+            self.ingest_raw(data, _room)
+            if _is_event_list_topic(_room) and sio is not None:
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(self._subscribe_mlb_coefficients(sio))
+                except RuntimeError:
+                    pass
+
     async def _emit_public_handshake(self, sio: Any) -> None:
+        topics = public_ui_subscribe_topics()
+        for room in topics:
+            self._bind_room(sio, room)
         for event, payload in handshake_emits():
             try:
                 await sio.emit(event, payload)
             except Exception as ex:
                 print(f"[PLIVE] [WARN] emit {event} failed: {ex}")
-        topics = public_ui_subscribe_topics()
         print(f"[PLIVE] handshake emitted setSocketMetadata + subscribe/getCache ({len(topics)} rooms)")
 
     async def _subscribe_mlb_coefficients(self, sio: Any) -> None:
@@ -808,6 +911,7 @@ class PlivePandoraFeed:
             if room in self._coeff_subscribed:
                 continue
             self._coeff_subscribed.add(room)
+            self._bind_room(sio, room)
             new_rooms.append(room)
         if not new_rooms:
             return
@@ -884,6 +988,7 @@ class PlivePandoraFeed:
         self._sio = sio
         self._coeff_subscribed = set()
         self._ack_names = set()
+        self._bound_rooms = set()
 
         @sio.on("connect")
         async def _on_connect() -> None:
