@@ -14,6 +14,7 @@ from odds_ev_monitor import (
     _pick_qualifier_line_for_side,
     format_spread_qualifier,
     side_handicap,
+    side_signed_line,
 )
 from tests.test_sharp_panel_filter import _book
 
@@ -57,6 +58,25 @@ def test_brewers_away_plus25_label_was_minus25_prices():
     assert away_pick == "Milwaukee Brewers"
     assert away_line == -2.5
     assert away_qual == "-2.5"
+
+
+def test_plive_american_minus15_slot_away_stays_minus15():
+    """Dump −1.5 slot: Astros −1.5 / Sox −1.5. Do not paint Sox +1.5."""
+    row = {"hdp": -1.5, "home": 9.78, "away": 1.03358, "line_style": "american"}
+    home_pick, home_qual, home_line = _pick_qualifier_line_for_side(
+        "Houston Astros", "Chicago White Sox", "Spread", "home", row
+    )
+    away_pick, away_qual, away_line = _pick_qualifier_line_for_side(
+        "Houston Astros", "Chicago White Sox", "Spread", "away", row
+    )
+    assert home_pick == "Houston Astros"
+    assert home_line == -1.5
+    assert home_qual == "-1.5"
+    assert away_pick == "Chicago White Sox"
+    assert away_line == -1.5
+    assert away_qual == "-1.5"
+    assert side_signed_line(row, "away") == -1.5
+    assert side_signed_line(row, "home") == -1.5
 
 
 def test_do_not_keep_on_painted_plus15_when_actual_is_minus15():

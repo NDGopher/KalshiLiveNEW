@@ -62,7 +62,8 @@ Public handshake (bare connect is silent):
 4. Then `subscribeSystemEvents` + `subscribe` / `getCache` for `live.sports`, `live.main.<LINE_SET>.eventData`, and `eventCoefficients` (click-in full book). Per-event `eventCoefficients.{id}` for live MLB (sport 1, league 8). `live.events` is dead.
 
 - MLB is catalog **sport 1** (`#!/sport/1`). `https://plive.becoms.co/live/?#!/sport/220` is **Top Soccer**, not MLB.
-- Run-line name/ticker: negate the home `hdp` for the **away** side only (Brewers +2.5 label on −2.5 prices). Home labels stay as stored.
+- `eventData` list is **[home, away]** (stadium home first). Market 6 `[idx0, idx1]` is a 2-way decimal pair, not money/decimal.
+- PLive run-line name/ticker: away keeps the **slot sign** (`line_style=american`) so a −1.5 slot is not painted as Sox +1.5. Kalshi/Odds-API still negate home `hdp` for away.
 - Trust the `live.sports` catalog (1 Baseball, 2 Basketball, 3 Football, …). Do not use the old Selenium map that had nfl=2 / nba=3.
 - Filter JSON still has `bettingBooks=[Kalshi]`; PLive take is a second venue in code. Same filters and dollar sizes. PLive is not a new filter.
 - **No BetBCK scrape.**

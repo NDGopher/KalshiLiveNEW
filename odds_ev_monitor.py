@@ -821,20 +821,37 @@ def _float_hdp(value: Any) -> Optional[float]:
 
 
 def home_centric_hdp(row: Optional[Dict[str, Any]]) -> Optional[float]:
-    """Odds-API / PLive spread rows store ``hdp`` as the home handicap."""
+    """Spread rows store ``hdp`` as the home handicap (market 6 outcome key)."""
     if not isinstance(row, dict):
         return None
     return _float_hdp(row.get("hdp"))
 
 
+def is_american_run_line_row(row: Optional[Dict[str, Any]]) -> bool:
+    """PLive market 6: both sides of a slot keep that slot's sign on the label."""
+    if not isinstance(row, dict):
+        return False
+    return str(row.get("line_style") or "").lower() == "american"
+
+
 def side_handicap(home_hdp: Optional[float], bet_side: str) -> Optional[float]:
-    """Actual handicap for this side. Away is the negated home line — never reuse home's sign."""
+    """Odds-API / Kalshi: away is the negated home line."""
     hf = _float_hdp(home_hdp)
     if hf is None:
         return None
     if (bet_side or "").lower() == "away":
         return -hf
     return hf
+
+
+def side_signed_line(row: Optional[Dict[str, Any]], bet_side: str) -> Optional[float]:
+    """Away label: PLive slot sign as-is; Kalshi/Odds-API negate home hdp."""
+    hf = home_centric_hdp(row)
+    if hf is None:
+        return None
+    if is_american_run_line_row(row):
+        return hf
+    return side_handicap(hf, bet_side)
 
 
 def format_spread_qualifier(hdp: Optional[float]) -> Optional[str]:
@@ -884,8 +901,8 @@ def _pick_qualifier_line_for_side(
         if side == "under":
             return "Under", (f"{lf:.1f}" if lf is not None else None), lf
     if "SPREAD" in mname or "HANDICAP" in mname or "PUCK LINE" in mname or "PUCKLINE" in mname.replace(" ", ""):
-        # Home-centric hdp. Away must flip the sign or the ticker/name is the other contract.
-        hf = side_handicap(home_centric_hdp(row), side)
+        # PLive american: same slot sign both sides. Kalshi: negate away.
+        hf = side_signed_line(row, side)
         qual = format_spread_qualifier(hf)
         if side == "home":
             return event_home, qual, hf
@@ -2587,7 +2604,7 @@ class OddsEVMonitor:
         row_for_pick = k_row if k_row else f_row if f_row else market
         pick, qualifier, line_val = _pick_qualifier_line_for_side(home, away, mname, bet_side, row_for_pick)
         if _market_is_spread(mname):
-            actual_hdp = side_handicap(home_centric_hdp(row_for_pick), bet_side)
+            actual_hdp = side_signed_line(row_for_pick, bet_side)
             if actual_hdp is not None:
                 # Re-grade on the side's real line. Do not drop as a totals/TT mismatch.
                 line_val = actual_hdp

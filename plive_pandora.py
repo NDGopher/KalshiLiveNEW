@@ -66,16 +66,13 @@ PLIVE_SPORT_CATALOG_FALLBACK: Dict[int, str] = {
 
 _SPORT_HASH_RE = re.compile(r"#!?/sport/(\d+)", re.I)
 
-# Ganchrow coefficient tree (same parse as UnifiedBetting):
+# Ganchrow coefficient tree (live MLB, event 199298371):
 #   /c/m/{market}/o/{outcome}/{index}
-# index 0 ≈ money price, index 1 ≈ decimal odds (see Unified README).
-# Defaults from that subscriber's MLB-looking examples (market 10 ML, 5 totals)
-# plus common 2-way handicap = 2. Override with env if the tree differs.
-# Live catalog game period ``c.m`` (main baseball list = ML / game total / run line):
-#   6 = run line only (nested [home, away] often lives in slot 1).
-#   5 = game totals. 7/8 = team totals — never paint those on a spread tile.
-# Market 3 is not the public-UI / Odds-API PLive ML for MLB; do not use it
-# for the ML column (Odds-API PLive ML wins on merge).
+# Market 6 run line: each outcome is a HOME handicap. [idx0, idx1] is a
+# 2-way pair (~7% hold), NOT [money price, decimal]. Both slots are decimals.
+# Market 3 ML: idx1 is the true decimal. Do not overwrite Odds-API PLive ML.
+# Market 5 = game totals. 7/8 = team totals (click-in only) — never on Spread.
+# eventData list is [home, away] (stadium home first).
 _DEFAULT_ML_MARKETS = (10, 9, 1)
 _DEFAULT_SPREAD_MARKETS = (6,)
 _DEFAULT_TOTAL_MARKETS = (5,)
@@ -257,7 +254,7 @@ def _as_float(v: Any) -> Optional[float]:
 
 
 def _decimal_from_slot(slots: Dict[int, Any]) -> Optional[float]:
-    """Prefer index 1 (decimal odds in the UnifiedBetting README), else index 0 if it looks like odds."""
+    """ML / totals: prefer index 1 (true decimal on market 3). Not used for market 6 pairs."""
     for idx in (1, 0):
         f = _as_float(slots.get(idx))
         if f is not None and f > 1.0:
@@ -266,7 +263,7 @@ def _decimal_from_slot(slots: Dict[int, Any]) -> Optional[float]:
 
 
 def _as_decimal_pair(value: Any) -> Optional[Tuple[float, float]]:
-    """Unwrap ``[home, away]`` or ``{0: home, 1: away}``. Nested slot-1 pairs from market 6."""
+    """Unwrap ``[home, away]`` or ``{0: home, 1: away}``. Both values are decimals."""
     if isinstance(value, (list, tuple)) and len(value) >= 2:
         a, b = _as_float(value[0]), _as_float(value[1])
         if a is not None and b is not None and a > 1.0 and b > 1.0:
@@ -284,28 +281,18 @@ def _as_decimal_pair(value: Any) -> Optional[Tuple[float, float]]:
     return None
 
 
-def _looks_like_live_spread_dec(d: float) -> bool:
-    """Reject dead scalars (dump: 8.86 / 1.045 on hidden Astros −1.5). Keep 1.17 / 4.6 alts."""
-    return 1.12 <= float(d) <= 7.0
-
-
 def _spread_pair_from_slots(slots: Dict[int, Any]) -> Optional[Tuple[float, float]]:
-    """Market 6 run line: prefer nested pair in slot 1. Dead scalars → unpriced."""
+    """Market 6: [idx0, idx1] is the 2-way pair. Keep alts (9.78 / 1.03 is a real hold)."""
     if not isinstance(slots, dict):
         return None
-    for idx in (1, 0, 2):
-        pair = _as_decimal_pair(slots.get(idx))
-        if pair and _looks_like_live_spread_dec(pair[0]) and _looks_like_live_spread_dec(pair[1]):
-            return pair
     a = _as_float(slots.get(0))
     b = _as_float(slots.get(1))
-    if (
-        a is not None
-        and b is not None
-        and _looks_like_live_spread_dec(a)
-        and _looks_like_live_spread_dec(b)
-    ):
+    if a is not None and b is not None and a > 1.0 and b > 1.0:
         return (a, b)
+    for idx in (1, 0, 2):
+        pair = _as_decimal_pair(slots.get(idx))
+        if pair:
+            return pair
     return None
 
 
@@ -383,11 +370,11 @@ def walk_event_data_tree(
     sport_id: Optional[int] = None,
     path: Optional[List[str]] = None,
 ) -> Iterable[Tuple[str, Dict[str, Any]]]:
-    """Walk ``payload.s[sport][…][eventId] = [awayRow, homeRow, …]``."""
+    """Walk ``payload.s[sport][…][eventId] = [homeRow, awayRow, …]`` (stadium home first)."""
     path = path or []
     if isinstance(node, list) and len(node) >= 2 and isinstance(node[0], (list, tuple, dict, str)):
-        away = _team_name_from_row(node[0])
-        home = _team_name_from_row(node[1])
+        home = _team_name_from_row(node[0])
+        away = _team_name_from_row(node[1])
         if away and home and path:
             eid = path[-1]
             if eid.isdigit():
@@ -865,7 +852,7 @@ class PliveStore:
                     by_line[float(line)] = {"home": pair[0], "away": pair[1]}
                     continue
                 dec = _decimal_from_slot(slots)
-                if dec is not None and _looks_like_live_spread_dec(dec):
+                if dec is not None and dec > 1.0:
                     singles[float(line)] = dec
             seen_abs: Set[float] = set()
             for line, home_dec in singles.items():
@@ -879,7 +866,12 @@ class PliveStore:
                 by_line[float(line)] = {"home": home_dec, "away": opp}
             for line, sides in by_line.items():
                 spread_rows.append(
-                    {"hdp": line, "home": sides["home"], "away": sides["away"]}
+                    {
+                        "hdp": line,
+                        "home": sides["home"],
+                        "away": sides["away"],
+                        "line_style": "american",
+                    }
                 )
             if spread_rows:
                 break
