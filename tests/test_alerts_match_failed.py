@@ -250,3 +250,142 @@ def test_unmatched_handle_does_not_emit_new_alert():
     assert result["stored"] is False
     assert "new_alert" not in emitted
     assert emitted == ["alert_match_failed"]
+
+
+def test_blank_kalshi_ticker_routes_to_paper_display():
+    try:
+        from dashboard import _is_paper_kalshi_alert, _is_plive_take_alert
+        from ev_alert import EvAlert
+    except Exception as exc:  # pragma: no cover
+        pytest.skip(f"dashboard import failed: {exc}")
+
+    blank = EvAlert(
+        {
+            "market_type": "Moneyline",
+            "teams": "A @ B",
+            "pick": "Draw",
+            "qualifier": "",
+            "ev_percent": 5.0,
+            "odds": "+150",
+            "ticker": "",
+            "take_book": "Kalshi",
+            "ev_source": "live_event_scan",
+        }
+    )
+    assert _is_plive_take_alert(blank) is False
+    assert _is_paper_kalshi_alert(blank) is True
+
+
+def test_match_failed_kalshi_falls_back_to_paper_display(monkeypatch):
+    """Backend-fired alert with unmatchable KX ticker must still reach /api/alerts."""
+    monkeypatch.delenv("DASHBOARD_PASSWORD", raising=False)
+    try:
+        import asyncio
+
+        import dashboard as dash
+        from ev_alert import EvAlert
+    except Exception as exc:  # pragma: no cover
+        pytest.skip(f"dashboard import failed: {exc}")
+
+    dash.active_alerts.clear()
+    monkeypatch.setattr(dash, "dashboard_min_ev", 0.0)
+    monkeypatch.setattr(dash, "selected_dashboard_filters", [])
+
+    async def _no_submarket(*_a, **_k):
+        return None
+
+    class _FakeKalshi:
+        async def find_submarket(self, *a, **k):
+            return None
+
+        async def build_market_ticker(self, *a, **k):
+            return None
+
+        async def subscribe_orderbook(self, *_a, **_k):
+            return None
+
+        warm_cache_tickers = set()
+
+    monkeypatch.setattr(dash, "kalshi_client", _FakeKalshi())
+
+    alert = EvAlert(
+        {
+            "market_type": "Moneyline",
+            "teams": "Away FC @ Home FC",
+            "pick": "Draw",
+            "qualifier": "",
+            "ev_percent": 6.5,
+            "odds": "+180",
+            "ticker": "KXSOCCERGAME-26SEP04AWYHOM",
+            "market_url": "https://kalshi.com/markets/kxsoccer/game",
+            "take_book": "Kalshi",
+            "ev_source": "odds_api_value_bets",
+            "filter_name": "",
+        }
+    )
+    alert.price_cents = 36
+    alert.filter_name = ""
+
+    emitted = []
+
+    def _emit(event, data=None, **_kwargs):
+        emitted.append(event)
+
+    monkeypatch.setattr(dash.socketio, "emit", _emit)
+
+    asyncio.run(dash.handle_new_alert(alert))
+    assert "new_alert" in emitted
+    assert "alert_match_failed" in emitted
+    with dash.app.test_client() as client:
+        body = client.get("/api/alerts").get_json()
+        assert body.get("count", 0) >= 1
+        row = (body.get("alerts") or [])[0]
+        assert row.get("take_book") == "Kalshi"
+        assert row.get("match_failed") is False
+        assert float(row.get("ev_percent") or 0) >= 6.0
+
+
+def test_keepalive_invokes_updated_callbacks_for_unchanged_alerts():
+    """Stable odds must still hit updated callbacks (dashboard refreshes last_seen)."""
+    try:
+        import asyncio
+
+        from ev_alert import EvAlert
+        from odds_ev_monitor import OddsEVMonitor
+    except Exception as exc:  # pragma: no cover
+        pytest.skip(f"import failed: {exc}")
+
+    alert = EvAlert(
+        {
+            "market_type": "Moneyline",
+            "teams": "A @ B",
+            "pick": "A",
+            "qualifier": "",
+            "ev_percent": 4.0,
+            "odds": "+120",
+            "ticker": "KALSHI|A @ B|A|",
+            "take_book": "Kalshi",
+            "ev_source": "live_event_scan",
+        }
+    )
+    mon = OddsEVMonitor(auth_token=None)
+    touched = []
+
+    async def _on_upd(a):
+        touched.append(a.pick)
+
+    mon.updated_alert_callbacks.append(_on_upd)
+    h = f"{alert.ticker}|{alert.pick}|{alert.qualifier}|{alert.odds}"
+    mon._seen_alerts.add(h)
+    mon._previous_alert_values[h] = {
+        "ev_percent": alert.ev_percent,
+        "liquidity": getattr(alert, "liquidity", 0),
+        "odds": alert.odds,
+    }
+
+    async def fake_fetch():
+        return [alert]
+
+    mon.fetch_alerts = fake_fetch  # type: ignore[method-assign]
+    asyncio.run(mon.check_for_new_alerts())
+    assert touched == ["A"]

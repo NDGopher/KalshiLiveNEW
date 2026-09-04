@@ -1868,7 +1868,11 @@ class OddsEVMonitor:
                 alert.ev_source = "plive_take"
                 alert.ticker = str(bet.get("ticker") or f"PLIVE|{teams}|{selection}|{qualifier}")
             else:
-                alert.ticker = self.extract_ticker_from_link(link) or bet.get("ticker")
+                alert.ticker = (
+                    self.extract_ticker_from_link(link)
+                    or bet.get("ticker")
+                    or paper_kalshi_ticker(teams, selection, qualifier)
+                )
             alert.price_cents = price_cents
             alert.line = line
             alert.live = alert_data.get("live")
@@ -3702,6 +3706,9 @@ class OddsEVMonitor:
 
         new_alerts: List[EvAlert] = []
         updated_alerts: List[EvAlert] = []
+        # Unchanged but still returned by the scan — must refresh dashboard last_seen.
+        # Otherwise the 5s stale cleanup removes cards while odds sit still.
+        keepalive_alerts: List[EvAlert] = []
         for alert_hash, alert in current_alerts_by_hash.items():
             if alert_hash not in self._seen_alerts:
                 self._seen_alerts.add(alert_hash)
@@ -3723,6 +3730,8 @@ class OddsEVMonitor:
                         "liquidity": getattr(alert, "liquidity", 0),
                         "odds": alert.odds,
                     }
+                else:
+                    keepalive_alerts.append(alert)
 
         if new_alerts:
             print(f"[ODDS API] Emitting {len(new_alerts)} new alert(s) to callbacks")
@@ -3750,6 +3759,17 @@ class OddsEVMonitor:
                 except Exception as e:
                     print(f"[WARN] Error in updated alert callback: {e}")
 
+        # Touch last_seen on stable cards so FE stale cleanup does not wipe them.
+        for alert in keepalive_alerts:
+            for callback in self.updated_alert_callbacks:
+                try:
+                    if asyncio.iscoroutinefunction(callback):
+                        await callback(alert)
+                    else:
+                        callback(alert)
+                except Exception as e:
+                    print(f"[WARN] Error in keepalive alert callback: {e}")
+
         for removed_hash in removed_hashes:
             self._previous_alert_values.pop(removed_hash, None)
 
@@ -3757,6 +3777,8 @@ class OddsEVMonitor:
             print(f"[ALERT] Found {len(new_alerts)} new/reappeared alert(s): {[f'{a.teams} - {a.pick}' for a in new_alerts[:3]]}")
         if updated_alerts:
             print(f"[UPD] Updated {len(updated_alerts)} alert(s) with new EV/liquidity")
+        if keepalive_alerts and (len(keepalive_alerts) <= 3 or int(time.time()) % 30 < 2):
+            print(f"[KEEPALIVE] {len(keepalive_alerts)} stable alert(s) still live (refresh last_seen)")
         if removed_hashes:
             print(f"[DEL] {len(removed_hashes)} alert(s) disappeared from Odds-API feed")
 

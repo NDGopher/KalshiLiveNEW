@@ -2348,8 +2348,9 @@ def _is_paper_kalshi_alert(alert: EvAlert) -> bool:
     ticker = str(getattr(alert, "ticker", "") or "")
     if is_paper_kalshi_ticker(ticker):
         return True
+    # Empty ticker still has a priced Kalshi take — show the card (paper), do not drop.
     if not ticker:
-        return False
+        return True
     return not is_kalshi_ticker(ticker) and not ticker.upper().startswith("KXSCAN")
 
 
@@ -2695,7 +2696,7 @@ async def handle_new_alert(alert: EvAlert):
                     except Exception as e:
                         print(f"      Error extracting team codes: {e}")
             
-            print(f"   Unmatched card omitted from the alert list (failed_auto_bet / alert_match_failed only)")
+            print(f"   Unmatched executable ticker — still emit a paper display card so the FE shows the take")
             
             alert_id = create_alert_id(alert)
             filter_name = getattr(alert, 'filter_name', '')
@@ -2744,11 +2745,19 @@ async def handle_new_alert(alert: EvAlert):
                 'ev_source': getattr(alert, 'ev_source', 'odds_api_value_bets'),
             }
             
-            # Do not store unmatched rows on the live list and do not emit new_alert.
+            # Diagnostic: alert_match_failed (FE does not render this event).
             alert_filter_name = getattr(alert, 'filter_name', None) or alert_data.get('filter_name')
             if unmatched_alert_should_emit_new_alert(alert_data):
                 socketio.emit('new_alert', alert_data)
             fanout_unmatched_alert(socketio.emit, alert_data)
+
+            # Display fallback: priced take still belongs on the board as paper Kalshi.
+            # Auto-bet stays fail-closed (paper path sets autobet_allow=False).
+            print(
+                f"[ALERT] Match failed → paper display card | {alert.teams} - {alert.pick} "
+                f"({alert.ev_percent:.2f}% EV)"
+            )
+            await handle_kalshi_paper_display_alert(alert)
             
             # Skip auto-betting since matching failed
             # CRITICAL: Log ALL high-EV alerts (>= 10%) that fail matching, regardless of filter selection
@@ -4660,7 +4669,11 @@ def run_monitor_loop():
                 try:
                     await asyncio.sleep(2)  # Check every 2 seconds
                     current_time = time.time()
-                    stale_threshold = 5.0  # Remove alerts not seen in 5 seconds
+                    # Keepalive from the monitor should refresh last_seen every cycle.
+                    # Floor well above the old 5s kill window so a missed keepalive cannot
+                    # wipe the board while Odds-API odds sit still.
+                    stale_threshold = float(os.getenv("ALERT_STALE_SEC", "45") or "45")
+                    stale_threshold = max(stale_threshold, 30.0)
                     to_remove = []
                     
                     for alert_id, alert_data in list(active_alerts.items()):
