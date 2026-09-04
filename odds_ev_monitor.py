@@ -3330,21 +3330,53 @@ class OddsEVMonitor:
                     }
                     for d_pick, d_opp, sn in panels
                 ]
+                take_american = decimal_to_american(k_dec)
+                # Baseline = hold/freshness/two-way only (no take-junk screen).
+                # A flipped/stale take can wipe every real sharp; that is a bad TAKE,
+                # not "missing books". Use baseline for display cards in that case.
+                baseline_surviving = filter_sharp_panel(panel_books, kalshi_american=None)
+                baseline_fair = fair_books_excluding_take(baseline_surviving, take_canon)
                 surviving_books = filter_sharp_panel(
-                    panel_books, kalshi_american=decimal_to_american(k_dec)
+                    panel_books, kalshi_american=take_american
                 )
                 fair_eligible = fair_books_excluding_take(surviving_books, take_canon)
-                # minSharp is 3 for display and auto-bet. One rec on an alt
-                # (FD-only O10.5) is `insufficient sharp quotes (1/3)` — correct.
-                # PLive never counts toward minSharp or fair. Kalshi may on a PLive card.
+                display_min_sharp = min_sharp
+                if _display_extra_relaxed() or _diagnostic_mode():
+                    try:
+                        display_min_sharp = max(
+                            2, int(os.getenv("ODDS_DISPLAY_MIN_SHARP", "2") or "2")
+                        )
+                    except (TypeError, ValueError):
+                        display_min_sharp = 2
+                    display_min_sharp = min(int(min_sharp), int(display_min_sharp))
+                use_fair = fair_eligible
+                take_outlier_display = False
                 if len(fair_eligible) >= min_sharp:
+                    use_fair = fair_eligible
+                elif len(baseline_fair) >= display_min_sharp and (
+                    _display_extra_relaxed() or _diagnostic_mode()
+                ):
+                    # Books are present; take-junk emptied the take-relative panel.
+                    use_fair = baseline_fair
+                    take_outlier_display = True
+                    if _diagnostic_mode():
+                        print(
+                            f"[PIPELINE] Display card via baseline sharps "
+                            f"(take_junk wiped panel: fair_after={len(fair_eligible)}/{min_sharp}, "
+                            f"baseline={len(baseline_fair)}) take={take_canon} {take_american} "
+                            f"| \"{mname}\" side={bet_side} | {teams}"
+                        )
+                else:
+                    use_fair = []
+                # PLive never counts toward minSharp or fair. Kalshi may on a PLive card.
+                if len(use_fair) >= display_min_sharp:
                     fair_src = fair_books_for_panel(
-                        fair_eligible, decimal_to_american(k_dec), take_book=take_canon
+                        use_fair, take_american, take_book=take_canon
                     )
-                    fair_for_avg = fair_src or fair_eligible
+                    fair_for_avg = fair_src or use_fair
                     if (method or "POWER").upper() == "POWER" and comb_type != "WORST_CASE":
                         fair_prob = power_average_fair_prob(
-                            fair_for_avg, self._calc, take_american=decimal_to_american(k_dec)
+                            fair_for_avg, self._calc, take_american=take_american
                         )
                     else:
                         pick_probs = [
@@ -3359,24 +3391,45 @@ class OddsEVMonitor:
                         fair_prob = (
                             min(pick_probs) if comb_type == "WORST_CASE" else sum(pick_probs) / len(pick_probs)
                         )
-                    sharp_books_used = len(fair_eligible)
-                    devig_book_labels = [str(b.get("name") or "") for b in fair_eligible]
-                    d0 = float(fair_eligible[0]["decimal_pick"])
-                    opp0 = float(fair_eligible[0]["decimal_opp"])
+                    sharp_books_used = len(use_fair)
+                    devig_book_labels = [str(b.get("name") or "") for b in use_fair]
+                    d0 = float(use_fair[0]["decimal_pick"])
+                    opp0 = float(use_fair[0]["decimal_opp"])
                     sharp_decimals = [d0, opp0]
                     fd_dec_for_side = d0
                     panels = [
                         (float(b["decimal_pick"]), float(b["decimal_opp"]), str(b.get("name") or ""))
-                        for b in fair_eligible
+                        for b in use_fair
                     ]
+                    if take_outlier_display:
+                        # Force display-only later (no auto-bet).
+                        vb = dict(vb)
+                        vb["_take_outlier_display"] = True
 
         multi_panel_mode = bool(bks and sharp_names and min_sharp > 1)
         if multi_panel_mode and fair_prob is None:
-            pc = len(triples) if bet_side == "draw" else len(surviving_books or panels)
-            if _env_bool("ODDS_ALERT_DIAG", "false") or _diagnostic_mode():
+            # Never use `surviving_books or panels` — empty surviving is falsy and
+            # incorrectly reported as len(panels) (e.g. fake "(3/3)" after junk wipe).
+            if bet_side == "draw":
+                pc = len(triples)
+                raw_pc = pc
+                base_pc = pc
+            else:
+                loc = locals()
+                pc = len(loc.get("fair_eligible") or loc.get("surviving_books") or [])
+                raw_pc = len(panels)
+                base_pc = len(loc.get("baseline_fair") or [])
+            if bet_side != "draw" and base_pc >= min_sharp and pc < min_sharp:
+                print(
+                    f"[PIPELINE] Dropped: take outlier vs sharp consensus "
+                    f"(fair_after_take_junk={pc}/{min_sharp}, baseline_sharps={base_pc}, "
+                    f"raw_two_way={raw_pc}) for \"{mname}\" side={bet_side} | {teams}"
+                )
+            elif _env_bool("ODDS_ALERT_DIAG", "false") or _diagnostic_mode():
                 print(
                     f"[PIPELINE] Dropped: insufficient sharp quotes ({pc}/{min_sharp}) for "
-                    f"\"{mname}\" side={bet_side} | {teams}"
+                    f"\"{mname}\" side={bet_side} | {teams} "
+                    f"(raw_two_way={raw_pc}, baseline={base_pc})"
                 )
             return None
 
@@ -3456,6 +3509,9 @@ class OddsEVMonitor:
         board_books = _fresh_board_books(board_books, event=clock_ev)
         if used_fallback_fair:
             return None
+        raw_ev_percent = float(ev_percent)
+        take_outlier_display = bool(vb.get("_take_outlier_display"))
+        display_only = False
         if surviving_books or board_books:
             gated = apply_ev_hard_gates(
                 ev_percent,
@@ -3466,16 +3522,31 @@ class OddsEVMonitor:
                 take_book=take_canon,
                 exchange_source=board_books or panel_books or surviving_books,
             )
-            ev_percent = float(gated["ev_percent"])
-            if not gated["plus_alert"] or not is_plus_print_ev(ev_percent):
+            gated_ev = float(gated["ev_percent"])
+            gated_plus = bool(gated.get("plus_alert")) and is_plus_print_ev(gated_ev)
+            if gated_plus:
+                ev_percent = gated_ev
+            elif (_display_extra_relaxed() or _diagnostic_mode()) and is_plus_print_ev(raw_ev_percent):
+                # Hard gates are auto-bet quality filters. A live plus-EV print still
+                # belongs on the FE for a second — show it, block auto-bet.
+                ev_percent = raw_ev_percent
+                display_only = True
+                if _diagnostic_mode():
+                    print(
+                        f"[PIPELINE] Display-only card (hard gates {gated.get('reasons') or []}) "
+                        f"| {teams} | {mname} | raw_ev={raw_ev_percent:.2f}%"
+                    )
+            else:
                 if _diagnostic_mode():
                     print(
                         f"[PIPELINE] Dropped: EV gates {gated.get('reasons') or ['no_plus']} "
-                        f"| {teams} | {mname} | ev={ev_percent:.2f}%"
+                        f"| {teams} | {mname} | ev={gated_ev:.2f}%"
                     )
                 return None
         elif not is_plus_print_ev(ev_percent):
             return None
+        if take_outlier_display:
+            display_only = True
         if ev_percent > 20.0:
             if _diagnostic_mode():
                 print("[PIPELINE] Dropped: suspect EV (>20%).")
@@ -3627,14 +3698,19 @@ class OddsEVMonitor:
                 if take_canon.lower() == "plive"
                 else (ticker if ticker and is_kalshi_ticker(ticker) else paper_kalshi_ticker(teams, pick, qualifier))
             ),
-            "strict_pass": strict_ok,
+            "strict_pass": bool(strict_ok) and not display_only,
             "ev_source": (
                 "plive_take"
                 if take_canon.lower() == "plive"
                 else str(vb.get("_ev_source") or "odds_api_value_bets")
             ),
             "take_book": take_canon,
-            "autobet_allow": bool(shape["allow"]) and take_canon.lower() == "kalshi" and bool(ticker and is_kalshi_ticker(ticker)),
+            "autobet_allow": (
+                bool(shape["allow"])
+                and not display_only
+                and take_canon.lower() == "kalshi"
+                and bool(ticker and is_kalshi_ticker(ticker))
+            ),
         }
 
     async def check_for_new_alerts(self) -> None:
