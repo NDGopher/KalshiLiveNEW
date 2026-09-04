@@ -37,7 +37,7 @@ _LOADED_ENV_CWD = load_dotenv(_DOTENV_CWD, override=True, encoding="utf-8-sig")
 import aiohttp
 
 from auto_bet_sheet import live_context_from_event
-from ev_alert import EvAlert
+from ev_alert import EvAlert, alert_presence_key
 from execution_guard import is_kalshi_ticker, paper_kalshi_ticker
 from ev_calculator import (
     EVCalculator,
@@ -3669,7 +3669,8 @@ class OddsEVMonitor:
         current_hashes: Set[str] = set()
         current_alerts_by_hash: Dict[str, EvAlert] = {}
         for alert in alerts:
-            alert_hash = f"{alert.ticker}|{alert.pick}|{alert.qualifier}|{alert.odds}"
+            # Presence key is stable across odds/EV ticks — cards update in place.
+            alert_hash = alert_presence_key(alert)
             current_hashes.add(alert_hash)
             current_alerts_by_hash[alert_hash] = alert
 

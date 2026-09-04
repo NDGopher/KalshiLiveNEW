@@ -1,4 +1,4 @@
-"""Alert cards must outlive the monitor poll so the FE is not wiped empty."""
+"""Presence-based cards: orphan safety-net is minutes, not a poll race."""
 from __future__ import annotations
 
 import os
@@ -6,34 +6,25 @@ import os
 import dashboard as dash
 
 
-def test_alert_card_ttl_above_default_poll():
+def test_orphan_floor_above_ws_and_rest_cadence():
+    os.environ.pop("ALERT_ORPHAN_SEC", None)
+    os.environ.pop("ALERT_STALE_SEC", None)
     os.environ.pop("ALERT_TTL_SEC", None)
     os.environ.pop("ALERT_TTL", None)
-    os.environ["ALERT_STALE_SEC"] = "45"
-    ttl = dash.alert_card_ttl_sec()
-    assert ttl >= 60
-    assert ttl >= 45 + 15  # stale floor + buffer
-    assert ttl > 30  # old hard TTL that emptied the board
+    sec = dash.alert_orphan_sec()
+    assert sec >= 120
+    assert sec > 45  # must not race REST fallback poll
+    assert sec > 30  # must not race the old hard expiry
 
 
-def test_touch_alert_liveness_extends_expiry_with_last_seen():
+def test_touch_alert_liveness_extends_last_seen():
     row: dict = {}
     dash.touch_alert_liveness(row, now=1_000.0)
     assert row["last_seen"] == 1_000.0
-    assert row["expiry"] == 1_000.0 + dash.alert_card_ttl_sec()
-
+    assert row["expiry"] == 1_000.0 + dash.alert_orphan_sec()
     dash.touch_alert_liveness(row, now=1_050.0)
     assert row["last_seen"] == 1_050.0
-    assert row["expiry"] == 1_050.0 + dash.alert_card_ttl_sec()
-    # Keepalive after 50s must still leave expiry in the future relative to "now"
-    assert row["expiry"] > 1_050.0
 
 
-def test_old_30s_expiry_would_die_before_45s_poll():
-    """Document the race this fix closes."""
-    created = 0.0
-    old_expiry = created + 30.0
-    next_poll = created + 45.0
-    assert old_expiry < next_poll
-    new_expiry = created + dash.alert_card_ttl_sec()
-    assert new_expiry > next_poll
+def test_alert_card_ttl_alias_matches_orphan():
+    assert dash.alert_card_ttl_sec() == dash.alert_orphan_sec()

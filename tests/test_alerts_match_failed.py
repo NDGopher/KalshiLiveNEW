@@ -375,7 +375,9 @@ def test_keepalive_invokes_updated_callbacks_for_unchanged_alerts():
         touched.append(a.pick)
 
     mon.updated_alert_callbacks.append(_on_upd)
-    h = f"{alert.ticker}|{alert.pick}|{alert.qualifier}|{alert.odds}"
+    from ev_alert import alert_presence_key
+
+    h = alert_presence_key(alert)
     mon._seen_alerts.add(h)
     mon._previous_alert_values[h] = {
         "ev_percent": alert.ev_percent,
