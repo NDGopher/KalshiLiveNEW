@@ -1,0 +1,277 @@
+{
+    "version":  1,
+    "saved_filters":  {
+                          "Kalshi All Sports (3 Sharps Live)":  {
+                                                                    "state":  "ND",
+                                                                    "bettingBooks":  [
+                                                                                         "Kalshi",
+                                                                                         "PLive"
+                                                                                     ],
+                                                                    "displayBooks":  [
+                                                                                         "Circa",
+                                                                                         "Polymarket",
+                                                                                         "Betfair Exchange",
+                                                                                         "DraftKings",
+                                                                                         "FanDuel",
+                                                                                         "BetMGM",
+                                                                                         "Kalshi",
+                                                                                         "Bet365",
+                                                                                         "Caesars",
+                                                                                         "NoVig",
+                                                                                         "PLive"
+                                                                                     ],
+                                                                    "leagues":  [
+
+                                                                                ],
+                                                                    "betTypes":  [
+                                                                                     "GAMELINES"
+                                                                                 ],
+                                                                    "minRoi":  0,
+                                                                    "middleStatus":  "INCLUDE",
+                                                                    "middleFilters":  [
+                                                                                          {
+                                                                                              "sport":  "Any",
+                                                                                              "minHold":  0,
+                                                                                              "minMiddle":  0
+                                                                                          }
+                                                                                      ],
+                                                                    "sortOrder":  "ROI",
+                                                                    "devigFilter":  {
+                                                                                        "sharps":  [
+                                                                                                       "Circa",
+                                                                                                       "Betfair Exchange",
+                                                                                                       "DraftKings",
+                                                                                                       "FanDuel",
+                                                                                                       "BetMGM",
+                                                                                                       "Bet365",
+                                                                                                       "Caesars",
+                                                                                                       "NoVig",
+                                                                                                       "Polymarket"
+                                                                                                   ],
+                                                                                        "method":  "POWER",
+                                                                                        "type":  "AVERAGE",
+                                                                                        "minEv":  0,
+                                                                                        "minLimit":  0,
+                                                                                        "minSharpBooks":  3,
+                                                                                        "hold":  [
+                                                                                                     {
+                                                                                                         "book":  "Any",
+                                                                                                         "max":  8
+                                                                                                     }
+                                                                                                 ]
+                                                                                    },
+                                                                    "oddsRanges":  [
+                                                                                       {
+                                                                                           "book":  "Any",
+                                                                                           "min":  -500,
+                                                                                           "max":  500
+                                                                                       }
+                                                                                   ],
+                                                                    "minLimits":  [
+                                                                                      {
+                                                                                          "book":  "Kalshi",
+                                                                                          "min":  75
+                                                                                      }
+                                                                                  ],
+                                                                    "minSharpLimits":  [
+                                                                                           {
+                                                                                               "book":  "BookMaker",
+                                                                                               "min":  250
+                                                                                           },
+                                                                                           {
+                                                                                               "book":  "Circa",
+                                                                                               "min":  250
+                                                                                           },
+                                                                                           {
+                                                                                               "book":  "Novig",
+                                                                                               "min":  200
+                                                                                           },
+                                                                                           {
+                                                                                               "book":  "ProphetX",
+                                                                                               "min":  200
+                                                                                           },
+                                                                                           {
+                                                                                               "book":  "SportTrade",
+                                                                                               "min":  200
+                                                                                           },
+                                                                                           {
+                                                                                               "book":  "DraftKings",
+                                                                                               "min":  200
+                                                                                           },
+                                                                                           {
+                                                                                               "book":  "FanDuel",
+                                                                                               "min":  200
+                                                                                           },
+                                                                                           {
+                                                                                               "book":  "Polymarket",
+                                                                                               "min":  0
+                                                                                           },
+                                                                                           {
+                                                                                               "book":  "Betfair",
+                                                                                               "min":  0
+                                                                                           },
+                                                                                           {
+                                                                                               "book":  "Betfair Exchange",
+                                                                                               "min":  0
+                                                                                           },
+                                                                                           {
+                                                                                               "book":  "BetMGM",
+                                                                                               "min":  0
+                                                                                           },
+                                                                                           {
+                                                                                               "book":  "Bet365",
+                                                                                               "min":  0
+                                                                                           },
+                                                                                           {
+                                                                                               "book":  "Caesars",
+                                                                                               "min":  0
+                                                                                           }
+                                                                                       ],
+                                                                    "linkType":  "DESKTOP_BETSLIP"
+                                                                },
+                          "CBB EV Filter (Live - Kalshi)":  {
+                                                                "state":  "ND",
+                                                                "bettingBooks":  [
+                                                                                     "Kalshi"
+                                                                                 ],
+                                                                "displayBooks":  [
+                                                                                     "Circa",
+                                                                                     "Polymarket",
+                                                                                     "Betfair Exchange",
+                                                                                     "DraftKings",
+                                                                                     "FanDuel",
+                                                                                     "BetMGM",
+                                                                                     "Kalshi",
+                                                                                     "Bet365",
+                                                                                     "Caesars",
+                                                                                     "NoVig"
+                                                                                 ],
+                                                                "leagues":  [
+                                                                                "NCAAB"
+                                                                            ],
+                                                                "excludedCategories":  [
+                                                                                           "1st Quarter",
+                                                                                           "2nd Quarter",
+                                                                                           "3rd Quarter",
+                                                                                           "4th Quarter",
+                                                                                           "1st Half",
+                                                                                           "2nd Half"
+                                                                                       ],
+                                                                "betTypes":  [
+                                                                                 "GAMELINES"
+                                                                             ],
+                                                                "minRoi":  0,
+                                                                "middleStatus":  "INCLUDE",
+                                                                "middleFilters":  [
+                                                                                      {
+                                                                                          "sport":  "Any",
+                                                                                          "minHold":  0,
+                                                                                          "minMiddle":  0
+                                                                                      }
+                                                                                  ],
+                                                                "sortOrder":  "ROI",
+                                                                "devigFilter":  {
+                                                                                    "sharps":  [
+                                                                                                   "Circa",
+                                                                                                   "Polymarket",
+                                                                                                   "Betfair Exchange",
+                                                                                                   "DraftKings",
+                                                                                                   "FanDuel",
+                                                                                                   "BetMGM",
+                                                                                                   "Bet365",
+                                                                                                   "Caesars",
+                                                                                                   "NoVig"
+                                                                                               ],
+                                                                                    "method":  "WORST_CASE",
+                                                                                    "type":  "AVERAGE",
+                                                                                    "minEv":  0,
+                                                                                    "minLimit":  0,
+                                                                                    "minSharpBooks":  2,
+                                                                                    "hold":  [
+                                                                                                 {
+                                                                                                     "book":  "Any",
+                                                                                                     "max":  8
+                                                                                                 }
+                                                                                             ]
+                                                                                },
+                                                                "oddsRanges":  [
+                                                                                   {
+                                                                                       "book":  "Any",
+                                                                                       "min":  -500,
+                                                                                       "max":  500
+                                                                                   }
+                                                                               ],
+                                                                "minLimits":  [
+                                                                                  {
+                                                                                      "book":  "Any",
+                                                                                      "min":  25
+                                                                                  },
+                                                                                  {
+                                                                                      "book":  "Kalshi",
+                                                                                      "min":  75
+                                                                                  }
+                                                                              ],
+                                                                "minSharpLimits":  [
+                                                                                       {
+                                                                                           "book":  "Novig",
+                                                                                           "min":  1000
+                                                                                       },
+                                                                                       {
+                                                                                           "book":  "ProphetX",
+                                                                                           "min":  1000
+                                                                                       },
+                                                                                       {
+                                                                                           "book":  "SportTrade",
+                                                                                           "min":  1000
+                                                                                       },
+                                                                                       {
+                                                                                           "book":  "FanDuel",
+                                                                                           "min":  200
+                                                                                       },
+                                                                                       {
+                                                                                           "book":  "DraftKings",
+                                                                                           "min":  200
+                                                                                       },
+                                                                                       {
+                                                                                           "book":  "BookMaker",
+                                                                                           "min":  250
+                                                                                       },
+                                                                                       {
+                                                                                           "book":  "Polymarket",
+                                                                                           "min":  0
+                                                                                       },
+                                                                                       {
+                                                                                           "book":  "Betfair",
+                                                                                           "min":  0
+                                                                                       },
+                                                                                       {
+                                                                                           "book":  "Circa",
+                                                                                           "min":  0
+                                                                                       },
+                                                                                       {
+                                                                                           "book":  "Betfair Exchange",
+                                                                                           "min":  0
+                                                                                       },
+                                                                                       {
+                                                                                           "book":  "BetMGM",
+                                                                                           "min":  0
+                                                                                       },
+                                                                                       {
+                                                                                           "book":  "Bet365",
+                                                                                           "min":  0
+                                                                                       },
+                                                                                       {
+                                                                                           "book":  "Caesars",
+                                                                                           "min":  0
+                                                                                       }
+                                                                                   ],
+                                                                "linkType":  "DESKTOP_BETSLIP"
+                                                            }
+                      },
+    "selected_dashboard_filters":  [
+                                       "Kalshi All Sports (3 Sharps Live)"
+                                   ],
+    "selected_auto_bettor_filters":  [
+
+                                     ]
+}

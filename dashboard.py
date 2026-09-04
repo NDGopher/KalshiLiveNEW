@@ -581,7 +581,7 @@ def _load_filters_state() -> None:
     if not os.path.isfile(USER_FILTERS_STATE_FILE):
         return
     try:
-        with open(USER_FILTERS_STATE_FILE, "r", encoding="utf-8") as f:
+        with open(USER_FILTERS_STATE_FILE, "r", encoding="utf-8-sig") as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError) as exc:
         print(f"[DASHBOARD] Could not load filter state ({USER_FILTERS_STATE_FILE}): {exc}")
