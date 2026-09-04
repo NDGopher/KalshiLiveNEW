@@ -3249,6 +3249,9 @@ class OddsEVMonitor:
         triples: List[Tuple[float, float, float, str]] = []
         surviving_books: List[Dict[str, Any]] = []
         panel_books: List[Dict[str, Any]] = []
+        fair_eligible: List[Dict[str, Any]] = []
+        baseline_fair: List[Dict[str, Any]] = []
+        take_american: Optional[int] = None
         used_fallback_fair = False
 
         ref_for_sharps = canon_vb or (k_row if k_row else None)
@@ -3330,8 +3333,15 @@ class OddsEVMonitor:
                     }
                     for d_pick, d_opp, sn in panels
                 ]
+                take_american = decimal_to_american(k_dec)
+                # Baseline = sharps that survive hold/freshness/two-way (no take junk screen).
+                baseline_surviving = filter_sharp_panel(panel_books, kalshi_american=None)
+                baseline_fair = fair_books_excluding_take(baseline_surviving, take_canon)
+                # Take-relative junk screen. A flipped/stale Kalshi take can wipe every
+                # real sharp (DK/FD at -150 vs Kalshi +138) — that is a bad TAKE, not
+                # "missing books". Detect that separately below.
                 surviving_books = filter_sharp_panel(
-                    panel_books, kalshi_american=decimal_to_american(k_dec)
+                    panel_books, kalshi_american=take_american
                 )
                 fair_eligible = fair_books_excluding_take(surviving_books, take_canon)
                 # minSharp is 3 for display and auto-bet. One rec on an alt
@@ -3372,11 +3382,31 @@ class OddsEVMonitor:
 
         multi_panel_mode = bool(bks and sharp_names and min_sharp > 1)
         if multi_panel_mode and fair_prob is None:
-            pc = len(triples) if bet_side == "draw" else len(surviving_books or panels)
-            if _env_bool("ODDS_ALERT_DIAG", "false") or _diagnostic_mode():
+            if bet_side == "draw":
+                pc = len(triples)
+                raw_pc = pc
+                base_pc = pc
+            else:
+                # Never use `surviving_books or panels` — empty surviving is falsy and
+                # incorrectly reported as len(panels) (e.g. "(3/3)" after a junk wipe).
+                pc = len(fair_eligible)
+                raw_pc = len(panels)
+                base_pc = len(baseline_fair)
+            # Always log these — this is the #1 "where are my books?" confusion.
+            if bet_side != "draw" and base_pc >= min_sharp and pc < min_sharp:
                 print(
-                    f"[PIPELINE] Dropped: insufficient sharp quotes ({pc}/{min_sharp}) for "
-                    f"\"{mname}\" side={bet_side} | {teams}"
+                    f"[PIPELINE] Dropped: take outlier vs sharp consensus "
+                    f"(fair_after_take_junk={pc}/{min_sharp}, "
+                    f"baseline_sharps={base_pc}, raw_two_way={raw_pc}, "
+                    f"take={take_canon} {take_american}) "
+                    f"for \"{mname}\" side={bet_side} | {teams} "
+                    f"— books are present; take is sign-flip/junk vs panel"
+                )
+            else:
+                print(
+                    f"[PIPELINE] Dropped: insufficient sharp quotes ({pc}/{min_sharp}) "
+                    f"for \"{mname}\" side={bet_side} | {teams} "
+                    f"(raw_two_way={raw_pc}, baseline={base_pc})"
                 )
             return None
 

@@ -4638,22 +4638,32 @@ def run_monitor_loop():
                             print(f"[AUTO-BET] SKIP: Alert {alert_id} already being processed, skipping duplicate task")
                 else:
                     print(f"[AUTO-BET] SKIP: Alert {alert_id} - Invalid submarket key: {submarket_key_for_check}")
-                    # Log this as a failure - side determination failed
-                    if high_ev_should_trigger:
-                        filter_ev_min = auto_bet_settings_by_filter.get(alert_filter_name, {}).get('ev_min', auto_bet_ev_min) if alert_filter_name else auto_bet_ev_min
-                        if alert.ev_percent >= filter_ev_min:
-                            store_failed_auto_bet(
-                                alert_id=alert_id,
-                                alert=alert,
-                                alert_data=alert_data,
-                                error="Side determination failed - invalid submarket key",
-                                reason=f"Alert has {alert.ev_percent:.2f}% EV (>= {filter_ev_min}% threshold) but side determination failed. Ticker: '{ticker}', Side: '{side}'. This usually means the market subtitles are N/A and ticker suffix matching failed.",
-                                ticker=ticker if ticker else None,
-                                side=side if side else None,
-                                ev_percent=alert.ev_percent,
-                                odds=alert_data.get('american_odds'),
-                                filter_name=alert_filter_name
-                            )
+                    # Log this as a failure - side determination failed.
+                    # Recompute locally: this path is handle_updated_alert / keepalive,
+                    # which does not define high_ev_should_trigger from handle_new_alert.
+                    alert_filter_name = getattr(alert, "filter_name", None) or alert_data.get("filter_name")
+                    filter_ev_min = (
+                        auto_bet_settings_by_filter.get(alert_filter_name, {}).get("ev_min", auto_bet_ev_min)
+                        if alert_filter_name
+                        else auto_bet_ev_min
+                    )
+                    if alert.ev_percent >= filter_ev_min:
+                        store_failed_auto_bet(
+                            alert_id=alert_id,
+                            alert=alert,
+                            alert_data=alert_data,
+                            error="Side determination failed - invalid submarket key",
+                            reason=(
+                                f"Alert has {alert.ev_percent:.2f}% EV (>= {filter_ev_min}% threshold) "
+                                f"but side determination failed. Ticker: '{ticker}', Side: '{side}'. "
+                                f"This usually means the market subtitles are N/A and ticker suffix matching failed."
+                            ),
+                            ticker=ticker if ticker else None,
+                            side=side if side else None,
+                            ev_percent=alert.ev_percent,
+                            odds=alert_data.get("american_odds"),
+                            filter_name=alert_filter_name,
+                        )
             else:
                 # Alert not in active_alerts - treat as new (it disappeared and came back)
                 # This ensures perfect mirroring — if the monitor still has it, show it
