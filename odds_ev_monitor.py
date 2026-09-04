@@ -3197,15 +3197,7 @@ class OddsEVMonitor:
             return None
         if k_dec is None or k_dec <= 1.0:
             return None
-        if take_canon.lower() == "kalshi" and not _kalshi_take_quote_is_live(
-            odds_doc, ev_merged, k_row
-        ):
-            if _diagnostic_mode():
-                print(
-                    f"[PIPELINE] Dropped: stale or unstamped Kalshi take | {teams} | {mname} | "
-                    f"side={bet_side}"
-                )
-            return None
+        # Stale Kalshi: do not kill the card; omit from POWER via freshness helpers.
         ref_for_gate = canon_vb or (k_row if k_row else None)
         if _soccer_ml_home_away_suppressed(ev_merged, mname, bet_side, bks, ref_for_gate):
             if _diagnostic_mode():

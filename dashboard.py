@@ -375,15 +375,12 @@ _DEFAULT_SHARPS_ORDER = [
 ]
 DEFAULT_FILTER_PAYLOAD = {
     "state": "ND",
-    "bettingBooks": ["Kalshi"],
+    "bettingBooks": ["Kalshi", "PLive"],
     "displayBooks": [
         "Kalshi", "FanDuel", "Circa", "BookMaker", "DraftKings",
         "NoVig", "ProphetX", "SportTrade", "Polymarket", "Betfair Exchange",
     ],
-    "leagues": [
-        "SOCCER_ALL", "TENNIS_ALL", "BASKETBALL_ALL", "FOOTBALL_ALL",
-        "HOCKEY_ALL", "BASEBALL_ALL", "UFC_ALL",
-    ],
+    "leagues": [],  # empty = all active leagues`r`n
     "betTypes": ["GAMELINES"],
     "minRoi": 0,
     "middleStatus": "INCLUDE",
@@ -611,10 +608,9 @@ def _load_filters_state() -> None:
 
 
 _load_filters_state()
-# Disk overlay cannot drop or weaken the soccer live filter.
+# Soccer live filter stays available in saved_filters; do NOT force-append
+# into selected_dashboard_filters (soccer-only cycles were zeroing the board).
 saved_filters[SOCCER_FILTER_NAME] = SOCCER_FILTER_PAYLOAD
-if SOCCER_FILTER_NAME not in selected_dashboard_filters:
-    selected_dashboard_filters.append(SOCCER_FILTER_NAME)
 
 
 def _live_odds_display_books() -> List[str]:
