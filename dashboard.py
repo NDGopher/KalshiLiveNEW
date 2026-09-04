@@ -4428,23 +4428,24 @@ def run_monitor_loop():
         print(f"[MONITOR] About to start monitors: monitor_running={monitor_running}, monitors_to_start={len(monitors_to_start)}")
 
         async def handle_removed_alerts(removed_hashes):
-            """Presence-driven: monitor no longer lists this key → drop the FE card."""
+            """Presence-driven: monitor no longer lists this key → drop that FE card only.
+
+            Never wipe surviving cards because a large share of the board flipped —
+            that bulk clear was emptying the UI on normal live churn and on WS flaps.
+            """
             to_remove = []
             for alert_id, alert_data in list(active_alerts.items()):
                 alert_hash = presence_key_from_row(alert_data)
                 if alert_hash in removed_hashes:
                     to_remove.append(alert_id)
-            if len(to_remove) >= len(active_alerts) * 0.5 or len(removed_hashes) >= len(active_alerts):
-                all_ids = list(active_alerts.keys())
-                active_alerts.clear()
-                for alert_id in all_ids:
-                    socketio.emit("remove_alert", {"id": str(alert_id)})
-                print(f"Cleared all {len(all_ids)} alerts (feed empty or bulk remove)")
-            else:
-                for alert_id in to_remove:
-                    del active_alerts[alert_id]
-                    socketio.emit("remove_alert", {"id": str(alert_id)})
-                    print(f"Removed alert (disappeared from feed): {alert_id}")
+            for alert_id in to_remove:
+                del active_alerts[alert_id]
+                socketio.emit("remove_alert", {"id": str(alert_id)})
+            if to_remove:
+                print(
+                    f"[DEL] Removed {len(to_remove)} alert(s) that left the feed "
+                    f"(board now {len(active_alerts)})"
+                )
 
         if monitor_running:
             for filter_name, monitor in monitors_to_start:

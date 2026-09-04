@@ -484,6 +484,7 @@ def test_429_fallback_suppression(monkeypatch):
     monkeypatch.setenv("ODDS_API_WS", "true")
     monkeypatch.setenv("ODDS_API_REST_UPDATED_FALLBACK", "true")
     monkeypatch.setenv("ODDS_API_REST_FALLBACK_429_COOLDOWN_SEC", "60")
+    monkeypatch.setenv("ODDS_API_SPORTS", "baseball")
 
     class RateLimitedRest(_DummyRest):
         def __init__(self):
@@ -538,6 +539,7 @@ def test_no_concurrent_recovery_calls(monkeypatch):
     monkeypatch.setenv("ODDS_API_WS", "true")
     monkeypatch.setenv("ODDS_API_REST_UPDATED_FALLBACK", "true")
     monkeypatch.setenv("ODDS_API_REST_FALLBACK_COOLDOWN_SEC", "30")
+    monkeypatch.setenv("ODDS_API_SPORTS", "baseball")
 
     class SlowRest(_DummyRest):
         def __init__(self):
@@ -549,6 +551,8 @@ def test_no_concurrent_recovery_calls(monkeypatch):
             self.inflight += 1
             self.max_inflight = max(self.max_inflight, self.inflight)
             self.calls.append(bookmaker)
+            self.sports = getattr(self, "sports", [])
+            self.sports.append(sport)
             await asyncio.sleep(0.05)
             self.inflight -= 1
             return []
@@ -568,8 +572,9 @@ def test_no_concurrent_recovery_calls(monkeypatch):
             feed.rest_updated_fallback(1, books),
         )
         assert rest.max_inflight == 1
-        # One fallback pass (3 books). Extra callers wait then hit cooldown.
+        # One fallback pass (3 books × 1 pinned sport). Extra callers wait then hit cooldown.
         assert rest.calls == ["DraftKings", "FanDuel", "BetMGM"]
+        assert rest.sports == ["Baseball", "Baseball", "Baseball"]
         sources = [r[1] if isinstance(r, tuple) else "direct" for r in results]
         assert sources.count("unavailable") >= 2
         assert "rest_multi" not in sources
@@ -611,3 +616,38 @@ def test_ws_recovery_fail_closed_does_not_serve_stale(monkeypatch):
     finally:
         ows._shared_feed = None
         ows._recovery_lock = None
+
+
+def test_sport_name_for_odds_updated_maps_slug_and_object():
+    from odds_api_client import sport_name_for_odds_updated, odds_updated_sport_names
+
+    assert sport_name_for_odds_updated("baseball") == "Baseball"
+    assert sport_name_for_odds_updated("american-football") == "American Football"
+    assert sport_name_for_odds_updated({"name": "Ice Hockey", "slug": "ice-hockey"}) == "Ice Hockey"
+    assert sport_name_for_odds_updated(None) is None
+    assert odds_updated_sport_names(["baseball", "Baseball", "soccer"]) == ["Baseball", "Football"]
+
+
+def test_rest_updated_fallback_requires_sport_display_name(monkeypatch):
+    monkeypatch.setenv("ODDS_API_SPORTS", "baseball")
+    monkeypatch.setenv("ODDS_API_REST_UPDATED_FALLBACK", "true")
+
+    class CaptureRest(_DummyRest):
+        def __init__(self):
+            self.params = []
+
+        async def get_odds_updated(self, since, bookmaker, sport=None):
+            self.params.append((bookmaker, sport))
+            return []
+
+    async def run() -> None:
+        rest = CaptureRest()
+        feed = OddsApiWsFeed(rest, api_key="test-not-a-real-key")
+        feed.store.event_meta[1] = {"id": 1, "sport": {"name": "Baseball", "slug": "baseball"}}
+        feed._reconnect_attempts = 1
+        feed.last_error = "disconnected"
+        n = await feed.rest_updated_fallback(1, ["DraftKings"], sports=[{"slug": "baseball"}])
+        assert n == 0
+        assert rest.params == [("DraftKings", "Baseball")]
+
+    asyncio.run(run())
