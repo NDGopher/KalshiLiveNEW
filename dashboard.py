@@ -187,7 +187,41 @@ monitor_running = False
 api_kalshi_client: Optional[KalshiClient] = None
 api_loop: Optional[asyncio.AbstractEventLoop] = None
 api_loop_thread: Optional[threading.Thread] = None
-ALERT_TTL = 30  # Remove alerts after 30 seconds if EV drops
+def alert_card_ttl_sec() -> float:
+    """How long a card may sit without a keepalive before expiry wipe.
+
+    Must stay above the monitor poll (default 45s). The old hard 30s TTL deleted
+    every card before the next poll could refresh last_seen — empty FE board.
+    """
+    try:
+        ttl = float(os.getenv("ALERT_TTL_SEC", os.getenv("ALERT_TTL", "120")) or "120")
+    except (TypeError, ValueError):
+        ttl = 120.0
+    try:
+        stale = float(os.getenv("ALERT_STALE_SEC", "45") or "45")
+    except (TypeError, ValueError):
+        stale = 45.0
+    return max(60.0, ttl, stale + 15.0)
+
+
+def fresh_alert_expiry_ts(now: Optional[float] = None) -> float:
+    """Wall-clock expiry timestamp for a newly seen / keepalived card."""
+    return float(now if now is not None else time.time()) + alert_card_ttl_sec()
+
+
+def touch_alert_liveness(alert_data: Dict[str, Any], now: Optional[float] = None) -> None:
+    """Refresh last_seen AND expiry together — expiry alone used to kill keepalived cards."""
+    ts = float(now if now is not None else time.time())
+    alert_data["last_seen"] = ts
+    alert_data["expiry"] = fresh_alert_expiry_ts(ts)
+
+
+# Alias for readability at call sites / tests.
+touch_alert_freshness = touch_alert_liveness
+
+
+# Legacy name kept for imports/tests; value is the resolved default TTL seconds.
+ALERT_TTL = int(alert_card_ttl_sec())
 user_max_bet_amount = 100.0  # Default max bet amount in dollars (user-configurable)
 dashboard_min_ev = 0.0  # Minimum EV to show on dashboard (for manual betting, default 0% to show all)
 per_event_max_bet = 404.0  # Default max bet per event in dollars (user-configurable, default $404)
@@ -2418,7 +2452,7 @@ async def handle_plive_take_display_alert(alert: EvAlert) -> None:
         "sharp_books": sharp_books,
         "market_data": None,
         "filter_name": filter_name,
-        "expiry": (datetime.now() + timedelta(seconds=30)).timestamp(),
+        "expiry": fresh_alert_expiry_ts(),
         "last_seen": time.time(),
         "match_failed": False,
         "strict_pass": getattr(alert, "strict_pass", True),
@@ -2495,7 +2529,7 @@ async def handle_kalshi_paper_display_alert(alert: EvAlert) -> None:
         "sharp_books": sharp_books,
         "market_data": None,
         "filter_name": filter_name,
-        "expiry": (datetime.now() + timedelta(seconds=30)).timestamp(),
+        "expiry": fresh_alert_expiry_ts(),
         "last_seen": time.time(),
         "match_failed": False,
         "strict_pass": getattr(alert, "strict_pass", True),
@@ -2737,7 +2771,7 @@ async def handle_new_alert(alert: EvAlert):
                 'sharp_books': sharp_books,
                 'market_data': None,  # No market data - matching failed
                 'filter_name': filter_name,
-                'expiry': (datetime.now() + timedelta(seconds=30)).timestamp(),
+                'expiry': fresh_alert_expiry_ts(),
                 'last_seen': time.time(),
                 'match_failed': True,  # Flag to indicate matching failed
                 'match_failure_reason': 'Could not find matching submarket',
@@ -3086,8 +3120,8 @@ async def handle_new_alert(alert: EvAlert):
             'sharp_books': sharp_books,  # Store sharp books from filter (for frontend display)
             'market_data': match_result['market'],  # Store full market data for validation
             'filter_name': filter_name,  # Filter name that generated this alert
-            'expiry': (datetime.now() + timedelta(seconds=30)).timestamp(),  # TTL: 30 seconds
-            'last_seen': time.time(),  # Track when alert was last seen for stale detection
+            'expiry': fresh_alert_expiry_ts(),
+            'last_seen': time.time(),
             'strict_pass': getattr(alert, 'strict_pass', True),
             'autobet_allow': bool(getattr(alert, 'autobet_allow', False)),
             'ev_source': getattr(alert, 'ev_source', 'odds_api_value_bets'),
@@ -4495,8 +4529,9 @@ def run_monitor_loop():
                         alert_data[_lk] = getattr(alert, _lk)
                 if alert_data.get("status_detail"):
                     alert_data["statusDetail"] = alert_data["status_detail"]
-                # Update last_seen timestamp for stale alert detection
-                alert_data['last_seen'] = time.time()
+                # Keepalive: refresh last_seen AND expiry together.
+                # Old path only touched last_seen; alert_expiry_loop still wiped at +30s.
+                touch_alert_liveness(alert_data)
                 
                 # Update price if available
                 if hasattr(alert, 'price_cents') and alert.price_cents:
@@ -10537,15 +10572,20 @@ def initialize_dashboard():
             try:
                 now = datetime.now().timestamp()
                 to_remove = []
+                ttl = alert_card_ttl_sec()
                 for aid, ad in list(active_alerts.items()):
-                    expiry = ad.get('expiry', 0)
-                    if expiry and expiry < now:
+                    # Prefer last_seen + TTL (keepalive-safe). Fall back to expiry field.
+                    last_seen = float(ad.get('last_seen') or 0)
+                    expiry = float(ad.get('expiry') or 0)
+                    stale_by_seen = last_seen > 0 and (now - last_seen) > ttl
+                    stale_by_expiry = (not last_seen) and expiry and expiry < now
+                    if stale_by_seen or stale_by_expiry:
                         to_remove.append(aid)
                 
                 for aid in to_remove:
                     del active_alerts[aid]
                     socketio.emit('remove_alert', {'id': aid})
-                    print(f"Removed expired alert: {aid}")
+                    print(f"Removed expired alert: {aid} (ttl={ttl:.0f}s)")
                 
                 await asyncio.sleep(5)  # Check every 5 seconds
             except Exception as e:
