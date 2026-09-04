@@ -48,7 +48,7 @@ import warnings
 warnings.filterwarnings('ignore', category=RuntimeWarning, message='.*Future exception was never retrieved.*')
 warnings.filterwarnings('ignore', message='.*APPLICATION_DATA_AFTER_CLOSE_NOTIFY.*')
 warnings.filterwarnings('ignore', message='.*SSL.*')
-from ev_alert import EvAlert
+from ev_alert import EvAlert, alert_presence_key, presence_key_from_row
 from market_matcher import MarketMatcher
 from kalshi_client import KalshiClient
 from execution_guard import (
@@ -187,7 +187,45 @@ monitor_running = False
 api_kalshi_client: Optional[KalshiClient] = None
 api_loop: Optional[asyncio.AbstractEventLoop] = None
 api_loop_thread: Optional[threading.Thread] = None
-ALERT_TTL = 30  # Remove alerts after 30 seconds if EV drops
+def alert_orphan_sec() -> float:
+    """Safety-net only: drop a card if the monitor has gone silent for this long.
+
+    Primary lifecycle is presence: cards stay while the monitor still lists them
+    (WS-driven eval) and leave via removed_alert callbacks. This is NOT a
+    display TTL — it only cleans orphans if the monitor dies mid-flight.
+    """
+    try:
+        sec = float(os.getenv("ALERT_ORPHAN_SEC", os.getenv("ALERT_STALE_SEC", "300")) or "300")
+    except (TypeError, ValueError):
+        sec = 300.0
+    return max(120.0, sec)
+
+
+def alert_card_ttl_sec() -> float:
+    """Deprecated alias — presence-based cards use alert_orphan_sec() as safety net."""
+    return alert_orphan_sec()
+
+
+def fresh_alert_expiry_ts(now: Optional[float] = None) -> float:
+    """Optional wall-clock hint for debugging; removal is presence-driven."""
+    return float(now if now is not None else time.time()) + alert_orphan_sec()
+
+
+def touch_alert_liveness(alert_data: Dict[str, Any], now: Optional[float] = None) -> None:
+    """Mark card still active (monitor keepalive / realtime update)."""
+    ts = float(now if now is not None else time.time())
+    alert_data["last_seen"] = ts
+    alert_data["expiry"] = fresh_alert_expiry_ts(ts)
+    if not alert_data.get("presence_key") and alert_data.get("ticker") is not None:
+        alert_data["presence_key"] = presence_key_from_row(alert_data)
+
+
+# Alias for readability at call sites / tests.
+touch_alert_freshness = touch_alert_liveness
+
+
+# Legacy name kept for imports/tests; value is the orphan safety-net seconds.
+ALERT_TTL = int(alert_orphan_sec())
 user_max_bet_amount = 100.0  # Default max bet amount in dollars (user-configurable)
 dashboard_min_ev = 0.0  # Minimum EV to show on dashboard (for manual betting, default 0% to show all)
 per_event_max_bet = 404.0  # Default max bet per event in dollars (user-configurable, default $404)
@@ -2418,8 +2456,9 @@ async def handle_plive_take_display_alert(alert: EvAlert) -> None:
         "sharp_books": sharp_books,
         "market_data": None,
         "filter_name": filter_name,
-        "expiry": (datetime.now() + timedelta(seconds=30)).timestamp(),
+        "expiry": fresh_alert_expiry_ts(),
         "last_seen": time.time(),
+        "presence_key": alert_presence_key(alert),
         "match_failed": False,
         "strict_pass": getattr(alert, "strict_pass", True),
         "autobet_allow": False,
@@ -2495,8 +2534,9 @@ async def handle_kalshi_paper_display_alert(alert: EvAlert) -> None:
         "sharp_books": sharp_books,
         "market_data": None,
         "filter_name": filter_name,
-        "expiry": (datetime.now() + timedelta(seconds=30)).timestamp(),
+        "expiry": fresh_alert_expiry_ts(),
         "last_seen": time.time(),
+        "presence_key": alert_presence_key(alert),
         "match_failed": False,
         "strict_pass": getattr(alert, "strict_pass", True),
         "autobet_allow": False,
@@ -2737,8 +2777,9 @@ async def handle_new_alert(alert: EvAlert):
                 'sharp_books': sharp_books,
                 'market_data': None,  # No market data - matching failed
                 'filter_name': filter_name,
-                'expiry': (datetime.now() + timedelta(seconds=30)).timestamp(),
+                'expiry': fresh_alert_expiry_ts(),
                 'last_seen': time.time(),
+                'presence_key': alert_presence_key(alert),
                 'match_failed': True,  # Flag to indicate matching failed
                 'match_failure_reason': 'Could not find matching submarket',
                 'strict_pass': getattr(alert, 'strict_pass', True),
@@ -3086,8 +3127,9 @@ async def handle_new_alert(alert: EvAlert):
             'sharp_books': sharp_books,  # Store sharp books from filter (for frontend display)
             'market_data': match_result['market'],  # Store full market data for validation
             'filter_name': filter_name,  # Filter name that generated this alert
-            'expiry': (datetime.now() + timedelta(seconds=30)).timestamp(),  # TTL: 30 seconds
-            'last_seen': time.time(),  # Track when alert was last seen for stale detection
+            'expiry': fresh_alert_expiry_ts(),
+            'last_seen': time.time(),
+            'presence_key': alert_presence_key(alert),
             'strict_pass': getattr(alert, 'strict_pass', True),
             'autobet_allow': bool(getattr(alert, 'autobet_allow', False)),
             'ev_source': getattr(alert, 'ev_source', 'odds_api_value_bets'),
@@ -4386,11 +4428,10 @@ def run_monitor_loop():
         print(f"[MONITOR] About to start monitors: monitor_running={monitor_running}, monitors_to_start={len(monitors_to_start)}")
 
         async def handle_removed_alerts(removed_hashes):
-            """When Odds-API stops listing an alert, remove matching cards from the dashboard."""
+            """Presence-driven: monitor no longer lists this key → drop the FE card."""
             to_remove = []
             for alert_id, alert_data in list(active_alerts.items()):
-                event_ticker = alert_data.get("event_ticker", "") or alert_data.get("ticker", "")
-                alert_hash = f"{event_ticker}|{alert_data.get('pick', '')}|{alert_data.get('qualifier', '')}|{alert_data.get('odds', '')}"
+                alert_hash = presence_key_from_row(alert_data)
                 if alert_hash in removed_hashes:
                     to_remove.append(alert_id)
             if len(to_remove) >= len(active_alerts) * 0.5 or len(removed_hashes) >= len(active_alerts):
@@ -4495,8 +4536,9 @@ def run_monitor_loop():
                         alert_data[_lk] = getattr(alert, _lk)
                 if alert_data.get("status_detail"):
                     alert_data["statusDetail"] = alert_data["status_detail"]
-                # Update last_seen timestamp for stale alert detection
-                alert_data['last_seen'] = time.time()
+                # Keepalive: refresh last_seen AND expiry together.
+                # Old path only touched last_seen; alert_expiry_loop still wiped at +30s.
+                touch_alert_liveness(alert_data)
                 
                 # Update price if available
                 if hasattr(alert, 'price_cents') and alert.price_cents:
@@ -4663,29 +4705,25 @@ def run_monitor_loop():
         
         # Start stale alert cleanup loop - remove alerts that haven't been seen in 5+ seconds
         async def stale_alert_cleanup_loop():
-            """Periodically remove alerts that haven't been updated in 5+ seconds"""
-            await asyncio.sleep(5)  # Wait 5 seconds before first check
+            """Orphan safety-net only — primary removal is monitor presence callbacks."""
+            await asyncio.sleep(30)
             while True:
                 try:
-                    await asyncio.sleep(2)  # Check every 2 seconds
+                    await asyncio.sleep(15)
                     current_time = time.time()
-                    # Keepalive from the monitor should refresh last_seen every cycle.
-                    # Floor well above the old 5s kill window so a missed keepalive cannot
-                    # wipe the board while Odds-API odds sit still.
-                    stale_threshold = float(os.getenv("ALERT_STALE_SEC", "45") or "45")
-                    stale_threshold = max(stale_threshold, 30.0)
+                    orphan_sec = alert_orphan_sec()
                     to_remove = []
                     
                     for alert_id, alert_data in list(active_alerts.items()):
-                        last_seen = alert_data.get('last_seen', 0)
-                        if current_time - last_seen > stale_threshold:
+                        last_seen = float(alert_data.get('last_seen', 0) or 0)
+                        if last_seen and current_time - last_seen > orphan_sec:
                             to_remove.append(alert_id)
                     
                     if to_remove:
                         for alert_id in to_remove:
                             del active_alerts[alert_id]
                             socketio.emit('remove_alert', {'id': str(alert_id)})
-                        print(f"[STALE CLEANUP] Removed {len(to_remove)} stale alert(s) (not seen in {stale_threshold}s)")
+                        print(f"[ORPHAN CLEANUP] Removed {len(to_remove)} card(s) with no monitor touch in {orphan_sec:.0f}s")
                 except Exception as e:
                     print(f"[STALE CLEANUP] Warning: Error in stale alert cleanup: {e}")
                     await asyncio.sleep(2)
@@ -10533,24 +10571,24 @@ def initialize_dashboard():
     
     # Start alert expiry loop
     async def alert_expiry_loop():
+        """Orphan safety-net mirror. Cards normally leave via monitor remove callbacks."""
         while True:
             try:
-                now = datetime.now().timestamp()
+                now = time.time()
                 to_remove = []
+                orphan_sec = alert_orphan_sec()
                 for aid, ad in list(active_alerts.items()):
-                    expiry = ad.get('expiry', 0)
-                    if expiry and expiry < now:
+                    last_seen = float(ad.get('last_seen') or 0)
+                    if last_seen and (now - last_seen) > orphan_sec:
                         to_remove.append(aid)
-                
                 for aid in to_remove:
                     del active_alerts[aid]
                     socketio.emit('remove_alert', {'id': aid})
-                    print(f"Removed expired alert: {aid}")
-                
-                await asyncio.sleep(5)  # Check every 5 seconds
+                    print(f"[ORPHAN] Removed silent card: {aid} (>{orphan_sec:.0f}s without monitor)")
+                await asyncio.sleep(15)
             except Exception as e:
                 print(f"Warning: Error in alert expiry loop: {e}")
-                await asyncio.sleep(5)
+                await asyncio.sleep(15)
     
     # Run expiry loop in background thread
     def run_expiry_loop():

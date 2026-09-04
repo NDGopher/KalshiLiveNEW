@@ -89,3 +89,32 @@ class EvAlert:
             "game_status": self.game_status,
             "line": self.line,
         }
+
+
+def alert_presence_key(alert: Any) -> str:
+    """Stable identity for an active card — independent of odds/EV ticks.
+
+    Frontend cards stay while this key remains in the monitor's active set and
+    leave when it disappears. Do not put odds in the key or every price tick
+    becomes remove+add.
+    """
+    ticker = str(getattr(alert, "ticker", "") or "")
+    pick = str(getattr(alert, "pick", "") or "")
+    qualifier = str(getattr(alert, "qualifier", "") or "")
+    market_type = str(getattr(alert, "market_type", "") or "")
+    take_book = str(getattr(alert, "take_book", "") or "Kalshi")
+    take_part = f"|{take_book}" if take_book.lower() != "kalshi" else ""
+    return f"{ticker}|{pick}|{qualifier}|{market_type}{take_part}"
+
+
+def presence_key_from_row(row: Dict[str, Any]) -> str:
+    """Rebuild presence key from a stored dashboard alert row."""
+    if row.get("presence_key"):
+        return str(row["presence_key"])
+    ticker = str(row.get("ticker") or "")
+    pick = str(row.get("pick") or "")
+    qualifier = str(row.get("qualifier") or "")
+    market_type = str(row.get("market_type") or "")
+    take_book = str(row.get("take_book") or "Kalshi")
+    take_part = f"|{take_book}" if take_book.lower() != "kalshi" else ""
+    return f"{ticker}|{pick}|{qualifier}|{market_type}{take_part}"
