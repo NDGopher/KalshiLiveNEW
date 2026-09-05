@@ -606,6 +606,83 @@ def test_handoff_runs_rest_odds_by_default(monkeypatch):
     asyncio.run(run())
 
 
+def test_handoff_seeds_soonest_pregame_ncaaf(monkeypatch):
+    """REST handoff must include pending NCAAF tip-offs, not only /events/live."""
+    monkeypatch.setenv("ODDS_API_KEY", "test-not-a-real-key")
+    monkeypatch.delenv("ODDS_API_WS_HANDOFF_REST_ODDS", raising=False)
+    monkeypatch.setenv("ODDS_PREGAME_EVENTS_PER_SPORT", "8")
+
+    class SpyRest(_DummyRest):
+        def __init__(self):
+            self.snap_ids: list = []
+            self.last_seq = 7
+
+        async def list_live_events(self, *args, **kwargs):
+            return [
+                {
+                    "id": 1,
+                    "sport": {"slug": "football"},
+                    "league": {"slug": "england-premier-league"},
+                    "home": "Arsenal",
+                    "away": "Chelsea",
+                }
+            ]
+
+        async def list_events_for_sport(self, sport_slug, league=None, status=None):
+            from odds_api_client import sport_slug_query_for_api
+
+            if sport_slug_query_for_api(str(sport_slug)) != "american-football":
+                return []
+            return [
+                {
+                    "id": 88,
+                    "status": "settled",
+                    "date": "2026-09-05T14:00:00Z",
+                    "sport": {"slug": "american-football"},
+                    "league": {"slug": "usa-college"},
+                    "home": "Settled",
+                    "away": "Done",
+                },
+                {
+                    "id": 99,
+                    "status": "pending",
+                    "date": "2026-09-05T19:30:00Z",
+                    "sport": {"slug": "american-football"},
+                    "league": {"slug": "usa-college"},
+                    "home": "Georgia Bulldogs",
+                    "away": "Tennessee State Tigers",
+                },
+            ]
+
+        async def get_odds_multi(self, event_ids, bookmakers, **kwargs):
+            self.snap_ids = [int(x) for x in event_ids]
+            return [
+                {
+                    "id": int(eid),
+                    "bookmakers": {
+                        "DraftKings": [{"name": "ML", "odds": [{"home": 2.0, "away": 1.8}]}],
+                        "FanDuel": [{"name": "ML", "odds": [{"home": 2.0, "away": 1.8}]}],
+                        "Bet365": [{"name": "ML", "odds": [{"home": 2.0, "away": 1.8}]}],
+                        "Kalshi": [{"name": "ML", "odds": [{"home": 2.1, "away": 1.7}]}],
+                    },
+                }
+                for eid in event_ids
+            ]
+
+    async def run() -> None:
+        rest = SpyRest()
+        feed = OddsApiWsFeed(rest, api_key="test-not-a-real-key")
+        await feed._handoff_snapshot()
+        assert 99 in rest.snap_ids
+        assert 88 not in rest.snap_ids
+        doc = feed.store.merged_doc(99)
+        bks = doc.get("bookmakers") or {}
+        assert "DraftKings" in bks
+        assert "Kalshi" in bks
+
+    asyncio.run(run())
+
+
 def test_handoff_can_be_disabled(monkeypatch):
     monkeypatch.setenv("ODDS_API_KEY", "test-not-a-real-key")
     monkeypatch.setenv("ODDS_API_WS_HANDOFF_REST_ODDS", "false")

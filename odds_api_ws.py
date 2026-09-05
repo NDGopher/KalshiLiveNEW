@@ -1176,12 +1176,25 @@ class OddsApiWsFeed:
             return
         try:
             liv = await self.rest.list_live_events(None)
-            self.store.apply_slate(liv or [])
+            pre_all: List[Dict[str, Any]] = []
+            try:
+                # Same upcoming picker as the monitor — /events is settled-first,
+                # so a raw slice never seeds tonight's NCAAF tip-offs.
+                from odds_ev_monitor import _diag_fetch_pregame_by_sports
+
+                pre_cap = int(os.getenv("ODDS_PREGAME_EVENTS_PER_SPORT", "35") or "35")
+                pre_all = await _diag_fetch_pregame_by_sports(self.rest, pre_cap)
+            except Exception as ex:
+                print(f"[ODDS-API WS] [WARN] handoff pregame slate failed: {ex}")
+                pre_all = []
+            self.store.apply_slate(list(liv or []) + list(pre_all or []))
             # Majors first — raw /events/live order buries EPL under FA Cup floods,
             # so a first-N cut never seeds soccer majors into the WS store.
             from odds_api_client import prioritize_live_events_for_scan
 
-            seed = prioritize_live_events_for_scan(list(liv or []), _handoff_seed_max())
+            seed = prioritize_live_events_for_scan(
+                list(liv or []) + list(pre_all or []), _handoff_seed_max()
+            )
             ids: List[int] = []
             for ev in seed:
                 eid = _event_id(ev.get("id") if isinstance(ev, dict) else None)
@@ -1194,7 +1207,8 @@ class OddsApiWsFeed:
                     lg = seed[0].get("league") if isinstance(seed[0].get("league"), dict) else {}
                     sample_slug = str((lg or {}).get("slug") or "")
                 print(
-                    f"[ODDS-API WS] REST→WS handoff: snapshot {len(ids)} live ids "
+                    f"[ODDS-API WS] REST→WS handoff: snapshot {len(ids)} ids "
+                    f"live={len(liv or [])} pregame={len(pre_all or [])} "
                     f"seq={self.store.last_seq} majors-first sample={sample_slug or '?'}"
                 )
         except Exception as ex:
