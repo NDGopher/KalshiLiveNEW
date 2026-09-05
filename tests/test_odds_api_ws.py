@@ -11,6 +11,7 @@ import odds_api_ws as ows
 from odds_api_client import (
     DEFAULT_ODDS_API_BOOKMAKERS,
     _bookmaker_for_odds_request,
+    _canonical_odds_api_bookmaker,
     api_wire_bookmakers,
     parse_odds_api_bookmakers,
     parse_odds_api_seq_header,
@@ -477,6 +478,153 @@ def test_1013_exception_reconnect_storm(monkeypatch):
 def _install_shared_feed(feed: OddsApiWsFeed) -> None:
     ows._shared_feed = feed
     ows._recovery_lock = None
+    ows._ws_rest_backfill_lock = None
+    ows._ws_rest_backfill_until = 0.0
+
+
+def _mark_feed_healthy(feed: OddsApiWsFeed) -> None:
+    feed.connected = True
+    feed.welcome_ok = True
+    feed._running = True
+    feed.resyncing = False
+    feed._unhealthy_since = None
+
+
+def test_bet365_latency_suffix_canonicalizes():
+    assert _canonical_odds_api_bookmaker("Bet365 (no latency)") == "Bet365"
+    assert _canonical_odds_api_bookmaker("Bet365 (low latency)") == "Bet365"
+    assert _canonical_odds_api_bookmaker("bet365 no latency") == "Bet365"
+
+
+def test_ws_bet365_latency_label_stores_as_bet365():
+    store = OddsWsStore()
+    store.apply_message(
+        {
+            "type": "updated",
+            "seq": 1,
+            "id": 55,
+            "bookie": "Bet365 (no latency)",
+            "markets": [{"name": "ML", "odds": [{"home": 2.1, "away": 1.7, "draw": 3.4}]}],
+        }
+    )
+    assert "Bet365" in store.merged_doc(55)["bookmakers"]
+    assert "Bet365 (no latency)" not in store.merged_doc(55)["bookmakers"]
+
+
+def test_thin_ws_store_rest_backfills_missing_books(monkeypatch):
+    monkeypatch.setenv("ODDS_API_KEY", "test-not-a-real-key")
+    monkeypatch.setenv("ODDS_API_WS", "true")
+    monkeypatch.setenv("ODDS_API_WS_REST_BACKFILL", "true")
+    monkeypatch.setenv("ODDS_API_WS_REST_BACKFILL_MIN_BOOKS", "4")
+    monkeypatch.setenv("ODDS_API_WS_REST_BACKFILL_COOLDOWN_SEC", "30")
+
+    class FatRest(_DummyRest):
+        def __init__(self):
+            self.multi_calls = 0
+
+        async def get_odds_multi(self, event_ids, bookmakers, **kwargs):
+            self.multi_calls += 1
+            return [
+                {
+                    "id": 42,
+                    "home": "Arsenal",
+                    "away": "Chelsea",
+                    "sport": "football",
+                    "bookmakers": {
+                        "DraftKings": [{"name": "ML", "odds": [{"home": 2.0, "away": 3.5, "draw": 3.2}]}],
+                        "FanDuel": [{"name": "ML", "odds": [{"home": 2.05, "away": 3.4, "draw": 3.1}]}],
+                        "Bet365": [{"name": "ML", "odds": [{"home": 1.95, "away": 3.6, "draw": 3.3}]}],
+                        "Polymarket": [{"name": "ML", "odds": [{"home": 2.1, "away": 3.3, "draw": 3.0}]}],
+                    },
+                }
+            ]
+
+    async def run() -> None:
+        rest = FatRest()
+        feed = OddsApiWsFeed(rest, api_key="test-not-a-real-key")
+        _mark_feed_healthy(feed)
+        feed.store.apply_rest_docs(
+            [
+                {
+                    "id": 42,
+                    "home": "Arsenal",
+                    "away": "Chelsea",
+                    "bookmakers": {
+                        "Polymarket": [{"name": "ML", "odds": [{"home": 2.1, "away": 3.3, "draw": 3.0}]}],
+                    },
+                }
+            ]
+        )
+        _install_shared_feed(feed)
+        books = ["DraftKings", "FanDuel", "Bet365", "Polymarket", "BetMGM", "Kalshi"]
+        docs, src = await resolve_odds_docs(rest, [42], books)
+        assert src == "websocket_rest_fill"
+        assert rest.multi_calls == 1
+        bks = set((docs[0].get("bookmakers") or {}).keys())
+        assert {"DraftKings", "FanDuel", "Bet365", "Polymarket"} <= bks
+        # Cooldown: second call must not hammer REST even if still thin on BetMGM/Kalshi.
+        docs2, src2 = await resolve_odds_docs(rest, [42], books)
+        assert rest.multi_calls == 1
+        assert src2 == "websocket"
+        assert len((docs2[0].get("bookmakers") or {})) >= 4
+
+    try:
+        asyncio.run(run())
+    finally:
+        ows._shared_feed = None
+        ows._recovery_lock = None
+        ows._ws_rest_backfill_lock = None
+        ows._ws_rest_backfill_until = 0.0
+
+
+def test_ws_rest_backfill_skipped_when_store_already_fat(monkeypatch):
+    monkeypatch.setenv("ODDS_API_KEY", "test-not-a-real-key")
+    monkeypatch.setenv("ODDS_API_WS", "true")
+    monkeypatch.setenv("ODDS_API_WS_REST_BACKFILL", "true")
+    monkeypatch.setenv("ODDS_API_WS_REST_BACKFILL_MIN_BOOKS", "4")
+
+    class SpyRest(_DummyRest):
+        def __init__(self):
+            self.multi_calls = 0
+
+        async def get_odds_multi(self, *args, **kwargs):
+            self.multi_calls += 1
+            raise AssertionError("fat WS store must not REST backfill")
+
+    async def run() -> None:
+        rest = SpyRest()
+        feed = OddsApiWsFeed(rest, api_key="test-not-a-real-key")
+        _mark_feed_healthy(feed)
+        feed.store.apply_rest_docs(
+            [
+                {
+                    "id": 9,
+                    "home": "A",
+                    "away": "B",
+                    "bookmakers": {
+                        "DraftKings": [{"name": "ML", "odds": [{"home": 2.0, "away": 1.8}]}],
+                        "FanDuel": [{"name": "ML", "odds": [{"home": 2.0, "away": 1.8}]}],
+                        "Bet365": [{"name": "ML", "odds": [{"home": 2.0, "away": 1.8}]}],
+                        "Polymarket": [{"name": "ML", "odds": [{"home": 2.0, "away": 1.8}]}],
+                    },
+                }
+            ]
+        )
+        _install_shared_feed(feed)
+        docs, src = await resolve_odds_docs(
+            rest, [9], ["DraftKings", "FanDuel", "Bet365", "Polymarket"]
+        )
+        assert src == "websocket"
+        assert rest.multi_calls == 0
+        assert len(docs[0]["bookmakers"]) == 4
+
+    try:
+        asyncio.run(run())
+    finally:
+        ows._shared_feed = None
+        ows._recovery_lock = None
+        ows._ws_rest_backfill_lock = None
+        ows._ws_rest_backfill_until = 0.0
 
 
 def test_429_fallback_suppression(monkeypatch):

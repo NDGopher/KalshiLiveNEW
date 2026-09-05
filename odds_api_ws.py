@@ -1351,6 +1351,129 @@ def _updated_since_window_sec() -> int:
         return 60
 
 
+
+def _priced_master_book_count(doc: Dict[str, Any], master: Sequence[str]) -> int:
+    """How many configured books have a non-empty markets list on this odds doc."""
+    bks = doc.get("bookmakers") if isinstance(doc, dict) else None
+    if not isinstance(bks, dict):
+        return 0
+    want = {_canonical_odds_api_bookmaker(b).lower() for b in master if str(b).strip()}
+    n = 0
+    for raw_k, markets in bks.items():
+        ck = _canonical_odds_api_bookmaker(str(raw_k)).lower()
+        if ck not in want:
+            continue
+        if isinstance(markets, list) and markets:
+            n += 1
+    return n
+
+
+def _ws_docs_need_rest_book_backfill(
+    docs: Sequence[Dict[str, Any]],
+    master: Sequence[str],
+    *,
+    min_books: int,
+) -> bool:
+    """True when WS store is healthy but thin vs REST (common for live soccer)."""
+    if min_books <= 0:
+        return False
+    if not docs:
+        return True
+    counts = [_priced_master_book_count(d, master) for d in docs]
+    return min(counts) < min_books
+
+
+_ws_rest_backfill_lock: Optional[asyncio.Lock] = None
+_ws_rest_backfill_until: float = 0.0
+
+
+def _get_ws_rest_backfill_lock() -> asyncio.Lock:
+    global _ws_rest_backfill_lock
+    lock = _ws_rest_backfill_lock
+    if lock is None:
+        lock = asyncio.Lock()
+        _ws_rest_backfill_lock = lock
+    return lock
+
+
+async def _maybe_rest_backfill_thin_ws_docs(
+    rest_client: Any,
+    event_ids: Sequence[int],
+    docs: List[Dict[str, Any]],
+    bookmakers: Sequence[str],
+    *,
+    odds_cache_ttl: Optional[float] = None,
+) -> Tuple[List[Dict[str, Any]], str]:
+    """When WS is up but missing DK/FD/Bet365/etc., merge a REST /odds/multi snapshot.
+
+    Odds-API WS only pushes books that tick. Cold or sparse soccer feeds often
+    leave the healthy store with Polymarket/BetMGM/Kalshi while REST still has
+    7/10 books for EPL. Without this, ``resolve_odds_docs`` short-circuits on
+    websocket and sharp gates never see DraftKings/FanDuel/Bet365.
+    """
+    global _ws_rest_backfill_until
+    if not _env_bool("ODDS_API_WS_REST_BACKFILL", "true"):
+        return docs, "websocket"
+    try:
+        min_books = int(os.getenv("ODDS_API_WS_REST_BACKFILL_MIN_BOOKS", "4") or "4")
+    except ValueError:
+        min_books = 4
+    min_books = max(0, min(min_books, 10))
+    books = list(bookmakers) if bookmakers else odds_api_master_bookmakers()
+    if not _ws_docs_need_rest_book_backfill(docs, books, min_books=min_books):
+        return docs, "websocket"
+    now = time.time()
+    if now < float(_ws_rest_backfill_until or 0.0):
+        return docs, "websocket"
+    feed = peek_shared_odds_ws_feed()
+    if feed is None:
+        return docs, "websocket"
+    try:
+        cooldown = float(os.getenv("ODDS_API_WS_REST_BACKFILL_COOLDOWN_SEC", "20") or "20")
+    except ValueError:
+        cooldown = 20.0
+    cooldown = max(5.0, min(cooldown, 300.0))
+    async with _get_ws_rest_backfill_lock():
+        # Re-check under lock (another poll may have filled the store).
+        fresh = odds_docs_from_ws(event_ids)
+        if fresh is not None and not _ws_docs_need_rest_book_backfill(
+            fresh, books, min_books=min_books
+        ):
+            return fresh, "websocket"
+        if time.time() < float(_ws_rest_backfill_until or 0.0):
+            return (fresh if fresh is not None else docs), "websocket"
+        before = [
+            _priced_master_book_count(d, books)
+            for d in (fresh if fresh is not None else docs)
+        ]
+        try:
+            rest_docs = await rest_client.get_odds_multi(
+                [int(x) for x in event_ids],
+                books,
+                odds_cache_ttl=0.0 if odds_cache_ttl is None else float(odds_cache_ttl),
+            )
+        except Exception as ex:
+            _ws_rest_backfill_until = time.time() + cooldown
+            if is_odds_api_rate_limit_error(ex):
+                print(f"[ODDS-API WS] [WARN] REST book backfill rate-limited: {ex}")
+            else:
+                print(f"[ODDS-API WS] [WARN] REST book backfill failed: {ex}")
+            return (fresh if fresh is not None else docs), "websocket"
+        feed.store.apply_rest_docs(rest_docs or [])
+        _ws_rest_backfill_until = time.time() + cooldown
+        merged = feed.store.merged_docs(event_ids)
+        after = [_priced_master_book_count(d, books) for d in merged]
+        print(
+            "[ODDS-API WS] REST book backfill: "
+            f"events={len(event_ids)} min_books_before={min(before) if before else 0} "
+            f"min_books_after={min(after) if after else 0} "
+            f"avg_before={(sum(before)/len(before)) if before else 0:.1f} "
+            f"avg_after={(sum(after)/len(after)) if after else 0:.1f} "
+            f"cooldown={cooldown:.0f}s"
+        )
+        return merged, "websocket_rest_fill"
+
+
 async def resolve_odds_docs(
     rest_client: Any,
     event_ids: Sequence[int],
@@ -1360,7 +1483,7 @@ async def resolve_odds_docs(
 ) -> Tuple[List[Dict[str, Any]], str]:
     """
     WS-first odds fetch. Returns ``(docs, source)`` where source is
-    ``websocket`` | ``rest_updated`` | ``rest_multi`` | ``unavailable``.
+    ``websocket`` | ``websocket_rest_fill`` | ``rest_updated`` | ``rest_multi`` | ``unavailable``.
 
     When the WebSocket is enabled but down, recovery is single-flight REST
     ``/odds/updated`` with cooldown. Rate limits and cooldown fail closed
@@ -1368,18 +1491,30 @@ async def resolve_odds_docs(
     ``/odds/multi``.
     """
     ids = [int(x) for x in event_ids]
+    books = list(bookmakers) if bookmakers else odds_api_master_bookmakers()
     ws_docs = odds_docs_from_ws(ids)
     if ws_docs is not None:
-        return ws_docs, "websocket"
+        return await _maybe_rest_backfill_thin_ws_docs(
+            rest_client,
+            ids,
+            ws_docs,
+            books,
+            odds_cache_ttl=odds_cache_ttl,
+        )
 
-    books = list(bookmakers) if bookmakers else odds_api_master_bookmakers()
     feed = peek_shared_odds_ws_feed()
 
     if odds_api_ws_wanted():
         async with _get_recovery_lock():
             ws_docs = odds_docs_from_ws(ids)
             if ws_docs is not None:
-                return ws_docs, "websocket"
+                return await _maybe_rest_backfill_thin_ws_docs(
+                    rest_client,
+                    ids,
+                    ws_docs,
+                    books,
+                    odds_cache_ttl=odds_cache_ttl,
+                )
             feed = peek_shared_odds_ws_feed()
             if feed is None or not feed.should_attempt_rest_fallback():
                 return [], "unavailable"

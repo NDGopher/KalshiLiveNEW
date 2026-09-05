@@ -120,6 +120,9 @@ _BOOKMAKER_API_ALIASES = {
     "bookmaker.eu": "BookMaker.eu",
     "betfair": "Betfair Exchange",
     "plive": "PLive",
+    # Odds-API WS occasionally suffixes catalog names.
+    "bet365 (no latency)": "Bet365",
+    "bet365 no latency": "Bet365",
 }
 
 # Local books that must never be sent on Odds-API.io REST / WS select.
@@ -138,7 +141,20 @@ def api_wire_bookmakers(names: Optional[List[str]] = None) -> List[str]:
 
 def _canonical_odds_api_bookmaker(name: str) -> str:
     n = _norm_book(name)
-    return _BOOKMAKER_API_ALIASES.get(n.lower(), n)
+    low = n.lower()
+    # WS bookie labels sometimes include a latency tag, e.g. ``Bet365 (no latency)``.
+    for suffix in (" (no latency)", " (low latency)"):
+        if low.endswith(suffix):
+            n = n[: -len(suffix)].strip()
+            low = n.lower()
+            break
+    aliased = _BOOKMAKER_API_ALIASES.get(low)
+    if aliased is not None:
+        return aliased
+    # Unify Betfair Sportsbook / Exchange-style labels to the catalog name.
+    if low.startswith("betfair "):
+        return _BOOKMAKER_API_ALIASES["betfair"]
+    return n
 
 
 # Growth 10-book catalog names. BookMaker.eu is catalog-inactive — do not add it.
