@@ -252,7 +252,7 @@ total_bet_amount = 101.0  # Total Points/Goals bet amount in dollars (keep at de
 spread_bet_amount = 75.0  # Point Spread bet amount in dollars (1.10% ROI - reduce bet size)
 
 # Legacy global settings (for backward compatibility, will be migrated to per-filter)
-auto_bet_ev_min = 5.0  # Minimum EV percentage (auto-bettor uses conservative 5% threshold, dashboard shows 0% for manual betting)
+auto_bet_ev_min = 2.0  # Auto-bet desk default 2% (All Sports / CFB). CBB stays 10%. Dashboard list is 0%+.
 auto_bet_ev_max = 25.0  # Maximum EV percentage
 auto_bet_odds_min = -200  # Minimum American odds (matches new conservative filter range)
 auto_bet_odds_max = 200  # Maximum American odds (matches new conservative filter range)
@@ -606,7 +606,7 @@ selected_auto_bettor_filters = []
 
 # Initialize per-filter auto-bet settings with defaults (overlaid from disk below).
 auto_bet_settings_by_filter[DEFAULT_FILTER_NAME] = {
-    'ev_min': 5.0,
+    'ev_min': 2.0,
     'ev_max': 25.0,
     'odds_min': -200,
     'odds_max': 200,
@@ -2479,6 +2479,22 @@ def _is_paper_kalshi_alert(alert: EvAlert) -> bool:
     return not is_kalshi_ticker(ticker) and not ticker.upper().startswith("KXSCAN")
 
 
+def _autobet_reasons_for_alert(alert: Any, *, forced: Optional[List[str]] = None) -> List[str]:
+    """Card/API reasons. High-EV display rows must not look silently tradeable."""
+    reasons: List[str] = []
+    raw = forced if forced is not None else getattr(alert, "autobet_reasons", None)
+    if isinstance(raw, list):
+        for r in raw:
+            s = str(r).strip()
+            if s and s not in reasons:
+                reasons.append(s)
+    if alert is not None and _is_plive_take_alert(alert) and "take_not_kalshi" not in reasons:
+        reasons.append("take_not_kalshi")
+    if alert is not None and _is_paper_kalshi_alert(alert) and "paper_ticker" not in reasons:
+        reasons.append("paper_ticker")
+    return reasons
+
+
 def _row_is_plive_take(row: Dict) -> bool:
     if not isinstance(row, dict):
         return False
@@ -2549,6 +2565,7 @@ async def handle_plive_take_display_alert(alert: EvAlert) -> None:
         "match_failed": False,
         "strict_pass": getattr(alert, "strict_pass", True),
         "autobet_allow": False,
+        "autobet_reasons": _autobet_reasons_for_alert(alert, forced=["take_not_kalshi"]),
         "ev_source": getattr(alert, "ev_source", "plive_take"),
         "take_book": "PLive",
         "line": getattr(alert, "line", None),
@@ -2627,6 +2644,7 @@ async def handle_kalshi_paper_display_alert(alert: EvAlert) -> None:
         "match_failed": False,
         "strict_pass": getattr(alert, "strict_pass", True),
         "autobet_allow": False,
+        "autobet_reasons": _autobet_reasons_for_alert(alert, forced=["paper_ticker"]),
         "ev_source": getattr(alert, "ev_source", "live_event_scan"),
         "take_book": "Kalshi",
         "line": getattr(alert, "line", None),
@@ -3243,6 +3261,7 @@ async def handle_new_alert(alert: EvAlert):
             'presence_key': alert_presence_key(alert),
             'strict_pass': getattr(alert, 'strict_pass', True),
             'autobet_allow': bool(getattr(alert, 'autobet_allow', False)),
+            'autobet_reasons': _autobet_reasons_for_alert(alert),
             'ev_source': getattr(alert, 'ev_source', 'odds_api_value_bets'),
             'take_book': getattr(alert, 'take_book', 'Kalshi') or 'Kalshi',
             'line': getattr(alert, 'line', None) if getattr(alert, 'line', None) is not None else line,
@@ -3305,6 +3324,9 @@ async def handle_new_alert(alert: EvAlert):
             if hasattr(alert, 'strict_pass'):
                 existing_alert['strict_pass'] = alert.strict_pass
                 updated = True
+            existing_alert['autobet_allow'] = bool(getattr(alert, 'autobet_allow', False))
+            existing_alert['autobet_reasons'] = _autobet_reasons_for_alert(alert)
+            updated = True
             if getattr(alert, "ev_source", None) and alert.ev_source != existing_alert.get("ev_source"):
                 existing_alert["ev_source"] = alert.ev_source
                 updated = True
@@ -4636,6 +4658,7 @@ def run_monitor_loop():
                 if hasattr(alert, 'strict_pass'):
                     alert_data['strict_pass'] = alert.strict_pass
                 alert_data['autobet_allow'] = bool(getattr(alert, 'autobet_allow', False))
+                alert_data['autobet_reasons'] = _autobet_reasons_for_alert(alert)
                 for _lk in (
                     "live",
                     "clock",
@@ -4685,6 +4708,8 @@ def run_monitor_loop():
                         'sharp_books': alert_data.get('sharp_books', []),  # Preserve sharp books from filter
                         'devig_books': alert_data.get('devig_books', getattr(alert, 'devig_books', [])),
                         'strict_pass': alert_data.get('strict_pass', getattr(alert, 'strict_pass', True)),
+                        'autobet_allow': alert_data.get('autobet_allow', False),
+                        'autobet_reasons': alert_data.get('autobet_reasons', []),
                         'book_updated_at': alert_data.get('book_updated_at', getattr(alert, 'book_updated_at', {}) or {}),
                         'kalshi_last_trade_ts': alert_data.get(
                             'kalshi_last_trade_ts', getattr(alert, 'kalshi_last_trade_ts', None)
@@ -5333,7 +5358,8 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
         else:
             autobet_ok = bool(alert_data.get("autobet_allow", False))
         if not autobet_ok:
-            # Product lock: only Royals-like Kalshi-best / ≥5 same-sign / two-way few-percent.
+            # Product lock: Kalshi take, ≥3 same-sign two-way recs (3 Sharps Live).
+            # PLive never auto-bets. Switch ON does not override a False allow.
             _terminal_skip(
                 "autobet_allow=False",
                 "Product-shape autobet_allow is False (fail-closed; switch ON does not override)",

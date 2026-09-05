@@ -53,12 +53,13 @@ MEDIAN_GATE_TOL = 0.005
 # Identity band. KEEP boards with ~8c of juice (57c vs 65c) must not match this.
 TIGHT_CLUSTER_BAND = 0.04
 TIGHT_CLUSTER_EV_ABS = 2.0
-# Auto-bet product lock (switch stays OFF). Royals-like: Kalshi strictly best
-# vs ≥5 tight same-sign recs, PLive on-pack confirm, two-way POWER few-percent.
-# Brewers-like +14% plus-only / away-sign-wrong must not fire.
-AUTOBET_MIN_SAME_SIGN_RECS = 5
+# Auto-bet product lock (switch stays OFF). Kalshi All Sports (3 Sharps Live):
+# ≥3 tight same-sign two-way recs, junk/Poly out, PLive never a take.
+# Kalshi need not be best. EV ≤20% is fine; >20 is ev_teens.
+# Fail-closed ticker/line/side stays outside this function.
+AUTOBET_MIN_SAME_SIGN_RECS = 3
 AUTOBET_TIGHT_PACK_CENTS = 0.15
-AUTOBET_MAX_EV_PCT = 12.0
+AUTOBET_MAX_EV_PCT = 20.0
 # Live recs older than this are out of POWER (tile timers stay). 3h NV is junk.
 LIVE_REC_POWER_MAX_AGE_SEC = 45.0
 # Soccer live Kalshi take. Recs at 0–3s vs a 2m Odds-API last must not print +EV.
@@ -231,15 +232,14 @@ def autobet_product_shape(
 ) -> Dict[str, Any]:
     """Allowlist for later auto-bet. Does not flip the live switch.
 
-    Royals ML +163 vs a tight same-sign pack of ≥5 recs, PLive +118 confirming
-    (not in POWER), honest two-way few-percent EV. Poly −455 is junk.
-    Brewers-like teens from plus-only implieds, or a wrong away hdp, fail.
+    3 Sharps Live: Kalshi take, ≥3 tight same-sign two-way recs, junk/Poly out.
+    PLive is never a take. Kalshi need not be best. EV ≤20% is fine.
+    Plus-only (missing sisters) and a wrong away hdp fail.
     """
     reasons: List[str] = []
     if _book_name_key(take_book or "Kalshi") != "kalshi":
         reasons.append("take_not_kalshi")
     recs: List[Dict[str, Any]] = []
-    plive_row: Optional[Dict[str, Any]] = None
     for raw in books or []:
         if not isinstance(raw, dict):
             continue
@@ -250,9 +250,10 @@ def autobet_product_shape(
         if not am:
             continue
         if is_plive_book(raw.get("name")):
-            plive_row = raw
             continue
         if is_kalshi_book(raw.get("name")):
+            continue
+        if is_polymarket_book(raw.get("name")) and is_junk_vs_kalshi(am, int(take_american)):
             continue
         if _tight_same_sign_vs_take(am, int(take_american)):
             recs.append(raw)
@@ -262,23 +263,6 @@ def autobet_product_shape(
     have_sister_field = any(b.get("decimal_opp") is not None for b in recs)
     if have_sister_field and sisters < AUTOBET_MIN_SAME_SIGN_RECS:
         reasons.append("sister_required")
-    pack_for_best = list(recs)
-    if plive_row is not None:
-        try:
-            _pam = int(plive_row.get("american") or 0)
-        except (TypeError, ValueError):
-            _pam = 0
-        if _pam and not is_junk_vs_kalshi(_pam, int(take_american)):
-            pack_for_best.append(plive_row)
-    if count_better_than_kalshi(pack_for_best, int(take_american)) > 0:
-        reasons.append("take_not_best")
-    if plive_row is not None:
-        try:
-            pam = int(plive_row.get("american") or 0)
-        except (TypeError, ValueError):
-            pam = 0
-        if not pam or is_junk_vs_kalshi(pam, int(take_american)):
-            reasons.append("plive_off_pack")
     if plus_alert is False:
         reasons.append("no_plus")
     if ev_percent is not None:
@@ -295,7 +279,6 @@ def autobet_product_shape(
     )
     if not hdp["allow_keep"]:
         reasons.extend(hdp["reasons"])
-    # Unique reasons, stable order.
     seen: Set[str] = set()
     uniq: List[str] = []
     for r in reasons:

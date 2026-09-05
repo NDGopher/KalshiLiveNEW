@@ -262,6 +262,9 @@ socket.on('alert_update', (data) => {
         if (data.sharp_books !== undefined) alert.sharp_books = data.sharp_books;
         if (data.book_updated_at !== undefined) alert.book_updated_at = data.book_updated_at;
         if (data.kalshi_last_trade_ts !== undefined) alert.kalshi_last_trade_ts = data.kalshi_last_trade_ts;
+        if (data.strict_pass !== undefined) alert.strict_pass = data.strict_pass;
+        if (data.autobet_allow !== undefined) alert.autobet_allow = data.autobet_allow;
+        if (data.autobet_reasons !== undefined) alert.autobet_reasons = data.autobet_reasons;
         for (const k of ['live', 'clock', 'clock_running', 'status_detail', 'statusDetail', 'score', 'scores', 'game_status']) {
             if (data[k] !== undefined) alert[k] = data[k];
         }
@@ -426,7 +429,7 @@ socket.on('alert_update', (data) => {
                         evValueEl.className = `ev-value ${newEv >= 0 ? 'positive' : 'negative'}`;
                         
                         // Update card background color based on EV (green only if >= 8%)
-                        if (newEv >= 8.0) {
+                        if ((alert.strict_pass !== false) && newEv >= 8.0) {
                             alertCard.classList.add('high-ev');
                         } else {
                             alertCard.classList.remove('high-ev');
@@ -989,6 +992,12 @@ function createAlertCard(alert) {
     const filterNameDisplay = filterName
         ? `<div class="filter-name-badge-block">${escapeHtml(filterName)}</div>`
         : '';
+    const autobetAllow = alert.autobet_allow === true && strictOk;
+    const autobetReasons = Array.isArray(alert.autobet_reasons) ? alert.autobet_reasons : [];
+    const autobetWhy = autobetReasons.length ? autobetReasons.join(', ') : (strictOk ? 'shape' : 'display only');
+    const autobetBadge = autobetAllow
+        ? `<span class="autobet-badge autobet-badge--ok" title="Passes 3-sharp Kalshi product shape">AUTO</span>`
+        : `<span class="autobet-badge autobet-badge--no" title="Not auto-bet: ${escapeHtml(autobetWhy)}">NO AUTO · ${escapeHtml(autobetWhy)}</span>`;
     const evSrc = alert.ev_source || 'odds_api_value_bets';
     let evSourceLabel = '';
     let evSourceTitle = '';
@@ -1018,6 +1027,7 @@ function createAlertCard(alert) {
                     <span class="alert-liq-badge alert-liq-usd" title="Kalshi line limit / stake from Odds-API (if provided)">Liq ${escapeHtml(liqBadge)}</span>
                     ${kTradeBadge}
                     <span class="ev-source-sub" title="${escapeHtml(evSourceTitle)}">${escapeHtml(evSourceLabel)}</span>
+                    ${autobetBadge}
                 </div>
                 <div class="teams-bb">${escapeHtml(alert.teams)}</div>
                 ${formatAlertGameStatus(alert) ? `<div class="alert-game-status">${escapeHtml(formatAlertGameStatus(alert))}</div>` : ''}
