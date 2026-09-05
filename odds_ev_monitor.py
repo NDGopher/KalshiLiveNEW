@@ -3752,7 +3752,29 @@ class OddsEVMonitor:
 
         if not alerts:
             self._empty_poll_count += 1
-            if self._empty_poll_count >= 2 and self._seen_alerts:
+            # Presence cards must survive Odds-API WS flaps. When the socket is down
+            # (or within store-grace), an empty scan means "odds unavailable", not
+            # "edge gone" — do not wipe the board after 2 polls.
+            feed = peek_shared_odds_ws_feed() if odds_api_ws_wanted() else None
+            odds_path_down = bool(
+                odds_api_ws_wanted()
+                and (feed is None or not feed.healthy)
+            )
+            try:
+                clear_after = max(2, int(os.getenv("ODDS_EMPTY_POLL_CLEAR_AFTER", "12") or "12"))
+            except ValueError:
+                clear_after = 12
+            if odds_path_down:
+                if self._seen_alerts and (
+                    self._empty_poll_count == 1 or self._empty_poll_count % 20 == 0
+                ):
+                    print(
+                        f"[MONITOR] Empty scan during odds outage "
+                        f"(poll #{self._empty_poll_count}) — keeping "
+                        f"{len(self._seen_alerts)} card(s) until WS/REST recovers"
+                    )
+                return
+            if self._empty_poll_count >= clear_after and self._seen_alerts:
                 all_removed = self._seen_alerts.copy()
                 self._seen_alerts.clear()
                 for callback in self.removed_alert_callbacks:
@@ -3763,7 +3785,10 @@ class OddsEVMonitor:
                             callback(all_removed)
                     except Exception as e:
                         print(f"[WARN] Error in removed alert callback: {e}")
-                print(f"[DEL] Odds-API returned empty for {self._empty_poll_count} polls - cleared all {len(all_removed)} alerts")
+                print(
+                    f"[DEL] Odds-API returned empty for {self._empty_poll_count} polls - "
+                    f"cleared all {len(all_removed)} alerts"
+                )
                 self._empty_poll_count = 0
             return
         if self._empty_poll_count > 0:

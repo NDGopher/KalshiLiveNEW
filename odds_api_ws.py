@@ -45,6 +45,9 @@ from odds_api_client import (
     get_shared_odds_client,
     is_local_only_bookmaker,
     odds_api_master_bookmakers,
+    odds_api_sports_list,
+    odds_updated_sport_names,
+    sport_name_for_odds_updated,
     sport_slug_query_for_api,
 )
 
@@ -866,6 +869,7 @@ class OddsApiWsFeed:
         self._fallback_cooldown_until = 0.0
         self._fallback_rate_limited = False
         self._session_started_at: Optional[float] = None
+        self._unhealthy_since: Optional[float] = None
         self.last_close_code: Optional[int] = None
         self._ws = None
         self._dirty = asyncio.Event()
@@ -875,6 +879,14 @@ class OddsApiWsFeed:
     @property
     def healthy(self) -> bool:
         return bool(self.connected and self.welcome_ok and not self.resyncing and self._running)
+
+    def note_unhealthy(self) -> None:
+        """Mark the start of a disconnect/resync gap (for short store-grace reads)."""
+        if self._unhealthy_since is None:
+            self._unhealthy_since = time.time()
+
+    def note_healthy(self) -> None:
+        self._unhealthy_since = None
 
     def _mark_dirty(self) -> None:
         self.generation = self.store.generation
@@ -923,6 +935,7 @@ class OddsApiWsFeed:
         self._running = False
         self.connected = False
         self.welcome_ok = False
+        self.note_unhealthy()
         ws = self._ws
         self._ws = None
         if ws is not None:
@@ -996,12 +1009,17 @@ class OddsApiWsFeed:
         self,
         since: int,
         books: Optional[Sequence[str]] = None,
-        sport: Optional[str] = None,
+        sport: Optional[Any] = None,
+        sports: Optional[Sequence[Any]] = None,
     ) -> int:
-        """Patch store from ``/odds/updated`` (REST fallback; one book per call).
+        """Patch store from ``/odds/updated`` (REST fallback; one book × sport per call).
+
+        Odds-API.io requires the sport *display name* (e.g. ``Baseball``). We loop
+        configured sports when callers do not pass one — calling without sport is a
+        hard 400 and was wiping the board on every WS flap.
 
         Single-flight: concurrent callers wait, then see cooldown and skip.
-        A 429 stops the remaining book loop and arms a longer cooldown.
+        A 429 stops the remaining book/sport loop and arms a longer cooldown.
         """
         async with self._fallback_lock:
             if self.fallback_cooling_down():
@@ -1009,19 +1027,34 @@ class OddsApiWsFeed:
             n = 0
             rate_limited = False
             use = list(books) if books else odds_api_master_bookmakers()
+            if sport is not None:
+                sport_names = odds_updated_sport_names([sport])
+            elif sports is not None:
+                sport_names = odds_updated_sport_names(list(sports))
+            else:
+                sport_names = odds_updated_sport_names()
+            if not sport_names:
+                print("[ODDS-API WS] [WARN] /odds/updated skipped — no sport names resolved")
+                self._arm_fallback_cooldown(rate_limited=False)
+                return 0
             for bm in use:
-                try:
-                    docs = await self.rest.get_odds_updated(since, bm, sport=sport)
-                except Exception as ex:
-                    if is_odds_api_rate_limit_error(ex):
-                        print(f"[ODDS-API WS] [WARN] /odds/updated 429 for {bm} — stopping book loop")
-                        rate_limited = True
-                        break
-                    print(f"[ODDS-API WS] [WARN] /odds/updated failed for {bm}: {ex}")
-                    continue
-                if docs:
-                    self.store.apply_rest_docs(docs)
-                    n += len(docs)
+                for sp in sport_names:
+                    try:
+                        docs = await self.rest.get_odds_updated(since, bm, sport=sp)
+                    except Exception as ex:
+                        if is_odds_api_rate_limit_error(ex):
+                            print(
+                                f"[ODDS-API WS] [WARN] /odds/updated 429 for {bm}/{sp} — stopping book loop"
+                            )
+                            rate_limited = True
+                            break
+                        print(f"[ODDS-API WS] [WARN] /odds/updated failed for {bm}/{sp}: {ex}")
+                        continue
+                    if docs:
+                        self.store.apply_rest_docs(docs)
+                        n += len(docs)
+                if rate_limited:
+                    break
             self._arm_fallback_cooldown(rate_limited=rate_limited)
             if n:
                 self._mark_dirty()
@@ -1039,6 +1072,7 @@ class OddsApiWsFeed:
                 applied = self.store.apply_message(msg)
                 if applied.type == "welcome":
                     self.welcome_ok = True
+                    self.note_healthy()
                     books = []
                     if isinstance(msg.get("bookmakers"), list):
                         books = [str(x) for x in msg["bookmakers"]]
@@ -1161,6 +1195,7 @@ class OddsApiWsFeed:
                     had_welcome = bool(self.welcome_ok)
                     self.connected = False
                     self.welcome_ok = False
+                    self.note_unhealthy()
                     self._reconnecting = False
             if not self._running:
                 break
@@ -1275,13 +1310,30 @@ async def reset_shared_odds_ws_feed() -> None:
 
 def odds_docs_from_ws(event_ids: Sequence[int]) -> Optional[List[Dict[str, Any]]]:
     """
-    Return merged /odds-shaped docs from the live WS store, or None if WS is not healthy.
-    Callers must treat None as “use REST”.
+    Return merged /odds-shaped docs from the live WS store, or None if WS is not usable.
+
+    While the socket is healthy, always serve the store. During a short reconnect
+    gap, keep serving the last store snapshot (grace) so a flap cannot empty the
+    board before REST ``/odds/updated`` recovers.
     """
     feed = peek_shared_odds_ws_feed()
-    if feed is None or not feed.healthy:
+    if feed is None:
         return None
-    return feed.store.merged_docs(event_ids)
+    if feed.healthy:
+        return feed.store.merged_docs(event_ids)
+    try:
+        grace = float(os.getenv("ODDS_API_WS_STORE_GRACE_SEC", "45") or "45")
+    except ValueError:
+        grace = 45.0
+    if grace <= 0:
+        return None
+    since = feed._unhealthy_since
+    if since is None:
+        return None
+    if (time.time() - float(since)) > grace:
+        return None
+    docs = feed.store.merged_docs(event_ids)
+    return docs if docs else None
 
 
 def _updated_since_window_sec() -> int:
@@ -1325,8 +1377,16 @@ async def resolve_odds_docs(
             if feed is None or not feed.should_attempt_rest_fallback():
                 return [], "unavailable"
             since = int(time.time()) - _updated_since_window_sec()
+            # /odds/updated requires sport display names (Baseball, not baseball).
+            sports_for_fallback = []
+            for eid in ids:
+                meta = (feed.store.event_meta or {}).get(int(eid)) or {}
+                if meta.get("sport") is not None:
+                    sports_for_fallback.append(meta.get("sport"))
             try:
-                n = await feed.rest_updated_fallback(since, books)
+                n = await feed.rest_updated_fallback(
+                    since, books, sports=sports_for_fallback or None
+                )
             except Exception as ex:
                 print(f"[ODDS-API WS] [WARN] updated fallback failed: {ex}")
                 if is_odds_api_rate_limit_error(ex):

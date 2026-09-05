@@ -40,7 +40,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlencode
 
 import aiohttp
@@ -230,6 +230,94 @@ def sport_slug_query_for_api(slug: str) -> str:
     if s in legacy:
         return legacy[s]
     return s
+
+
+# GET /odds/updated requires the sport *display name* from GET /sports (e.g. "Baseball"),
+# not the slug ("baseball"). Wrong or missing sport → HTTP 400 and a dead REST fallback.
+_ODDS_UPDATED_SPORT_NAME_BY_SLUG: Dict[str, str] = {
+    "football": "Football",
+    "basketball": "Basketball",
+    "tennis": "Tennis",
+    "baseball": "Baseball",
+    "american-football": "American Football",
+    "ice-hockey": "Ice Hockey",
+    "esports": "Esports",
+    "darts": "Darts",
+    "mixed-martial-arts": "MMA",
+    "boxing": "Boxing",
+    "handball": "Handball",
+    "volleyball": "Volleyball",
+    "snooker": "Snooker",
+    "table-tennis": "Table Tennis",
+    "rugby": "Rugby",
+    "cricket": "Cricket",
+    "water-polo": "Waterpolo",
+    "futsal": "Futsal",
+    "beach-volleyball": "Beach Volley",
+    "aussie-rules": "Aussie Rules",
+    "floorball": "Floorball",
+    "squash": "Squash",
+    "beach-soccer": "Beach Soccer",
+    "lacrosse": "Lacrosse",
+    "curling": "Curling",
+    "padel": "Padel",
+    "bandy": "Bandy",
+    "gaelic-football": "Gaelic Football",
+    "beach-handball": "Beach Handball",
+    "athletics": "Athletics",
+    "badminton": "Badminton",
+    "cross-country": "Cross-Country",
+    "golf": "Golf",
+    "cycling": "Cycling",
+}
+
+
+def sport_name_for_odds_updated(sport: Any) -> Optional[str]:
+    """Return the Odds-API.io ``sport`` query value for GET /odds/updated.
+
+    Accepts a slug (``baseball``), display name (``Baseball``), or event ``sport``
+    object ``{"name":"Baseball","slug":"baseball"}``. Returns None if empty.
+    """
+    if sport is None:
+        return None
+    if isinstance(sport, dict):
+        name = sport.get("name")
+        if name and str(name).strip():
+            return str(name).strip()
+        slug = sport.get("slug") or sport.get("key") or sport.get("id")
+        return sport_name_for_odds_updated(slug)
+    raw = str(sport).strip()
+    if not raw:
+        return None
+    # Already a known display name.
+    if raw in _ODDS_UPDATED_SPORT_NAME_BY_SLUG.values():
+        return raw
+    slug = sport_slug_query_for_api(raw)
+    if slug in _ODDS_UPDATED_SPORT_NAME_BY_SLUG:
+        return _ODDS_UPDATED_SPORT_NAME_BY_SLUG[slug]
+    # Last resort: title-case the slug (works for simple names; prefer the map).
+    return slug.replace("-", " ").title()
+
+
+def odds_updated_sport_names(sports: Optional[Sequence[Any]] = None) -> List[str]:
+    """Deduped display names for /odds/updated. Defaults to ``odds_api_sports_list()``."""
+    src: Sequence[Any]
+    if sports is None:
+        src = odds_api_sports_list()
+    else:
+        src = sports
+    out: List[str] = []
+    seen: set = set()
+    for item in src:
+        name = sport_name_for_odds_updated(item)
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(name)
+    return out
 
 
 # When ``ODDS_API_SPORTS`` is unset, empty, or ``all`` / ``*`` / ``everything``: use this set (Odds-API ``sport`` values).
@@ -827,17 +915,28 @@ class OddsAPIClient:
         self,
         since: int,
         bookmaker: str,
-        sport: Optional[str] = None,
+        sport: Optional[Any] = None,
     ) -> List[Dict[str, Any]]:
         """GET /odds/updated — odds changed since UNIX ``since`` (must be ≤90s old).
 
         One bookmaker per call. Prefer this over full ``/odds/multi`` when the
         WebSocket is down and you already have a snapshot to patch.
+
+        ``sport`` is required by Odds-API.io and must be the display name from
+        GET /sports (e.g. ``Baseball``), not the slug. Slugs and sport objects
+        are coerced via ``sport_name_for_odds_updated``.
         """
         bm = _bookmaker_for_odds_request(_canonical_odds_api_bookmaker(bookmaker))
-        params: Dict[str, Any] = {"since": int(since), "bookmaker": bm}
-        if sport and str(sport).strip():
-            params["sport"] = str(sport).strip()
+        sport_name = sport_name_for_odds_updated(sport)
+        if not sport_name:
+            raise ValueError(
+                "GET /odds/updated requires sport (display name from /sports, e.g. 'Baseball')"
+            )
+        params: Dict[str, Any] = {
+            "since": int(since),
+            "bookmaker": bm,
+            "sport": sport_name,
+        }
         data = await self._get_json("/odds/updated", params)
         docs = _as_odds_multi_list(data)
         if docs:
