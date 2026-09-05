@@ -242,8 +242,8 @@ def test_monitor_phillies_spread_card_has_market_ticker_and_side():
     from odds_ev_monitor import OddsEVMonitor
 
     now = _time.time()
-    phi_dec = american_to_decimal(-105)
-    atl_dec = american_to_decimal(-105)
+    phi_dec = american_to_decimal(130)
+    atl_dec = american_to_decimal(-160)
     doc = {
         "id": 2609051805,
         "home": "Philadelphia Phillies",
