@@ -22,7 +22,7 @@ Non-goals for v1: perfect parity with every BookieBeats edge case; burning REST 
 
 | Item | Dev path / behavior | Why bring it | Caveat |
 |------|---------------------|--------------|--------|
-| **Filter persistence** | `USER_FILTERS_STATE_FILE`, load/save `saved_filters` + selections | Survives restarts; matches “build filters and test” | Wire load at startup; keep atomic write (Dev pattern). |
+| **Filter persistence** | `USER_FILTERS_STATE_FILE`, load/save `saved_filters` + selections + `auto_bet_enabled` / amount / EV bounds / `auto_bet_settings_by_filter` | Survives restarts; matches “build filters and test” | Wire load at startup; keep atomic write (Dev pattern). Missing `auto_bet_enabled` stays OFF. |
 | **`redact_secrets_for_log`** | `Dev/odds_api_client.py` | Safer logs when echoing URLs/errors | Small copy or shared util. |
 | **`secrets_bootstrap.py`** | `Dev/secrets_bootstrap.py` | Optional bundled creds in CI / locked-down deploy | Only if you use that workflow; keep try/except import. |
 | **Separate live vs pregame event TTL** | `ODDS_API_LIVE_EVENTS_TTL_SEC` vs `ODDS_API_EVENTS_TTL_SEC` | Lets **live list** refresh faster **without** hammering pregame `/events` | Set live TTL **≥** live poll interval to avoid duplicate HTTP. |

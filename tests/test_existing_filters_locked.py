@@ -29,12 +29,15 @@ def test_default_and_cbb_filter_payloads_unchanged():
     assert "auto_bet_settings_by_filter" in src
     assert "_persist_filters_state" in src
     assert "_load_filters_state" in src
+    assert "_overlay_auto_bet_persist" in src
+    assert '"auto_bet_enabled"' in src
 
 
 def test_dollar_rules_and_auto_bet_off():
     src = _src()
     assert "auto_bet_enabled = False" in src
-    assert "auto_bet_amount = 101.0" in src
+    assert "auto_bet_amount = 25.0" in src
+    assert "DEFAULT_AUTO_BET_AMOUNT = 25.0" in src
     assert "moneyline_bet_amount = 151.0" in src
     assert "total_bet_amount = 101.0" in src
     assert "spread_bet_amount = 75.0" in src
