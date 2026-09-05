@@ -42,12 +42,64 @@ SOCCER_EVENT = {
     "home": "Al-Fayha FC",
     "away": "Al-Kholood",
     "sport": {"slug": "football"},
-    "league": {"name": "Saudi Pro League"},
+    # Must be a majors-scan league: ODDS_LIVE_SCAN_MAJORS_ONLY drops minor soccer
+    # before resolve_odds_docs, which would empty WS-first recovery for this fixture.
+    "league": {
+        "name": "England - Premier League",
+        "slug": "england-premier-league",
+    },
     "live": True,
 }
 
 UNDER_25 = american_to_decimal(186)
 OVER_25 = 1.52
+PLIVE_UNDER_25 = american_to_decimal(205)
+
+# Odds-API WS only keeps catalog books. PLive is Pandora-local and is attached via
+# merge_plive_into_docs — never via the Odds-API WS bookmakers map.
+_KALSHI_TOTALS = {
+    "Kalshi": [
+        {
+            "name": "Totals",
+            "odds": [
+                {
+                    "hdp": 2.5,
+                    "max": 2.5,
+                    "line": 2.5,
+                    "over": OVER_25,
+                    "under": UNDER_25,
+                }
+            ],
+        }
+    ],
+    "[REDACTED]": [
+        {"name": "Totals", "odds": [{"max": 2.5, "over": 1.55, "under": 2.40}]}
+    ],
+    "Bet365": [
+        {"name": "Totals", "odds": [{"max": 2.5, "over": 1.56, "under": 2.38}]}
+    ],
+    "FanDuel": [
+        {"name": "Totals", "odds": [{"max": 2.5, "over": 1.54, "under": 2.42}]}
+    ],
+}
+
+_PLIVE_TOTALS = [
+    {
+        "name": "Totals",
+        "odds": [
+            {
+                "hdp": 2.5,
+                "max": 2.5,
+                "line": 2.5,
+                "over": OVER_25,
+                "under": PLIVE_UNDER_25,
+                # Pandora live markers — required by is_live_plive_side / is_live_plive_row.
+                "plive_live": True,
+                "plive_market": 5,
+            }
+        ],
+    }
+]
 
 
 class _Raise429Live:
@@ -134,31 +186,7 @@ def test_list_live_events_429_does_not_empty_scan_when_ws_store_has_events(monke
         [
             {
                 **SOCCER_EVENT,
-                "bookmakers": {
-                    "PLive": [
-                        {
-                            "name": "Totals",
-                            "odds": [
-                                {
-                                    "hdp": 2.5,
-                                    "max": 2.5,
-                                    "line": 2.5,
-                                    "over": OVER_25,
-                                    "under": UNDER_25,
-                                }
-                            ],
-                        }
-                    ],
-                    "Betfair Exchange": [
-                        {"name": "Totals", "odds": [{"max": 2.5, "over": 1.55, "under": 2.40}]}
-                    ],
-                    "Bet365": [
-                        {"name": "Totals", "odds": [{"max": 2.5, "over": 1.56, "under": 2.38}]}
-                    ],
-                    "FanDuel": [
-                        {"name": "Totals", "odds": [{"max": 2.5, "over": 1.54, "under": 2.42}]}
-                    ],
-                },
+                "bookmakers": dict(_KALSHI_TOTALS),
             }
         ]
     )
@@ -180,6 +208,22 @@ def test_list_live_events_429_does_not_empty_scan_when_ws_store_has_events(monke
 
     monkeypatch.setattr("odds_ev_monitor.attach_public_kalshi_to_docs", no_kalshi)
 
+    def attach_plive(docs):
+        """Simulate a healthy Pandora feed matching this WS event."""
+        n = 0
+        for doc in docs:
+            if not isinstance(doc, dict):
+                continue
+            bks = doc.setdefault("bookmakers", {})
+            if not isinstance(bks, dict):
+                continue
+            bks.pop("PLive", None)
+            bks["PLive"] = [dict(m) for m in _PLIVE_TOTALS]
+            n += 1
+        return n
+
+    monkeypatch.setattr("odds_ev_monitor.merge_plive_into_docs", attach_plive)
+
     mon = OddsEVMonitor(auth_token=None)
     mon.set_filter(
         {
@@ -187,7 +231,7 @@ def test_list_live_events_429_does_not_empty_scan_when_ws_store_has_events(monke
             "leagues": ["SOCCER_ALL"],
             "minRoi": 0,
             "devigFilter": {
-                "sharps": ["Betfair Exchange", "Bet365", "FanDuel"],
+                "sharps": ["[REDACTED]", "Bet365", "FanDuel"],
                 "method": "POWER",
                 "type": "AVERAGE",
                 "minEv": 0,
@@ -195,7 +239,8 @@ def test_list_live_events_429_does_not_empty_scan_when_ws_store_has_events(monke
                 "hold": [{"book": "Any", "max": 20}],
             },
             "oddsRanges": [{"book": "Any", "min": -500, "max": 500}],
-            "displayBooks": ["PLive", "Betfair Exchange", "Bet365", "FanDuel"],
+            "displayBooks": ["PLive", "Kalshi", "[REDACTED]", "Bet365", "FanDuel"],
+            "bettingBooks": ["Kalshi", "PLive"],
         }
     )
 
@@ -208,9 +253,9 @@ def test_list_live_events_429_does_not_empty_scan_when_ws_store_has_events(monke
             if str(getattr(a, "take_book", "")).lower() == "plive"
             and str(getattr(a, "pick", "")).lower() == "under"
         ]
-        assert plive_unders
+        assert plive_unders, f"expected PLive under cards, got {len(alerts)} alerts"
         assert any(abs(float(a.qualifier) - 2.5) < 1e-9 for a in plive_unders)
-        assert any(str(a.odds) in ("+186", "186") for a in plive_unders)
+        assert any(str(a.odds) in ("+205", "205") for a in plive_unders)
     finally:
         ows._shared_feed = None
         ows._recovery_lock = None
