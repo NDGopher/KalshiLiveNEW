@@ -782,6 +782,46 @@ def test_handoff_retries_after_transient_rest_error(monkeypatch):
     asyncio.run(run())
 
 
+def test_handoff_does_not_retry_on_429(monkeypatch):
+    """A 429 during includeSeq handoff must not re-blast /events/live + /odds/multi."""
+    monkeypatch.setenv("ODDS_API_KEY", "test-not-a-real-key")
+    monkeypatch.delenv("ODDS_API_WS_HANDOFF_REST_ODDS", raising=False)
+    monkeypatch.setenv("ODDS_API_REST_429_BASE_SEC", "60")
+
+    class RateLimitedRest(_DummyRest):
+        def __init__(self):
+            self.live_calls = 0
+            self.multi_calls = 0
+
+        async def list_live_events(self, *args, **kwargs):
+            self.live_calls += 1
+            err = Exception("429 Too Many Requests: /v3/events/live")
+            err.status = 429
+            raise err
+
+        async def get_odds_multi(self, *args, **kwargs):
+            self.multi_calls += 1
+            raise AssertionError("handoff 429 must not continue to /odds/multi")
+
+    async def run() -> None:
+        rest = RateLimitedRest()
+        feed = OddsApiWsFeed(rest, api_key="test-not-a-real-key")
+        await feed._handoff_snapshot()
+        assert rest.live_calls == 1
+        assert rest.multi_calls == 0
+
+    async def _fast_sleep(_s):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", _fast_sleep)
+    try:
+        asyncio.run(run())
+    finally:
+        from odds_api_client import reset_odds_api_429_backoff
+
+        reset_odds_api_429_backoff()
+
+
 def test_handoff_can_be_disabled(monkeypatch):
     monkeypatch.setenv("ODDS_API_KEY", "test-not-a-real-key")
     monkeypatch.setenv("ODDS_API_WS_HANDOFF_REST_ODDS", "false")
@@ -806,11 +846,11 @@ def test_handoff_can_be_disabled(monkeypatch):
     asyncio.run(run())
 
 
-def test_cold_ws_store_seeds_empty_events_via_rest(monkeypatch):
-    """Cold seed (default on): events with zero books get a one-shot REST seed."""
+def test_cold_ws_store_does_not_rest_fill_while_healthy(monkeypatch):
+    """WS-primary: healthy socket + empty event must not fire /odds/multi."""
     monkeypatch.setenv("ODDS_API_KEY", "test-not-a-real-key")
     monkeypatch.setenv("ODDS_API_WS", "true")
-    monkeypatch.setenv("ODDS_API_WS_REST_BACKFILL", "false")
+    monkeypatch.setenv("ODDS_API_WS_REST_BACKFILL", "true")
     monkeypatch.setenv("ODDS_API_WS_COLD_SEED", "true")
     monkeypatch.setenv("ODDS_API_WS_REST_BACKFILL_COOLDOWN_SEC", "30")
 
@@ -820,19 +860,7 @@ def test_cold_ws_store_seeds_empty_events_via_rest(monkeypatch):
 
         async def get_odds_multi(self, event_ids, bookmakers, **kwargs):
             self.multi_calls += 1
-            return [
-                {
-                    "id": 42,
-                    "home": "Arsenal",
-                    "away": "Chelsea",
-                    "sport": "football",
-                    "bookmakers": {
-                        "DraftKings": [{"name": "ML", "odds": [{"home": 2.0, "away": 3.5, "draw": 3.2}]}],
-                        "FanDuel": [{"name": "ML", "odds": [{"home": 2.05, "away": 3.4, "draw": 3.1}]}],
-                        "Bet365": [{"name": "ML", "odds": [{"home": 1.95, "away": 3.6, "draw": 3.3}]}],
-                    },
-                }
-            ]
+            raise AssertionError("WS healthy must not cold-seed via REST")
 
     async def run() -> None:
         rest = SeedRest()
@@ -841,9 +869,10 @@ def test_cold_ws_store_seeds_empty_events_via_rest(monkeypatch):
         feed.store.apply_slate([{"id": 42, "home": "Arsenal", "away": "Chelsea"}])
         _install_shared_feed(feed)
         docs, src = await resolve_odds_docs(rest, [42], ["DraftKings", "FanDuel", "Bet365"])
-        assert src == "websocket_rest_fill"
-        assert rest.multi_calls == 1
-        assert {"DraftKings", "FanDuel", "Bet365"} <= set((docs[0].get("bookmakers") or {}).keys())
+        assert src == "websocket"
+        assert rest.multi_calls == 0
+        assert docs and int(docs[0]["id"]) == 42
+        assert (docs[0].get("bookmakers") or {}) == {}
 
     try:
         asyncio.run(run())
@@ -854,7 +883,8 @@ def test_cold_ws_store_seeds_empty_events_via_rest(monkeypatch):
         ows._ws_rest_backfill_until = 0.0
 
 
-def test_thin_ws_store_rest_backfills_missing_books(monkeypatch):
+def test_thin_ws_store_does_not_rest_backfill_while_healthy(monkeypatch):
+    """WS-primary: thin store while healthy must not flood /odds/multi."""
     monkeypatch.setenv("ODDS_API_KEY", "test-not-a-real-key")
     monkeypatch.setenv("ODDS_API_WS", "true")
     monkeypatch.setenv("ODDS_API_WS_REST_BACKFILL", "true")
@@ -867,20 +897,7 @@ def test_thin_ws_store_rest_backfills_missing_books(monkeypatch):
 
         async def get_odds_multi(self, event_ids, bookmakers, **kwargs):
             self.multi_calls += 1
-            return [
-                {
-                    "id": 42,
-                    "home": "Arsenal",
-                    "away": "Chelsea",
-                    "sport": "football",
-                    "bookmakers": {
-                        "DraftKings": [{"name": "ML", "odds": [{"home": 2.0, "away": 3.5, "draw": 3.2}]}],
-                        "FanDuel": [{"name": "ML", "odds": [{"home": 2.05, "away": 3.4, "draw": 3.1}]}],
-                        "Bet365": [{"name": "ML", "odds": [{"home": 1.95, "away": 3.6, "draw": 3.3}]}],
-                        "Polymarket": [{"name": "ML", "odds": [{"home": 2.1, "away": 3.3, "draw": 3.0}]}],
-                    },
-                }
-            ]
+            raise AssertionError("WS healthy must not REST-backfill a thin store")
 
     async def run() -> None:
         rest = FatRest()
@@ -901,15 +918,12 @@ def test_thin_ws_store_rest_backfills_missing_books(monkeypatch):
         _install_shared_feed(feed)
         books = ["DraftKings", "FanDuel", "Bet365", "Polymarket", "BetMGM", "Kalshi"]
         docs, src = await resolve_odds_docs(rest, [42], books)
-        assert src == "websocket_rest_fill"
-        assert rest.multi_calls == 1
-        bks = set((docs[0].get("bookmakers") or {}).keys())
-        assert {"DraftKings", "FanDuel", "Bet365", "Polymarket"} <= bks
-        # Cooldown: second call must not hammer REST even if still thin on BetMGM/Kalshi.
+        assert src == "websocket"
+        assert rest.multi_calls == 0
+        assert list((docs[0].get("bookmakers") or {}).keys()) == ["Polymarket"]
         docs2, src2 = await resolve_odds_docs(rest, [42], books)
-        assert rest.multi_calls == 1
+        assert rest.multi_calls == 0
         assert src2 == "websocket"
-        assert len((docs2[0].get("bookmakers") or {})) >= 4
 
     try:
         asyncio.run(run())
@@ -1023,6 +1037,9 @@ def test_429_fallback_suppression(monkeypatch):
     finally:
         ows._shared_feed = None
         ows._recovery_lock = None
+        from odds_api_client import reset_odds_api_429_backoff
+
+        reset_odds_api_429_backoff()
 
 
 def test_no_concurrent_recovery_calls(monkeypatch):

@@ -68,6 +68,7 @@ from odds_ev_monitor import (
     _numeric_close,
     _pick_matching_odds_row,
     _pick_qualifier_line_for_side,
+    _resolve_live_events_slate,
     format_total_qualifier,
     apply_betmgm_ml_grid_consensus_fix,
     total_line_value,
@@ -1651,7 +1652,7 @@ async def _live_odds_build_snapshot_with_client(
     if timing_l in ("live", "both"):
         try:
             live_sport_arg = sport_l if sport_l and sport_l != "all" else None
-            liv = await client.list_live_events(live_sport_arg)
+            liv = await _resolve_live_events_slate(client, live_sport_arg)
         except Exception as e:
             liv = []
             err_l = str(e)
