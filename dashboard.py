@@ -8410,8 +8410,13 @@ def alert_feed_prefs():
     if "include_pregame_value_bets" not in data:
         return jsonify({"error": "include_pregame_value_bets required"}), 400
     EvMonitorImpl.include_pregame_value_bets = bool(data["include_pregame_value_bets"])
+    # Diagnostic live-board scan uses broad_scan_include_pregame — keep them aligned.
+    EvMonitorImpl.broad_scan_include_pregame = bool(
+        EvMonitorImpl.include_pregame_value_bets
+    )
     print(
-        f"[DASHBOARD] Alert feed prefs: include_pregame_value_bets={EvMonitorImpl.include_pregame_value_bets}"
+        f"[DASHBOARD] Alert feed prefs: include_pregame_value_bets={EvMonitorImpl.include_pregame_value_bets} "
+        f"broad_scan_include_pregame={EvMonitorImpl.broad_scan_include_pregame}"
     )
     return jsonify(
         {
@@ -10180,6 +10185,17 @@ def initialize_dashboard():
         "on",
     )
     EvMonitorImpl.include_pregame_value_bets = _pre_ui
+    # Diagnostic board scan defaults pregame ON via ODDS_BROAD_SCAN_INCLUDE_PREGAME;
+    # also honor the Settings toggle at boot.
+    EvMonitorImpl.broad_scan_include_pregame = bool(
+        _pre_ui
+        or os.getenv("ODDS_BROAD_SCAN_INCLUDE_PREGAME", "true").strip().lower()
+        in ("1", "true", "yes", "on")
+    )
+    if EvMonitorImpl.broad_scan_include_pregame:
+        print(
+            "[DASHBOARD] broad_scan_include_pregame ON — pregame CFB/soccer enter the live board scan"
+        )
     if _pre_ui:
         print(
             "[DASHBOARD] ODDS_UI_INCLUDE_PREGAME_VALUE_BETS enabled — "

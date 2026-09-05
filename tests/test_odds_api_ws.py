@@ -564,8 +564,8 @@ def test_thin_ws_store_skips_rest_when_backfill_disabled(monkeypatch):
 
 
 
-def test_handoff_skips_rest_odds_by_default(monkeypatch):
-    """WS-first: connect-time handoff must not burn REST /odds/multi by default."""
+def test_handoff_runs_rest_odds_by_default(monkeypatch):
+    """REST→WS handoff seeds the store by default (then WS keeps books live)."""
     monkeypatch.setenv("ODDS_API_KEY", "test-not-a-real-key")
     monkeypatch.delenv("ODDS_API_WS_HANDOFF_REST_ODDS", raising=False)
 
@@ -573,28 +573,65 @@ def test_handoff_skips_rest_odds_by_default(monkeypatch):
         def __init__(self):
             self.live_calls = 0
             self.multi_calls = 0
+            self.last_seq = 42
 
         async def list_live_events(self, *args, **kwargs):
             self.live_calls += 1
-            return [{"id": 1, "league": {"slug": "england-premier-league"}}]
+            return [{"id": 1, "league": {"slug": "england-premier-league"}, "home": "A", "away": "B"}]
 
-        async def get_odds_multi(self, *args, **kwargs):
+        async def get_odds_multi(self, event_ids, bookmakers, **kwargs):
             self.multi_calls += 1
-            raise AssertionError("handoff must not call get_odds_multi by default")
+            return [
+                {
+                    "id": 1,
+                    "home": "A",
+                    "away": "B",
+                    "bookmakers": {
+                        "DraftKings": [{"name": "ML", "odds": [{"home": 2.0, "away": 1.8}]}],
+                        "Kalshi": [{"name": "ML", "odds": [{"home": 2.1, "away": 1.7}]}],
+                    },
+                }
+            ]
 
     async def run() -> None:
         rest = SpyRest()
         feed = OddsApiWsFeed(rest, api_key="test-not-a-real-key")
         await feed._handoff_snapshot()
-        assert rest.live_calls == 0
+        assert rest.live_calls == 1
+        assert rest.multi_calls == 1
+        doc = feed.store.merged_doc(1)
+        assert "DraftKings" in (doc.get("bookmakers") or {})
+        assert "Kalshi" in (doc.get("bookmakers") or {})
+
+    asyncio.run(run())
+
+
+def test_handoff_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("ODDS_API_KEY", "test-not-a-real-key")
+    monkeypatch.setenv("ODDS_API_WS_HANDOFF_REST_ODDS", "false")
+
+    class SpyRest(_DummyRest):
+        def __init__(self):
+            self.multi_calls = 0
+
+        async def list_live_events(self, *args, **kwargs):
+            return [{"id": 1}]
+
+        async def get_odds_multi(self, *args, **kwargs):
+            self.multi_calls += 1
+            raise AssertionError("disabled handoff must not call get_odds_multi")
+
+    async def run() -> None:
+        rest = SpyRest()
+        feed = OddsApiWsFeed(rest, api_key="test-not-a-real-key")
+        await feed._handoff_snapshot()
         assert rest.multi_calls == 0
-        assert feed.store.last_seq is None
 
     asyncio.run(run())
 
 
 def test_cold_ws_store_seeds_empty_events_via_rest(monkeypatch):
-    """Cold seed (opt-in): events with zero books get a one-shot REST seed."""
+    """Cold seed (default on): events with zero books get a one-shot REST seed."""
     monkeypatch.setenv("ODDS_API_KEY", "test-not-a-real-key")
     monkeypatch.setenv("ODDS_API_WS", "true")
     monkeypatch.setenv("ODDS_API_WS_REST_BACKFILL", "false")
@@ -963,3 +1000,18 @@ def test_rest_updated_fallback_requires_sport_display_name(monkeypatch):
         assert rest.params == [("DraftKings", "Baseball")]
 
     asyncio.run(run())
+
+
+def test_prioritize_promotes_usa_college_and_sport_tier():
+    from odds_api_client import prioritize_live_events_for_scan
+
+    events = [
+        {"id": 1, "sport": {"slug": "tennis"}, "league": {"slug": "atp-us-open"}},
+        {"id": 2, "sport": {"slug": "football"}, "league": {"slug": "angola-girabola"}},
+        {"id": 3, "sport": {"slug": "american-football"}, "league": {"slug": "usa-college"}},
+        {"id": 4, "sport": {"slug": "football"}, "league": {"slug": "england-premier-league"}},
+    ]
+    picked = prioritize_live_events_for_scan(events, 3)
+    slugs = [e["league"]["slug"] for e in picked]
+    assert slugs[0] == "england-premier-league"
+    assert slugs[1] == "usa-college"
