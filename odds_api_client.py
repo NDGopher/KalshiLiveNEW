@@ -2,9 +2,14 @@
 Async REST client for Odds-API.io (https://odds-api.io).
 
 Primary live odds path is the WebSocket module ``odds_api_ws.py``
-(https://docs.odds-api.io/guides/websockets). This client is for slate
-(``/events``, ``/events/live``), REST→WS handoff snapshots (``includeSeq=true``),
-resync after ``resync_required``, and REST fallback (prefer ``/odds/updated``).
+(https://docs.odds-api.io/guides/websockets). This client is for **cold-start
+bootstrap** (``/events``, ``/events/live``, REST→WS ``includeSeq`` snapshot
+once), resync after ``resync_required``, and **WS-down** REST fallback
+(prefer ``/odds/updated``). When the WebSocket is healthy, monitors must not
+poll these endpoints in a loop.
+
+HTTP 429 arms a process-wide exponential backoff (up to the remainder of the
+hour). Callers must not tight-retry the same path.
 
 Env:
   ODDS_API_KEY          — required for authenticated endpoints (read from env; never commit)
@@ -17,7 +22,9 @@ Env:
   ODDS_API_LEAGUE_NBA   — optional (default usa-nba)
   ODDS_API_LEAGUE_NHL   — optional (default usa-nhl)
   ODDS_API_LEAGUE_NFL   — optional (default usa-nfl)
-  ODDS_API_MAX_REQUESTS_PER_HOUR — soft cap (default 100)
+  ODDS_API_MAX_REQUESTS_PER_HOUR — soft cap (default 5000)
+  ODDS_API_REST_429_BASE_SEC     — first 429 backoff (default 60)
+  ODDS_API_REST_429_MAX_SEC      — 429 backoff cap (default 3600 = rest of hour)
   ODDS_API_VALUE_BETS_TTL_SEC    — cache TTL for /value-bets (default 25)
   ODDS_API_ODDS_TTL_SEC          — cache TTL for /odds and /odds/multi when not using live-odds TTL (default 35)
   ODDS_API_EVENTS_TTL_SEC        — cache TTL for /events (default 120)
@@ -74,6 +81,88 @@ load_dotenv(_PROJECT_DIR / ".env", override=True, encoding="utf-8-sig")
 load_dotenv(Path.cwd() / ".env", override=True, encoding="utf-8-sig")
 load_dotenv(_PROJECT_DIR / ".env.env", override=False, encoding="utf-8-sig")
 load_dotenv(Path.cwd() / ".env.env", override=False, encoding="utf-8-sig")
+
+
+class OddsAPIRateLimitError(RuntimeError):
+    """HTTP 429 or process-wide Odds-API REST backoff. ``status`` is always 429."""
+
+    def __init__(self, message: str, *, retry_after: Optional[float] = None):
+        super().__init__(message)
+        self.status = 429
+        self.retry_after = retry_after
+
+
+_rest_429_until: float = 0.0
+_rest_429_strikes: int = 0
+
+
+def reset_odds_api_429_backoff() -> None:
+    """Test / process helper — clear the 429 circuit breaker."""
+    global _rest_429_until, _rest_429_strikes
+    _rest_429_until = 0.0
+    _rest_429_strikes = 0
+
+
+def odds_api_rest_429_blocked() -> bool:
+    return time.time() < float(_rest_429_until or 0.0)
+
+
+def odds_api_rest_429_remaining_sec() -> float:
+    return max(0.0, float(_rest_429_until or 0.0) - time.time())
+
+
+def _retry_after_sec(headers: Any) -> Optional[float]:
+    if headers is None:
+        return None
+    getter = getattr(headers, "get", None)
+    raw = None
+    if callable(getter):
+        raw = getter("Retry-After") or getter("retry-after")
+    elif isinstance(headers, dict):
+        raw = headers.get("Retry-After") or headers.get("retry-after")
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        return max(1.0, float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return None
+
+
+def note_odds_api_429(*, retry_after: Optional[float] = None) -> float:
+    """Arm exponential backoff. Do not tight-retry for the rest of this window."""
+    global _rest_429_until, _rest_429_strikes
+    _rest_429_strikes += 1
+    try:
+        base = float(os.getenv("ODDS_API_REST_429_BASE_SEC", "60") or "60")
+    except ValueError:
+        base = 60.0
+    try:
+        cap = float(os.getenv("ODDS_API_REST_429_MAX_SEC", "3600") or "3600")
+    except ValueError:
+        cap = 3600.0
+    base = max(5.0, min(base, 3600.0))
+    cap = max(base, min(cap, 3600.0))
+    delay = min(cap, base * (2 ** max(0, _rest_429_strikes - 1)))
+    if retry_after is not None:
+        try:
+            delay = max(delay, float(retry_after))
+        except (TypeError, ValueError):
+            pass
+    delay = min(3600.0, delay)
+    _rest_429_until = time.time() + delay
+    print(
+        f"[ODDS-API] 429 backoff {delay:.0f}s (strike={_rest_429_strikes}) "
+        f"— no REST retry this window"
+    )
+    return delay
+
+
+def _raise_odds_api_429(path: str, *, retry_after: Optional[float] = None) -> None:
+    delay = note_odds_api_429(retry_after=retry_after)
+    raise OddsAPIRateLimitError(
+        f"Odds-API HTTP 429 on {path} — backing off {delay:.0f}s (no retry)",
+        retry_after=delay,
+    )
 
 
 def _parse_csv(name: str, default: str) -> List[str]:
@@ -993,7 +1082,6 @@ class OddsAPIClient:
         cache: Optional[_TTLCache] = None,
         cache_key: Optional[str] = None,
         ttl: float = 0.0,
-        _429_attempt: int = 0,
     ) -> Any:
         if not self.api_key and path not in ("/sports", "/bookmakers"):
             raise RuntimeError("ODDS_API_KEY is not set")
@@ -1001,6 +1089,12 @@ class OddsAPIClient:
             hit = await cache.get_valid(cache_key)
             if hit is not None:
                 return hit
+        if odds_api_rest_429_blocked():
+            raise OddsAPIRateLimitError(
+                f"Odds-API REST 429 backoff {odds_api_rest_429_remaining_sec():.0f}s "
+                f"— skipped {path}",
+                retry_after=odds_api_rest_429_remaining_sec(),
+            )
         await self._rate_limit()
         sess = await self._ensure_session()
         q = dict(params)
@@ -1009,9 +1103,8 @@ class OddsAPIClient:
         url = f"{self.base_url}{path}?{urlencode(q)}"
         self.http_request_count += 1
         async with sess.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            if resp.status == 429 and _429_attempt < 4:
-                await asyncio.sleep(2.0 + _429_attempt)
-                return await self._get_json(path, params, cache, cache_key, ttl, _429_attempt + 1)
+            if resp.status == 429:
+                _raise_odds_api_429(path, retry_after=_retry_after_sec(resp.headers))
             resp.raise_for_status()
             self._note_seq_header(resp.headers)
             data = await resp.json()
@@ -1030,10 +1123,15 @@ class OddsAPIClient:
         self,
         ids: str,
         bms: str,
-        _429_attempt: int = 0,
         *,
         include_seq: bool = False,
     ) -> Tuple[int, Any]:
+        if odds_api_rest_429_blocked():
+            raise OddsAPIRateLimitError(
+                f"Odds-API REST 429 backoff {odds_api_rest_429_remaining_sec():.0f}s "
+                f"— skipped /odds/multi",
+                retry_after=odds_api_rest_429_remaining_sec(),
+            )
         await self._rate_limit()
         sess = await self._ensure_session()
         q: Dict[str, Any] = {"eventIds": ids, "bookmakers": bms, "apiKey": self.api_key}
@@ -1042,11 +1140,8 @@ class OddsAPIClient:
         url = f"{self.base_url}/odds/multi?{urlencode(q)}"
         self.http_request_count += 1
         async with sess.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            if resp.status == 429 and _429_attempt < 4:
-                await asyncio.sleep(2.0 + _429_attempt)
-                return await self._odds_multi_http(
-                    ids, bms, _429_attempt + 1, include_seq=include_seq
-                )
+            if resp.status == 429:
+                _raise_odds_api_429("/odds/multi", retry_after=_retry_after_sec(resp.headers))
             self._note_seq_header(resp.headers)
             text = await resp.text()
             st = resp.status
@@ -1143,6 +1238,8 @@ class OddsAPIClient:
         if status != 200:
             if status == 403:
                 return []
+            if status == 429:
+                _raise_odds_api_429("/odds/multi")
             preview = data[:500] if isinstance(data, str) else str(data)[:500]
             raise RuntimeError(f"/odds/multi HTTP {status}: {preview}")
         if eff_ttl > 0:
@@ -1174,6 +1271,12 @@ class OddsAPIClient:
         """
         if not event_ids:
             return []
+        if odds_api_rest_429_blocked():
+            raise OddsAPIRateLimitError(
+                f"Odds-API REST 429 backoff {odds_api_rest_429_remaining_sec():.0f}s "
+                f"— skipped /odds/multi",
+                retry_after=odds_api_rest_429_remaining_sec(),
+            )
         eff_multi_ttl = 0.0 if include_seq else (self._odds_ttl if odds_cache_ttl is None else float(odds_cache_ttl))
         books = api_wire_bookmakers(
             [_canonical_odds_api_bookmaker(b) for b in (bookmakers or self.bookmakers)]
@@ -1192,6 +1295,9 @@ class OddsAPIClient:
 
         out: List[Dict[str, Any]] = []
         for i in range(0, len(event_ids), 10):
+            if odds_api_rest_429_blocked() and i > 0:
+                print("[ODDS-API] /odds/multi stopped remaining chunks — 429 backoff")
+                break
             part = [int(x) for x in event_ids[i : i + 10]]
             ids = ",".join(str(x) for x in part)
             if not parallel_books or len(books) <= 1:
@@ -1205,10 +1311,14 @@ class OddsAPIClient:
 
             async def _one_book(b: str) -> List[Dict[str, Any]]:
                 async with sem:
+                    if odds_api_rest_429_blocked():
+                        return []
                     try:
                         return await self._get_odds_multi_one_slice(
                             ids, [b], cache_ttl=eff_multi_ttl, include_seq=include_seq
                         )
+                    except OddsAPIRateLimitError:
+                        return []
                     except RuntimeError:
                         return []
 
@@ -1391,6 +1501,12 @@ class OddsAPIClient:
             raise RuntimeError("ODDS_API_KEY is not set")
         books = api_wire_bookmakers(names or self.bookmakers)
         bms = ",".join(_bookmaker_for_odds_request(b) for b in books)
+        if odds_api_rest_429_blocked():
+            raise OddsAPIRateLimitError(
+                f"Odds-API REST 429 backoff {odds_api_rest_429_remaining_sec():.0f}s "
+                f"— skipped /bookmakers/selected/select",
+                retry_after=odds_api_rest_429_remaining_sec(),
+            )
         await self._rate_limit()
         sess = await self._ensure_session()
         q = {"bookmakers": bms, "apiKey": self.api_key}
@@ -1398,8 +1514,10 @@ class OddsAPIClient:
         self.http_request_count += 1
         async with sess.put(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
             if resp.status == 429:
-                await asyncio.sleep(2.0)
-                return await self.select_bookmakers(names)
+                _raise_odds_api_429(
+                    "/bookmakers/selected/select",
+                    retry_after=_retry_after_sec(resp.headers),
+                )
             resp.raise_for_status()
             try:
                 return await resp.json()

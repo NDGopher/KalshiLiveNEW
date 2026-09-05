@@ -58,10 +58,11 @@ ufw reload
 - `ODDS_API_KEY` is set in `.env` and the dashboard was restarted after changes.
 - Multi-sport default: `ODDS_API_WS=true`, `ODDS_API_SPORTS=baseball,football,american-football`. Do **not** set `ODDS_API_WS_LEAGUES=usa-mlb` on that connection (it drops soccer and CFB/NFL). Baseball-only pin: `ODDS_API_SPORTS=baseball` then `usa-mlb` is applied automatically. Primary path is WebSocket; REST `/odds/multi` is resync/fallback only (a 10-book poller will 429).
 - Select the 10 catalog books in the Odds-API.io dashboard (Betfair **Exchange**, not Sportsbook; not BookMaker.eu).
-- `ODDS_POLL_INTERVAL_SECONDS` is the REST-fallback interval. With WS healthy, EV evaluates on ticks (`ODDS_API_WS_EVAL_INTERVAL_SEC`). With parallel per-book ``/odds/multi`` fallback, rough cost is ``(3600/poll) × ceil(n_live_ids/10) × n_books`` — use ``ODDS_LIVE_SCAN_MAX_EVENTS`` and ``ODDS_HTTP_BUDGET_LOG=true`` to inspect.
-- **Slate vs lines:** `ODDS_API_LIVE_EVENTS_TTL_SEC` (default long, ~20m) controls how often **which games are live** is re-fetched; `ODDS_API_LIVE_ODDS_TTL_SEC` (default **0**) controls caching of the **merged odds** snapshot for monitors. Lower the slate TTL temporarily (e.g. 90) when testing games **just** going live.
+- `ODDS_POLL_INTERVAL_SECONDS` is the **WS-down REST-fallback** interval. With WS healthy, EV evaluates on ticks (`ODDS_API_WS_EVAL_INTERVAL_SEC`) and must **not** poll `/events/live` or `/odds/multi`. A 10-book `/odds/multi` loop will 429 — that path is bootstrap/failover only.
+- **Slate vs lines:** while WS is healthy, the live slate comes from the WS store (no periodic `/events/live`). `ODDS_API_LIVE_EVENTS_TTL_SEC` applies only to the cold-start / WS-down REST fetch. `ODDS_API_LIVE_ODDS_TTL_SEC` is unused on the WS-primary path.
+- HTTP 429 from Odds-API.io arms process-wide exponential backoff (`ODDS_API_REST_429_BASE_SEC` / `ODDS_API_REST_429_MAX_SEC`, default 60s … 1h). There is no tight retry. Wait out the window; do not restart-loop the handoff.
 - `ODDS_API_MAX_REQUESTS_PER_HOUR` defaults **5000** (Growth-style); set lower (e.g. 100) on strict free tiers.
-- Logs for HTTP 401/429 from Odds-API.io — fix key or slow polling.
+- Logs for HTTP 401 from Odds-API.io — fix the key. A 429 should be rare after this change; if you see one, wait out the backoff instead of restarting.
 - PLive: look for `[PLIVE] handshake emitted` then `ack socketMetadataSet` / `subscribedSystemEvents`. Bare connect with no handshake is silent. Do not scrape BetBCK. One `eventData` directory covers MLB `#!/sport/1`, soccer `#!/sport/5`, and Top Soccer `#!/sport/220`. Odds-API ids do not join PLive — soccer EV is fail-closed unless the conservative fixture match is unique and the coeff is fresh.
 
 ---

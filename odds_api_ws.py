@@ -4,9 +4,11 @@ Odds-API.io WebSocket feed (https://docs.odds-api.io/guides/websockets).
 Primary live-odds path. Pattern: **REST snapshot once** (includeSeq handoff) to
 seed every selected book into the store, then **WebSocket deltas** keep those
 books live. Same bookmakers as REST — WS does not replay a full board on connect
-without that handoff. Slate still uses ``/events`` / ``/events/live``; 
-``resync_required`` / fail-closed ``/odds/updated`` remain REST. ~80 handoff calls
-per connect is fine within a 5k/hr budget; set ``ODDS_API_WS_HANDOFF_REST_ODDS=false``
+without that handoff. After the socket is healthy, **do not** poll
+``/events/live`` or ``/odds/multi`` in a loop. Slate metadata comes from the WS
+store (plus a one-shot REST bootstrap when the store is empty).
+``resync_required`` / fail-closed ``/odds/updated`` remain REST **only while WS
+is down**. A 429 must not retry-storm; set ``ODDS_API_WS_HANDOFF_REST_ODDS=false``
 only if you intentionally want a WS-warm-only connect.
 
 Official contract (do not invent):
@@ -48,8 +50,11 @@ from odds_api_client import (
     api_wire_bookmakers,
     get_shared_odds_client,
     is_local_only_bookmaker,
+    live_event_sport_slug,
+    note_odds_api_429,
     note_unknown_ws_bookie,
     odds_api_master_bookmakers,
+    odds_api_rest_429_blocked,
     odds_api_sports_list,
     odds_updated_sport_names,
     sport_name_for_odds_updated,
@@ -1049,6 +1054,8 @@ class OddsApiWsFeed:
         """True only after a disconnect — not during first connect, not on cooldown."""
         if not _env_bool("ODDS_API_REST_UPDATED_FALLBACK", "true"):
             return False
+        if odds_api_rest_429_blocked():
+            return False
         if self.fallback_cooling_down():
             return False
         if not self.store.event_meta:
@@ -1098,6 +1105,7 @@ class OddsApiWsFeed:
                             print(
                                 f"[ODDS-API WS] [WARN] /odds/updated 429 for {bm}/{sp} — stopping book loop"
                             )
+                            note_odds_api_429()
                             rate_limited = True
                             break
                         print(f"[ODDS-API WS] [WARN] /odds/updated failed for {bm}/{sp}: {ex}")
@@ -1189,7 +1197,8 @@ class OddsApiWsFeed:
         opening lines. Odds-API WS alone only pushes books when they tick.
 
         Set ``ODDS_API_WS_HANDOFF_REST_ODDS=false`` to skip the seed (WS-warm only).
-        Slate metadata still comes from the monitor's live-events polls.
+        One transient (non-429) retry is allowed. A 429 stops immediately —
+        connect WS without lastSeq instead of retry-storming ``/odds/multi``.
         """
         if not _env_bool("ODDS_API_WS_HANDOFF_REST_ODDS", "true"):
             print(
@@ -1197,17 +1206,26 @@ class OddsApiWsFeed:
                 "store warms from live book ticks only (ODDS_API_WS_HANDOFF_REST_ODDS=false)"
             )
             return
+        if odds_api_rest_429_blocked():
+            print("[ODDS-API WS] REST handoff skipped — 429 backoff already armed")
+            return
         last_err: Optional[BaseException] = None
-        for attempt in range(1, 4):
+        for attempt in range(1, 3):
             try:
                 await self._handoff_snapshot_once()
                 return
             except Exception as ex:
                 last_err = ex
+                if is_odds_api_rate_limit_error(ex) or odds_api_rest_429_blocked():
+                    print(
+                        "[ODDS-API WS] [WARN] handoff 429 — connecting without lastSeq "
+                        f"(no retry): {ex}"
+                    )
+                    return
                 print(
-                    f"[ODDS-API WS] [WARN] handoff snapshot attempt {attempt}/3 failed: {ex}"
+                    f"[ODDS-API WS] [WARN] handoff snapshot attempt {attempt}/2 failed: {ex}"
                 )
-                if attempt < 3:
+                if attempt < 2:
                     await asyncio.sleep(1.5 * attempt)
         print(
             f"[ODDS-API WS] [WARN] handoff snapshot failed (connecting without lastSeq): {last_err}"
@@ -1392,13 +1410,39 @@ def peek_shared_odds_ws_feed() -> Optional[OddsApiWsFeed]:
 def live_events_from_ws_store() -> List[Dict[str, Any]]:
     """Live-event list from the shared Odds-API WS store (no HTTP).
 
-    Used when REST ``/events/live`` 429s or fails. This is the event
-    *list* only — price recovery stays fail-closed in ``resolve_odds_docs``.
+    Used when REST ``/events/live`` 429s or fails, and as the primary slate
+    while the WebSocket is healthy. This is the event *list* only — price
+    recovery stays fail-closed in ``resolve_odds_docs``.
     """
     feed = peek_shared_odds_ws_feed()
     if feed is None:
         return []
     return feed.store.slate_events()
+
+
+def filter_live_events_by_sport(
+    rows: Sequence[Dict[str, Any]],
+    sport: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Keep rows matching an Odds-API sport slug (or all when sport is empty)."""
+    if not rows:
+        return []
+    if sport is None or str(sport).strip().lower() in ("", "all"):
+        return [dict(r) for r in rows if isinstance(r, dict)]
+    want = sport_slug_query_for_api(str(sport))
+    out: List[Dict[str, Any]] = []
+    for ev in rows:
+        if not isinstance(ev, dict):
+            continue
+        slug = live_event_sport_slug(ev)
+        if not slug or slug == want:
+            out.append(dict(ev))
+    return out
+
+
+def ws_feed_is_healthy() -> bool:
+    feed = peek_shared_odds_ws_feed()
+    return feed is not None and bool(feed.healthy)
 
 
 async def reset_shared_odds_ws_feed() -> None:
@@ -1505,15 +1549,22 @@ async def _maybe_rest_backfill_thin_ws_docs(
     the store at connect, then live updates on WS
     (https://docs.odds-api.io/guides/websockets).
 
-    Defaults (full board, REST seed then WS):
-    - ``ODDS_API_WS_COLD_SEED`` (default true): one-shot REST for events with
-      *zero* priced master books (pregame CFB / handoff miss).
-    - ``ODDS_API_WS_REST_BACKFILL`` (default false): optional thin-store fill when
-      any event is below ``ODDS_API_WS_REST_BACKFILL_MIN_BOOKS``.
+    Defaults (WS-primary):
+    - While the WebSocket is healthy, this is a no-op. Prices come from WS ticks
+      (and the one-shot connect handoff). Do not REST-fill a thin store every poll.
+    - ``ODDS_API_WS_COLD_SEED`` (default false): leftover opt-in for events with
+      *zero* priced master books, ignored while WS is healthy.
+    - ``ODDS_API_WS_REST_BACKFILL`` (default false): optional thin-store fill,
+      also ignored while WS is healthy.
     """
     global _ws_rest_backfill_until
+    feed = peek_shared_odds_ws_feed()
+    if feed is not None and feed.healthy:
+        return docs, "websocket"
+    if odds_api_rest_429_blocked():
+        return docs, "websocket"
     thin = _env_bool("ODDS_API_WS_REST_BACKFILL", "false")
-    cold = _env_bool("ODDS_API_WS_COLD_SEED", "true")
+    cold = _env_bool("ODDS_API_WS_COLD_SEED", "false")
     if not thin and not cold:
         return docs, "websocket"
     if thin:
@@ -1531,7 +1582,6 @@ async def _maybe_rest_backfill_thin_ws_docs(
     now = time.time()
     if now < float(_ws_rest_backfill_until or 0.0):
         return docs, "websocket"
-    feed = peek_shared_odds_ws_feed()
     if feed is None:
         return docs, "websocket"
     try:
@@ -1591,7 +1641,9 @@ async def resolve_odds_docs(
     WS-first odds fetch. Returns ``(docs, source)`` where source is
     ``websocket`` | ``websocket_rest_fill`` | ``rest_updated`` | ``rest_multi`` | ``unavailable``.
 
-    When the WebSocket is enabled but down, recovery is single-flight REST
+    When the WebSocket is healthy (or still inside store-grace), return the
+    in-memory store and **do not** call REST ``/odds/multi`` or thin-store
+    backfill. When WS is enabled but down, recovery is single-flight REST
     ``/odds/updated`` with cooldown. Rate limits and cooldown fail closed
     (empty docs) instead of serving stale store lines or hammering
     ``/odds/multi``.
@@ -1600,13 +1652,7 @@ async def resolve_odds_docs(
     books = list(bookmakers) if bookmakers else odds_api_master_bookmakers()
     ws_docs = odds_docs_from_ws(ids)
     if ws_docs is not None:
-        return await _maybe_rest_backfill_thin_ws_docs(
-            rest_client,
-            ids,
-            ws_docs,
-            books,
-            odds_cache_ttl=odds_cache_ttl,
-        )
+        return ws_docs, "websocket"
 
     feed = peek_shared_odds_ws_feed()
 
@@ -1614,13 +1660,7 @@ async def resolve_odds_docs(
         async with _get_recovery_lock():
             ws_docs = odds_docs_from_ws(ids)
             if ws_docs is not None:
-                return await _maybe_rest_backfill_thin_ws_docs(
-                    rest_client,
-                    ids,
-                    ws_docs,
-                    books,
-                    odds_cache_ttl=odds_cache_ttl,
-                )
+                return ws_docs, "websocket"
             feed = peek_shared_odds_ws_feed()
             if feed is None or not feed.should_attempt_rest_fallback():
                 return [], "unavailable"

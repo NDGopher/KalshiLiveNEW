@@ -69,6 +69,7 @@ from odds_api_client import (
     odds_api_kalshi_event_ticker,
     odds_api_kalshi_event_url,
     odds_api_master_bookmakers,
+    odds_api_rest_429_blocked,
     odds_api_sports_list,
     reset_shared_odds_client,
     resolve_kalshi_take_ticker,
@@ -76,12 +77,14 @@ from odds_api_client import (
     _norm_book,
 )
 from odds_api_ws import (
+    filter_live_events_by_sport,
     get_shared_odds_ws_feed,
     live_events_from_ws_store,
     mlb_ws_slice_active,
     odds_api_ws_wanted,
     peek_shared_odds_ws_feed,
     resolve_odds_docs,
+    ws_feed_is_healthy,
 )
 from kalshi_public_feed import attach_public_kalshi_to_docs
 from plive_pandora import (
@@ -152,16 +155,38 @@ async def _resolve_live_events_slate(
     client: Any,
     sport: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """REST ``/events/live`` with WS-store / stale-cache fallback.
+    """WS-primary live slate. REST ``/events/live`` only on cold start or WS-down.
 
+    When the WebSocket is healthy and the store already has events, skip HTTP.
     A 429 or other REST failure must not abort the monitor loop or empty
-    the live scan when the WebSocket store (or a prior cached slate) still
-    has event IDs. Price recovery stays fail-closed in ``resolve_odds_docs``.
+    the live scan. Price recovery stays fail-closed in ``resolve_odds_docs``.
     """
+    ws_rows = filter_live_events_by_sport(live_events_from_ws_store(), sport)
+    if ws_feed_is_healthy() and ws_rows:
+        return ws_rows
+    if odds_api_rest_429_blocked():
+        cached_blocked: List[Dict[str, Any]] = []
+        peek_blocked = getattr(client, "peek_cached_live_events", None)
+        if callable(peek_blocked):
+            try:
+                raw_b = await peek_blocked(sport)
+                if isinstance(raw_b, list):
+                    cached_blocked = list(raw_b)
+            except Exception:
+                cached_blocked = []
+        merged_blocked = _merge_live_event_rows(ws_rows, cached_blocked)
+        print(
+            f"[MONITOR] live slate: 429 backoff — cached={len(cached_blocked)} "
+            f"ws={len(ws_rows)} merged={len(merged_blocked)} (no /events/live)"
+        )
+        return merged_blocked
     try:
         liv = await client.list_live_events(sport)
         if liv:
             return list(liv)
+        # Empty REST body: keep a warm WS store rather than wiping the scan.
+        if ws_rows:
+            return ws_rows
         return []
     except Exception as ex:
         print(f"[MONITOR] [WARN] /events/live failed: {ex}")
@@ -174,7 +199,6 @@ async def _resolve_live_events_slate(
                 cached = list(raw)
         except Exception:
             cached = []
-    ws_rows = live_events_from_ws_store()
     merged = _merge_live_event_rows(ws_rows, cached)
     print(
         f"[MONITOR] live slate fallback: cached={len(cached)} ws={len(ws_rows)} "
@@ -357,8 +381,8 @@ def _log_book_flow_and_pipeline_fetch(
 
 
 async def _pipeline_live_league_counts(client: Any) -> Tuple[int, int, int]:
-    """MLB / NHL / total from Odds-API /events/live (best-effort)."""
-    liv = await client.list_live_events()
+    """MLB / NHL / total from the WS-primary live slate (best-effort)."""
+    liv = await _resolve_live_events_slate(client, None)
     mlb = nhl = tot = 0
     for e in liv or []:
         tot += 1
