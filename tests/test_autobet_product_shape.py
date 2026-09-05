@@ -55,7 +55,7 @@ def test_product_constants_are_three_sharps_and_ev20():
 def test_auto_bet_switch_stays_off():
     src = (REPO / "dashboard.py").read_text(encoding="utf-8")
     assert "auto_bet_enabled = False" in src
-    assert "≥3 same-sign two-way recs" in src
+    assert "≥3 same-LINE comparison recs" in src
     assert "per_event_max_bet = 404.0" in src
     js = (REPO / "static" / "script.js").read_text(encoding="utf-8")
     assert "autobet-badge" in js
@@ -163,17 +163,61 @@ def test_plive_118_is_confirm_not_fair():
     assert shape["allow"] is True
 
 
-def test_plus_only_missing_sisters_blocked():
+def test_plus110_take_vs_minus110_pack_allows():
+    """Take +110 vs −107/−110/−112 is a play. Odds-sign must not block allow."""
+    books = [
+        _book("DraftKings", -107, -113),
+        _book("FanDuel", -110, -110),
+        _book("Caesars", -112, -108),
+        _book("PLive", -109, -111),
+        _book("Poly", -455, 350),
+    ]
+    shape = autobet_product_shape(
+        books, 110, take_book="Kalshi", ev_percent=5.5, plus_alert=True
+    )
+    assert shape["same_sign_recs"] >= 3
+    assert shape["allow"] is True
+    assert "same_sign_recs" not in shape["reasons"]
+    assert "sister_required" not in shape["reasons"]
+    out = evaluate_sharp_panel_ev(books, 110, min_sharp_books=3, take_book="Kalshi")
+    assert out["autobet_allow"] is True
+    assert "same_sign_recs" not in out["autobet_reasons"]
+
+
+def test_plus_only_three_books_on_line_not_killed_by_sister():
+    """3 comparison books on the same LINE are enough. Missing sisters do not deny."""
     books = [
         {"name": "A", "american": 228, "decimal_pick": 3.28, "decimal_opp": 0},
         {"name": "B", "american": 234, "decimal_pick": 3.34, "decimal_opp": 0},
         {"name": "C", "american": 240, "decimal_pick": 3.40, "decimal_opp": 0},
     ]
     shape = autobet_product_shape(
-        books, 300, take_book="Kalshi", ev_percent=15.0, plus_alert=True
+        books, 245, take_book="Kalshi", ev_percent=4.0, plus_alert=True
+    )
+    assert shape["same_sign_recs"] >= 3
+    assert shape["allow"] is True
+    assert "sister_required" not in shape["reasons"]
+
+
+def test_book_line_mismatch_does_not_count_as_same_line_rec():
+    """Neighbor / opposite hdp is fail-closed. Same-sign odds cannot rescue it."""
+    books = [
+        {**_book("DraftKings", -110, -110), "hdp": 1.5},
+        {**_book("FanDuel", -108, -112), "hdp": 1.5},
+        {**_book("Caesars", -112, -108), "hdp": 1.5},
+    ]
+    shape = autobet_product_shape(
+        books,
+        110,
+        take_book="Kalshi",
+        ev_percent=8.0,
+        plus_alert=True,
+        painted_side_hdp=-1.5,
+        actual_side_hdp=-1.5,
     )
     assert shape["allow"] is False
-    assert "sister_required" in shape["reasons"]
+    assert shape["same_sign_recs"] < 3
+    assert "same_sign_recs" in shape["reasons"] or "spread_label_mismatch" in shape["reasons"]
 
 
 def test_away_sign_wrong_blocked():

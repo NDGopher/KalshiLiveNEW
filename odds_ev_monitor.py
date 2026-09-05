@@ -344,7 +344,7 @@ def _autobet_card_reasons(
 _ticker_builder = None
 
 
-def _resolve_kalshi_card_identity(ticker, market_type, line, pick, teams):
+def _resolve_kalshi_card_identity(ticker, market_type, line, pick, teams, qualifier=None):
     """Upgrade a GAME event KX to SPREAD/TOTAL/GAME-TEAM + yes/no. Sync, no network."""
     global _ticker_builder
     if _ticker_builder is None:
@@ -352,7 +352,7 @@ def _resolve_kalshi_card_identity(ticker, market_type, line, pick, teams):
 
         _ticker_builder = KalshiClient()
     return _ticker_builder.resolve_executable_market_identity(
-        ticker, market_type, line, pick, teams
+        ticker, market_type, line, pick, teams, qualifier
     )
 
 
@@ -3924,7 +3924,7 @@ class OddsEVMonitor:
         card_side = None
         if take_canon.lower() == "kalshi" and ticker and is_kalshi_ticker(ticker):
             ident = _resolve_kalshi_card_identity(
-                ticker, market_type_bb, line_val, pick, teams
+                ticker, market_type_bb, line_val, pick, teams, qualifier
             )
             if ident:
                 ticker = ident["ticker"]
@@ -3936,6 +3936,7 @@ class OddsEVMonitor:
                     line=line_val,
                     ticker=ticker,
                     teams=teams,
+                    qualifier=qualifier,
                 )
 
         has_exec = bool(
@@ -3944,9 +3945,21 @@ class OddsEVMonitor:
             and is_executable_market_ticker(ticker, market_type_bb, line_val)
         )
         shape_allow = bool(shape["allow"])
-        # Product shape already passed: do not let display_only / strict_pass
-        # hide an executable Kalshi take. allow=true implies not display_only.
+        # Product shape already passed: do not let display_only / sister_required /
+        # strict_pass hide an executable Kalshi take. allow=true implies not display_only.
         if shape_allow and has_exec:
+            display_only = False
+        elif (
+            has_exec
+            and is_plus_print_ev(ev_percent, 2.0)
+            and float(ev_percent) <= 20.0 + 1e-9
+            and int(shape.get("same_sign_recs") or 0) >= 3
+            and "spread_label_mismatch" not in (shape.get("reasons") or [])
+            and "spread_hdp_mismatch" not in (shape.get("reasons") or [])
+            and take_canon.lower() == "kalshi"
+        ):
+            # EV≥2 + executable ticker/side + 3 same-LINE books: do not silently kill.
+            shape_allow = True
             display_only = False
 
         return {

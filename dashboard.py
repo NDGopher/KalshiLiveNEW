@@ -56,10 +56,12 @@ from execution_guard import (
     expected_side_for_alert,
     format_hms_us,
     href_ticker_agrees_with_alert,
+    is_bare_game_event_ticker,
     is_executable_market_ticker,
     is_kalshi_ticker,
     is_paper_kalshi_ticker,
     kalshi_line_int,
+    parse_alert_line,
     parse_kalshi_ticker,
     prepare_executable_order,
     ticker_line_matches_alert,
@@ -2481,6 +2483,54 @@ def _is_paper_kalshi_alert(alert: EvAlert) -> bool:
     return not is_kalshi_ticker(ticker) and not ticker.upper().startswith("KXSCAN")
 
 
+_identity_builder = None
+
+
+def _identity_client():
+    """Prefer the live Kalshi client; fall back to a sync builder (no network)."""
+    global _identity_builder
+    if kalshi_client is not None:
+        return kalshi_client
+    if _identity_builder is None:
+        _identity_builder = KalshiClient()
+    return _identity_builder
+
+
+def _resolve_autobet_identity(
+    ticker,
+    market_type,
+    line,
+    pick,
+    teams,
+    qualifier=None,
+):
+    """Upgrade a GAME event (or missing side) to a concrete market ticker + yes/no.
+
+    Sync #36 resolver. Bare GAME events are never returned. Fail-closed → None.
+    """
+    if line is None:
+        line = parse_alert_line(None, qualifier)
+    try:
+        ident = _identity_client().resolve_executable_market_identity(
+            ticker, market_type, line, pick, teams, qualifier
+        )
+    except Exception:
+        ident = None
+    if not ident:
+        return None
+    resolved = str(ident.get("ticker") or "").strip().upper()
+    side = str(ident.get("side") or "").strip().lower()
+    if side not in ("yes", "no"):
+        return None
+    if is_bare_game_event_ticker(resolved):
+        return None
+    if not is_executable_market_ticker(resolved, market_type, line, qualifier):
+        return None
+    ident["ticker"] = resolved
+    ident["side"] = side
+    return ident
+
+
 def _autobet_reasons_for_alert(alert: Any, *, forced: Optional[List[str]] = None) -> List[str]:
     """Card/API reasons. High-EV display rows must not look silently tradeable."""
     reasons: List[str] = []
@@ -2777,6 +2827,23 @@ async def handle_new_alert(alert: EvAlert):
                     f"(ceil of |line|). Ignoring href suffix — match from alert line, not neighbor."
                 )
         
+        # Sync resolver first: never leave the allow-path on a bare GAME event.
+        # find_submarket GET is enrichment (floor_strike / subtitles). GET miss
+        # must not skip a resolved KXMLBSPREAD-… / GAME-TEAM identity.
+        ident = _resolve_autobet_identity(
+            raw_ticker or event_ticker,
+            alert.market_type,
+            line,
+            alert.pick,
+            alert.teams,
+            alert.qualifier,
+        )
+        if ident:
+            print(
+                f"[HANDLE ALERT] Resolved executable identity: {ident['ticker']} "
+                f"side={ident['side']} (from {raw_ticker or event_ticker})"
+            )
+
         # Find the exact submarket
         submarket = await kalshi_client.find_submarket(
             event_ticker=event_ticker,
@@ -2787,8 +2854,34 @@ async def handle_new_alert(alert: EvAlert):
         )
         
         match_result = None
+        if ident and ident.get("ticker"):
+            ident_ticker = str(ident["ticker"]).upper()
+            market_blob = submarket if isinstance(submarket, dict) else {}
+            fetched_ticker = str(market_blob.get("ticker") or "").upper()
+            if fetched_ticker and fetched_ticker != ident_ticker:
+                if not is_executable_market_ticker(
+                    fetched_ticker, alert.market_type, line, alert.qualifier
+                ):
+                    market_blob = {"ticker": ident_ticker}
+                elif not ticker_line_matches_alert(fetched_ticker, line, alert.qualifier):
+                    market_blob = {"ticker": ident_ticker}
+                else:
+                    ident_ticker = fetched_ticker
+            if not market_blob.get("ticker"):
+                market_blob = dict(market_blob) if market_blob else {}
+                market_blob["ticker"] = ident_ticker
+            match_result = {
+                "market": market_blob,
+                "ticker": ident_ticker,
+                "confidence": 1.0,
+                "match_method": "executable_identity",
+            }
+            print(
+                f"OK: Executable identity {ident_ticker} side={ident.get('side')} "
+                f"for {alert.market_type} {alert.pick} {line}"
+            )
         
-        if submarket:
+        if match_result is None and submarket:
             # Found exact submarket!
             submarket_ticker = submarket.get('ticker', '').upper()
             # CRITICAL: If ticker is missing, try alternative field names
@@ -2826,8 +2919,8 @@ async def handle_new_alert(alert: EvAlert):
                 }
                 print(f"OK: Found exact submarket: {submarket_ticker} for {alert.market_type} {alert.pick} {line}")
         
-        # If submarket was rejected or not found, try fallback
-        if not submarket or not match_result:
+        # GET miss is OK when the sync resolver already stamped a market ticker.
+        if not match_result:
             # DIAGNOSTIC: Enhanced logging for NCAAB failures
             is_ncaab = event_ticker and event_ticker.upper().startswith('KXNCAAMB')
             if is_ncaab:
@@ -2970,17 +3063,22 @@ async def handle_new_alert(alert: EvAlert):
         # CRITICAL: Ensure ticker is in market dict for ticker-based side determination
         market_dict = match_result['market'].copy()
         market_dict['ticker'] = match_result.get('ticker', market_dict.get('ticker', ''))
-        side = expected_side_for_alert(
-            market_type=alert.market_type,
-            pick=alert.pick,
-            line=line,
-            ticker=match_result.get('ticker') or market_dict.get('ticker'),
-            teams=alert.teams,
-        )
+        side = None
+        if ident and ident.get("side") in ("yes", "no"):
+            side = ident["side"]
+        if side not in ("yes", "no"):
+            side = expected_side_for_alert(
+                market_type=alert.market_type,
+                pick=alert.pick,
+                line=line,
+                ticker=match_result.get('ticker') or market_dict.get('ticker'),
+                teams=alert.teams,
+                qualifier=alert.qualifier,
+            )
         if side not in ('yes', 'no'):
             side = market_matcher.determine_side(alert, market_dict)
         
-        if not side:
+        if side not in ('yes', 'no'):
             print(f"❌ Could not determine side for: {alert.pick} in market {match_result['ticker']}")
             print(f"   Market YES: {yes_subtitle}")
             print(f"   Market NO: {no_subtitle}")
@@ -4681,7 +4779,34 @@ def run_monitor_loop():
                 alert_data['devig_books'] = getattr(alert, 'devig_books', [])
                 if hasattr(alert, 'strict_pass'):
                     alert_data['strict_pass'] = alert.strict_pass
-                alert_data['autobet_allow'] = bool(getattr(alert, 'autobet_allow', False))
+                _upd_line = alert_data.get("line")
+                if _upd_line is None:
+                    _upd_line = getattr(alert, "line", None)
+                ident = _resolve_autobet_identity(
+                    alert_data.get("ticker") or getattr(alert, "ticker", None),
+                    alert_data.get("market_type") or getattr(alert, "market_type", None),
+                    _upd_line,
+                    alert_data.get("pick") or getattr(alert, "pick", None),
+                    alert_data.get("teams") or getattr(alert, "teams", None),
+                    alert_data.get("qualifier") or getattr(alert, "qualifier", None),
+                )
+                if ident:
+                    alert_data["ticker"] = ident["ticker"]
+                    alert_data["side"] = ident["side"]
+                    if ident.get("event_ticker"):
+                        alert_data["event_ticker"] = ident["event_ticker"]
+                    if getattr(alert, "line", None) is not None:
+                        alert_data["line"] = alert.line
+                    elif _upd_line is not None:
+                        alert_data["line"] = _upd_line
+                alert_data['autobet_allow'] = bool(getattr(alert, 'autobet_allow', False)) and str(
+                    alert_data.get("side") or ""
+                ).lower() in ("yes", "no") and is_executable_market_ticker(
+                    alert_data.get("ticker"),
+                    alert_data.get("market_type") or getattr(alert, "market_type", None),
+                    alert_data.get("line") if alert_data.get("line") is not None else _upd_line,
+                    alert_data.get("qualifier") or getattr(alert, "qualifier", None),
+                )
                 alert_data['autobet_reasons'] = _autobet_reasons_for_alert(alert)
                 for _lk in (
                     "live",
@@ -4778,6 +4903,19 @@ def run_monitor_loop():
                         high_ev_should_trigger = True
                 ticker = alert_data.get('ticker') or ''
                 side = alert_data.get('side') or ''
+                # Never create a place task on a bare GAME event or empty side.
+                if (
+                    is_bare_game_event_ticker(ticker)
+                    or str(side or "").lower() not in ("yes", "no")
+                    or not is_executable_market_ticker(
+                        ticker,
+                        alert_data.get("market_type") or getattr(alert, "market_type", None),
+                        alert_data.get("line") if alert_data.get("line") is not None else getattr(alert, "line", None),
+                        alert_data.get("qualifier") or getattr(alert, "qualifier", None),
+                    )
+                ):
+                    ticker = ""
+                    side = ""
                 # Synthetic paper tickers (KALSHI|…) are display-only.
                 if isinstance(ticker, str) and ticker.upper().startswith("KALSHI|"):
                     return
@@ -5309,29 +5447,35 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
     _line = alert_data.get('line')
     if _line is None and alert is not None:
         _line = getattr(alert, 'line', None)
+    _qual = alert_data.get('qualifier') or (getattr(alert, 'qualifier', None) if alert is not None else None)
+    if _line is None:
+        _line = parse_alert_line(None, _qual)
     _teams = alert_data.get('teams') or (getattr(alert, 'teams', None) if alert is not None else None)
     if ticker or _pick:
-        try:
-            ident = kalshi_client.resolve_executable_market_identity(
-                ticker, _mt, _line, _pick, _teams
-            )
-        except Exception:
-            ident = None
+        ident = _resolve_autobet_identity(ticker, _mt, _line, _pick, _teams, _qual)
         if ident:
             ticker = ident['ticker']
             side = ident['side']
             alert_data['ticker'] = ticker
             alert_data['side'] = side
+            if _line is not None:
+                alert_data['line'] = _line
             if alert is not None:
                 alert.ticker = ticker
                 alert.side = side
         elif side not in ('yes', 'no') and ticker:
             side = expected_side_for_alert(
-                market_type=_mt, pick=_pick, line=_line, ticker=ticker, teams=_teams
+                market_type=_mt, pick=_pick, line=_line, ticker=ticker, teams=_teams, qualifier=_qual
             )
             if side:
                 alert_data['side'] = side
-    submarket_key = (ticker.upper(), side.lower()) if ticker and side else None
+    _exec_ready = bool(
+        ticker
+        and str(side or "").lower() in ("yes", "no")
+        and is_executable_market_ticker(ticker, _mt, _line, _qual)
+        and not is_bare_game_event_ticker(ticker)
+    )
+    submarket_key = (str(ticker).upper(), str(side).lower()) if _exec_ready else None
     lock_held_start = None
     trade_start_time = time.time()
 
@@ -5405,8 +5549,8 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
         else:
             autobet_ok = bool(alert_data.get("autobet_allow", False))
         if not autobet_ok:
-            # Product lock: Kalshi take, ≥3 same-sign two-way recs (3 Sharps Live).
-            # PLive never auto-bets. Switch ON does not override a False allow.
+            # Product lock: Kalshi take, ≥3 same-LINE comparison recs (3 Sharps Live).
+            # Odds + vs − is not a block. PLive never auto-bets. Switch ON does not override.
             _terminal_skip(
                 "autobet_allow=False",
                 "Product-shape autobet_allow is False (fail-closed; switch ON does not override)",
@@ -5423,6 +5567,16 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
             _terminal_skip(
                 f"EV {ev_percent:.2f}% above filter maximum {current_ev_max}%",
                 f"Alert has {ev_percent:.2f}% EV but above filter maximum threshold {current_ev_max}%",
+            )
+            return
+
+        if not _exec_ready:
+            _terminal_skip(
+                "unresolved market ticker or side",
+                (
+                    f"Fail-closed: will not place on bare GAME event or empty side. "
+                    f"Ticker: '{ticker}', Side: '{side or ''}'."
+                ),
             )
             return
 
