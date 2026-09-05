@@ -1,9 +1,12 @@
 """
 Odds-API.io WebSocket feed (https://docs.odds-api.io/guides/websockets).
 
-Primary live-odds path. REST stays for slate (``/events``, ``/events/live``),
-REST→WS handoff (``includeSeq=true`` + ``X-OddsAPI-Seq``), ``resync_required``,
-and fallback (prefer ``/odds/updated``).
+Primary live-odds path. WS streams the **same selected bookmakers** as REST, as
+real-time deltas (a book appears when it ticks — there is no full odds replay on
+connect). REST is reserved for slate (``/events``, ``/events/live``), optional
+``includeSeq`` handoff (``ODDS_API_WS_HANDOFF_REST_ODDS=true``), ``resync_required``,
+and fail-closed fallback (prefer ``/odds/updated``). Default is WS-first to
+protect the ~5k/hr REST budget.
 
 Official contract (do not invent):
 - ``wss://api.odds-api.io/v3/ws?apiKey=...`` plus query filters.
@@ -1155,12 +1158,31 @@ class OddsApiWsFeed:
                     pass
 
     async def _handoff_snapshot(self) -> None:
-        """REST includeSeq snapshot then connect with lastSeq (official handoff)."""
+        """Optional REST includeSeq snapshot before connect (official gapless handoff).
+
+        Default is **WS-first**: skip the multi-book REST odds snapshot and let the
+        socket warm from live ticks. Odds-API WS streams the same selected books as
+        REST; it just does not replay a full snapshot on connect — books appear as
+        they tick (EPL typically fills DraftKings/FanDuel/Bet365/etc. within a
+        minute). A full handoff snapshot is ~1 REST call per book × event chunk and
+        burns the 5k/hr REST budget on every reconnect.
+
+        Set ``ODDS_API_WS_HANDOFF_REST_ODDS=true`` to restore the official REST
+        includeSeq seed (gapless lastSeq). Slate metadata still comes from the
+        monitor's live-events polls, not from this path when odds handoff is off.
+        """
+        if not _env_bool("ODDS_API_WS_HANDOFF_REST_ODDS", "false"):
+            print(
+                "[ODDS-API WS] WS-first connect (no REST odds handoff) — "
+                "store warms from live book ticks; set ODDS_API_WS_HANDOFF_REST_ODDS=true "
+                "for official includeSeq snapshot"
+            )
+            return
         try:
             liv = await self.rest.list_live_events(None)
             self.store.apply_slate(liv or [])
             # Majors first — raw /events/live order buries EPL under FA Cup floods,
-            # so a first-50 cut never seeds soccer majors into the WS store.
+            # so a first-N cut never seeds soccer majors into the WS store.
             from odds_api_client import prioritize_live_events_for_scan
 
             seed = prioritize_live_events_for_scan(list(liv or []), _handoff_seed_max())
@@ -1436,15 +1458,15 @@ async def _maybe_rest_backfill_thin_ws_docs(
     the store at connect, then live updates on WS
     (https://docs.odds-api.io/guides/websockets).
 
-    Defaults (WS-first):
-    - ``ODDS_API_WS_COLD_SEED`` (default true): one-shot REST only for events with
-      *zero* priced master books (handoff miss / new slate entry).
+    Defaults (WS-first — conserve the 5k/hr REST budget):
+    - ``ODDS_API_WS_COLD_SEED`` (default false): one-shot REST only for events with
+      *zero* priced master books. Prefer waiting for WS ticks instead.
     - ``ODDS_API_WS_REST_BACKFILL`` (default false): optional thin-store fill when
       any event is below ``ODDS_API_WS_REST_BACKFILL_MIN_BOOKS`` (legacy safety net).
     """
     global _ws_rest_backfill_until
     thin = _env_bool("ODDS_API_WS_REST_BACKFILL", "false")
-    cold = _env_bool("ODDS_API_WS_COLD_SEED", "true")
+    cold = _env_bool("ODDS_API_WS_COLD_SEED", "false")
     if not thin and not cold:
         return docs, "websocket"
     if thin:
