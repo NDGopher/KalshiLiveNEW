@@ -264,6 +264,7 @@ def test_auto_bet_off_minsharp_three_mgm_stays():
     assert "BetMGM" in DEFAULT_ODDS_API_BOOKMAKERS
     assert "from auto_bet_sheet import" in src
     assert "build_auto_bet_sheet_record(" in src
+    assert "from auto_bet_sizing import size_auto_bet_order" in src
     import dashboard as dash_mod
 
     assert dash_mod.auto_bet_enabled is False
