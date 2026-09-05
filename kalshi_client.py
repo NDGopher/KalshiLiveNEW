@@ -19,6 +19,7 @@ from pathlib import Path
 from execution_guard import (
     build_limit_order_payload,
     event_ticker_from_any,
+    format_hms_us,
     has_trading_credentials,
     public_get_headers,
 )
@@ -2294,7 +2295,7 @@ class KalshiClient:
         Returns YES and NO side prices with liquidity
         """
         fetch_start = time.time()
-        print(f"[ORDERBOOK] [TIMING] Starting orderbook fetch for {ticker} at {time.strftime('%H:%M:%S.%f', time.localtime(fetch_start))}")
+        print(f"[ORDERBOOK] [TIMING] Starting orderbook fetch for {ticker} at {format_hms_us(fetch_start)}")
         
         if not self.session:
             await self.init()

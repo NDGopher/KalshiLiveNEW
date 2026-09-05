@@ -53,9 +53,13 @@ from market_matcher import MarketMatcher
 from kalshi_client import KalshiClient
 from execution_guard import (
     event_ticker_from_any,
+    format_hms_us,
     is_kalshi_ticker,
     is_paper_kalshi_ticker,
+    kalshi_line_int,
+    parse_kalshi_ticker,
     prepare_executable_order,
+    ticker_line_matches_alert,
 )
 from odds_ev_monitor import (
     OddsEVMonitor as EvMonitorImpl,
@@ -2647,6 +2651,22 @@ async def handle_new_alert(alert: EvAlert):
             print(f"[HANDLE ALERT] Using line value: {line} for market_type='{alert.market_type}', pick='{alert.pick}', qualifier='{alert.qualifier}'")
         else:
             print(f"[HANDLE ALERT] WARNING: No line value available! qualifier='{alert.qualifier}', alert.line={getattr(alert, 'line', None)}")
+
+        # Odds-API href is often a neighboring Kalshi market (59.5 alert, href …-60).
+        # Kalshi totals/spreads encode the integer part (59.5 → 59). Never adopt the href line.
+        href_parsed = parse_kalshi_ticker(raw_ticker)
+        if (
+            href_parsed
+            and href_parsed.is_market
+            and href_parsed.family in ("total", "spread")
+            and line is not None
+            and href_parsed.line_int != kalshi_line_int(line)
+        ):
+            print(
+                f"[HANDLE ALERT] market_url ticker {href_parsed.raw} encodes line "
+                f"{href_parsed.line_int}, alert line {line} encodes as {kalshi_line_int(line)}. "
+                f"Kalshi uses the integer part (59.5 → 59). Matching from alert line, not href."
+            )
         
         # Find the exact submarket
         submarket = await kalshi_client.find_submarket(
@@ -2681,6 +2701,13 @@ async def handle_new_alert(alert: EvAlert):
                 print(f"❌ REJECTED: Non-standard market type matched: {submarket_ticker} - this is not a standard game market!")
                 print(f"   This market type is not supported for auto-betting. Falling back to search...")
                 submarket = None  # Force fallback to search
+            elif not ticker_line_matches_alert(submarket_ticker, line, alert.qualifier):
+                print(
+                    f"❌ REJECTED: Matched ticker {submarket_ticker} line does not match "
+                    f"alert line {line} (qualifier={alert.qualifier!r}). Fail closed — "
+                    f"do not order the wrong Kalshi total/spread."
+                )
+                submarket = None
             else:
                 match_result = {
                     'market': submarket,
@@ -3556,7 +3583,7 @@ async def handle_new_alert(alert: EvAlert):
                                                 lock_held_duration = (time.time() - auto_bet_lock_acquired_at) * 1000
                                                 diagnostic_logs.append(f"🚨 LOCK HELD BY: {auto_bet_lock_holder}")
                                                 diagnostic_logs.append(f"   Held for: {lock_held_duration:.1f}ms")
-                                                diagnostic_logs.append(f"   Acquired at: {time.strftime('%H:%M:%S.%f', time.localtime(auto_bet_lock_acquired_at))}")
+                                                diagnostic_logs.append(f"   Acquired at: {format_hms_us(auto_bet_lock_acquired_at)}")
                                             else:
                                                 diagnostic_logs.append(f"⚠️  Lock holder tracking: holder={auto_bet_lock_holder}, acquired_at={auto_bet_lock_acquired_at}")
                                         except NameError:
@@ -3575,8 +3602,8 @@ async def handle_new_alert(alert: EvAlert):
                                             f"   In processing set: {alert_id in auto_bet_processing_alert_ids}",
                                             f"",
                                             f"Task creation timing:",
-                                            f"   Task start time: {time.strftime('%H:%M:%S.%f', time.localtime(task_start_time))}",
-                                            f"   Timeout occurred at: {time.strftime('%H:%M:%S.%f', time.localtime(time.time()))}",
+                                            f"   Task start time: {format_hms_us(task_start_time)}",
+                                            f"   Timeout occurred at: {format_hms_us()}",
                                             f"   Total wait time: {(time.time() - task_start_time) * 1000:.1f}ms",
                                             f"",
                                             f"====================================="
@@ -3600,7 +3627,7 @@ async def handle_new_alert(alert: EvAlert):
                                 # Lock acquired - now perform operations
                                 try:
                                     lock_acquired_time = time.time()
-                                    print(f"[AUTO-BET] [LOCK] Alert {alert_id} acquired lock for {submarket_key_for_check} at {time.strftime('%H:%M:%S.%f', time.localtime(lock_acquired_time))}")
+                                    print(f"[AUTO-BET] [LOCK] Alert {alert_id} acquired lock for {submarket_key_for_check} at {format_hms_us(lock_acquired_time)}")
                                     print(f"[AUTO-BET] [LOCK] Lock acquisition took {(lock_acquired_time - task_start_time) * 1000:.1f}ms")
                                     # CRITICAL: Check retry count and cooldown FIRST (prevents infinite loops)
                                     current_time = time.time()
@@ -3811,7 +3838,7 @@ async def handle_new_alert(alert: EvAlert):
                                     f"Lock state: locked={auto_bet_lock.locked() if auto_bet_lock else 'N/A'}, waiters={len(auto_bet_lock._waiters) if (auto_bet_lock and hasattr(auto_bet_lock, '_waiters') and auto_bet_lock._waiters is not None) else 'unknown'}",
                                     f"Lock holder: {auto_bet_lock_holder}",
                                     f"Lock held for: {(time.time() - auto_bet_lock_acquired_at) * 1000:.1f}ms" if (auto_bet_lock_acquired_at and auto_bet_lock_holder) else "Lock held for: N/A",
-                                    f"Lock acquired at: {time.strftime('%H:%M:%S.%f', time.localtime(auto_bet_lock_acquired_at))}" if auto_bet_lock_acquired_at else "Lock acquired at: N/A",
+                                    f"Lock acquired at: {format_hms_us(auto_bet_lock_acquired_at)}" if auto_bet_lock_acquired_at else "Lock acquired at: N/A",
                                     f"",
                                     f"========== STUCK TASK ANALYSIS ==========",
                                 ]
@@ -3843,7 +3870,7 @@ async def handle_new_alert(alert: EvAlert):
                                     diagnostic_logs.append(f"🚨 LOCK HELD BY STUCK TASK:")
                                     diagnostic_logs.append(f"   Holder: {auto_bet_lock_holder}")
                                     diagnostic_logs.append(f"   Held for: {lock_held_duration:.1f}ms ({lock_held_duration/1000:.1f}s)")
-                                    diagnostic_logs.append(f"   Acquired at: {time.strftime('%H:%M:%S.%f', time.localtime(auto_bet_lock_acquired_at))}")
+                                    diagnostic_logs.append(f"   Acquired at: {format_hms_us(auto_bet_lock_acquired_at)}")
                                     if lock_held_duration > 10000:
                                         diagnostic_logs.append(f"   ⚠️  WATCHDOG SHOULD HAVE KILLED THIS (>10s)!")
                                         diagnostic_logs.append(f"   Possible reasons:")
@@ -4057,7 +4084,7 @@ async def handle_new_alert(alert: EvAlert):
                                 lock_held_duration = (time.time() - auto_bet_lock_acquired_at) * 1000
                                 diagnostic_logs.append(f"Lock holder: {auto_bet_lock_holder}")
                                 diagnostic_logs.append(f"Lock held for: {lock_held_duration:.1f}ms")
-                                diagnostic_logs.append(f"Lock acquired at: {time.strftime('%H:%M:%S.%f', time.localtime(auto_bet_lock_acquired_at))}")
+                                diagnostic_logs.append(f"Lock acquired at: {format_hms_us(auto_bet_lock_acquired_at)}")
                             else:
                                 diagnostic_logs.append(f"Lock holder: {auto_bet_lock_holder}")
                                 diagnostic_logs.append(f"Lock acquired at: {auto_bet_lock_acquired_at}")
@@ -5265,7 +5292,7 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
     print(f"[AUTO-BET] Filter: {alert_filter_name or 'N/A'}")
     print(f"[AUTO-BET] Ticker: {ticker}, Side: {side}")
     print(f"[AUTO-BET] Expected Price: {alert_data.get('price_cents', 'N/A')}¢")
-    print(f"[AUTO-BET] Start Time: {time.strftime('%H:%M:%S.%f', time.localtime(trade_start_time))}")
+    print(f"[AUTO-BET] Start Time: {format_hms_us(trade_start_time)}")
     print(f"[AUTO-BET] =========================================")
     
     # Wrap main logic in try-except-finally for error handling
@@ -5575,7 +5602,7 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
             # Lock acquired - perform ALL operations (atomic checks, reverse middle, order placement)
             # Safety first: Lock must be held during reverse middle checks (reads shared state)
             # Speed: Order placement is fast (quick API call), so lock can stay held
-            print(f"[AUTO-BET] [LOCK] Alert {alert_id} acquired lock for {submarket_key} at {time.strftime('%H:%M:%S.%f', time.localtime(lock_held_start))}")
+            print(f"[AUTO-BET] [LOCK] Alert {alert_id} acquired lock for {submarket_key} at {format_hms_us(lock_held_start)}")
             # CRITICAL: Atomic check-and-mark to prevent race conditions
             # All checks and marks must happen within the lock to be atomic
             # CRITICAL: Check if already bet (but DON'T add to auto_bet_submarkets yet - only add after successful bet)
@@ -6037,7 +6064,7 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
             # FAST REVERSE MIDDLE CHECK - Use ticker-based matching only (lightning fast, instant)
             # Read directly from auto_bet_submarket_data (updated by position_check_loop every 60s)
             reverse_middle_check_start = time.time()
-            print(f"[AUTO-BET] [TIMING] [{time.strftime('%H:%M:%S.%f', time.localtime(reverse_middle_check_start))}] ⚡ Starting reverse middle check")
+            print(f"[AUTO-BET] [TIMING] [{format_hms_us(reverse_middle_check_start)}] ⚡ Starting reverse middle check")
             reverse_middle_checked_count = 0
             for existing_key, existing_data in auto_bet_submarket_data.items():
                 reverse_middle_checked_count += 1
@@ -6795,7 +6822,7 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
                 print(f"[AUTO-BET]   Expected Price: {expected_price_cents}¢")
                 print(f"[AUTO-BET]   Price Tolerance: ±2¢ better allowed, ±1¢ worse allowed")
                 print(f"[AUTO-BET] ========== CALLING place_order() NOW ==========")
-                print(f"[AUTO-BET] [TIMING] Order placement started at {time.strftime('%H:%M:%S.%f', time.localtime(order_placement_start))}")
+                print(f"[AUTO-BET] [TIMING] Order placement started at {format_hms_us(order_placement_start)}")
                 print(f"[AUTO-BET] [TIMING] Step timings so far: {step_timings}")
 
                 rebuilt_ticker = None
@@ -6835,7 +6862,7 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
                 
                 # TIMING: Track order placement
                 order_api_start = time.time()
-                print(f"[AUTO-BET] [TIMING] [{time.strftime('%H:%M:%S.%f', time.localtime(order_api_start))}] ⚡ Starting order placement API call")
+                print(f"[AUTO-BET] [TIMING] [{format_hms_us(order_api_start)}] ⚡ Starting order placement API call")
                 result = await kalshi_client.place_order(
                     ticker=ticker,
                     side=side,

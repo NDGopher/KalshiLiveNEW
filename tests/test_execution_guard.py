@@ -12,10 +12,12 @@ from execution_guard import (
     event_ticker_from_any,
     expected_side_for_alert,
     has_trading_credentials,
+    kalshi_line_int,
     parse_kalshi_ticker,
     prepare_executable_order,
     public_get_headers,
     same_event,
+    ticker_line_matches_alert,
     validate_execution_intent,
 )
 
@@ -348,12 +350,15 @@ def test_dashboard_and_client_wire_the_guard():
     js = (Path(__file__).resolve().parents[1] / "static" / "script.js").read_text(encoding="utf-8")
     assert "from execution_guard import" in dash
     assert "event_ticker_from_any" in dash
+    assert "format_hms_us" in dash
+    assert "ticker_line_matches_alert" in dash
     assert "prepare_executable_order" in dash
     assert "prepare_executable_order" in dash
     assert "Execution identity failed" in dash
     assert "expected_price_cents or 50" not in dash
     assert "attempting fallback matching for manual bet" not in dash
     assert "public_ok=True" in client
+    assert "format_hms_us" in client
     assert client.count('_headers_for("GET", path, public_ok=True)') >= 5
     assert "Kalshi credentials required to place orders" in client
     assert "function canPlaceKalshiBet" in js
@@ -390,3 +395,74 @@ def test_build_market_ticker_does_not_double_suffix_from_href():
     )
     assert built == "KXNBATOTAL-26JAN11ATLGSW-143"
     assert built.count("-143") == 1
+
+
+BALL_OSU_EVENT = "KXNCAAFGAME-26SEP05BALLOSU"
+BALL_OSU_TOTAL_59 = "KXNCAAFTOTAL-26SEP05BALLOSU-59"
+BALL_OSU_TOTAL_60 = "KXNCAAFTOTAL-26SEP05BALLOSU-60"
+
+
+def test_ncaaf_total_59_5_encodes_as_59_not_60():
+    """Kalshi totals use the integer part. Under 59.5 is …-59, not href …-60."""
+    from kalshi_client import KalshiClient
+
+    assert kalshi_line_int(59.5) == 59
+    assert kalshi_line_int(59.5) != 60
+    client = KalshiClient()
+    built = client.build_market_ticker(
+        BALL_OSU_EVENT,
+        "Total Points",
+        59.5,
+        "Under",
+        "Ball State @ Ohio State",
+    )
+    assert built == BALL_OSU_TOTAL_59
+    assert ticker_line_matches_alert(BALL_OSU_TOTAL_59, 59.5, "59.5") is True
+    assert ticker_line_matches_alert(BALL_OSU_TOTAL_60, 59.5, "59.5") is False
+
+    ok = validate_execution_intent(
+        ticker=BALL_OSU_TOTAL_59,
+        side="no",
+        price_cents=55,
+        market_type="Total Points",
+        pick="Under",
+        teams="Ball State @ Ohio State",
+        line=59.5,
+        qualifier="59.5",
+        event_ticker=BALL_OSU_EVENT,
+        rebuilt_ticker=built,
+    )
+    assert ok.ok is True
+    assert ok.ticker == BALL_OSU_TOTAL_59
+    assert ok.side == "no"
+
+    href_wrong = validate_execution_intent(
+        ticker=BALL_OSU_TOTAL_60,
+        side="no",
+        price_cents=55,
+        market_type="Total Points",
+        pick="Under",
+        teams="Ball State @ Ohio State",
+        line=59.5,
+        qualifier="59.5",
+        event_ticker=BALL_OSU_EVENT,
+        rebuilt_ticker=BALL_OSU_TOTAL_59,
+    )
+    assert href_wrong.ok is False
+    assert "wrong_line" in href_wrong.reasons or "stale_or_mismatched_ticker" in href_wrong.reasons
+
+
+def test_href_60_alone_is_wrong_line_for_59_5():
+    """Ordering the href …-60 market for a 59.5 alert must fail closed."""
+    check = validate_execution_intent(
+        ticker=BALL_OSU_TOTAL_60,
+        side="no",
+        price_cents=55,
+        market_type="Total Points",
+        pick="Under",
+        teams="Ball State @ Ohio State",
+        line=59.5,
+        event_ticker=BALL_OSU_EVENT,
+    )
+    assert check.ok is False
+    assert "wrong_line" in check.reasons

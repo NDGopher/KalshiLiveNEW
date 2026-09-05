@@ -9,7 +9,9 @@ or mismatched. Away spreads must already be -hdp (home-centric).
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 _TICKER_RE = re.compile(r"^[A-Z0-9]+(?:-[A-Z0-9]+)+$")
@@ -143,13 +145,46 @@ def same_event(left: Any, right: Any) -> bool:
     return a.event_key == b.event_key and to_game_series(a.series) == to_game_series(b.series)
 
 
+def format_hms_us(ts: Optional[float] = None) -> str:
+    """Local H:M:S.microseconds for auto-bet timing logs.
+
+    ``time.strftime`` does not support ``%f`` and raises
+    ``ValueError: Invalid format string``. Use ``datetime``.
+    """
+    if ts is None:
+        ts = time.time()
+    return datetime.fromtimestamp(float(ts)).strftime("%H:%M:%S.%f")
+
+
 def kalshi_line_int(line: Any) -> Optional[int]:
+    """Kalshi ticker line is the integer part of the sportsbook line.
+
+    Totals/spreads use floor of abs(line): 59.5 → 59, 143.5 → 143, -1.5 → 1.
+    Rounding 59.5 up to 60 is a different Kalshi market and must fail closed.
+    """
     try:
         if line is None or line == "":
             return None
         return int(abs(float(line)))
     except (TypeError, ValueError):
         return None
+
+
+def ticker_line_matches_alert(
+    ticker: Any,
+    line: Any = None,
+    qualifier: Any = None,
+) -> bool:
+    """True when the ticker has no line (ML) or its line_int matches the alert."""
+    parsed = parse_kalshi_ticker(ticker)
+    if not parsed:
+        return False
+    if parsed.family not in ("spread", "total"):
+        return True
+    alert_line = parse_alert_line(line, qualifier)
+    if alert_line is None or parsed.line_int is None:
+        return False
+    return parsed.line_int == kalshi_line_int(alert_line)
 
 
 def parse_alert_line(line: Any, qualifier: Any = None) -> Optional[float]:
