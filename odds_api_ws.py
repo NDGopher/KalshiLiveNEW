@@ -1,15 +1,14 @@
 """
 Odds-API.io WebSocket feed (https://docs.odds-api.io/guides/websockets).
 
-Primary live-odds path. Pattern: **REST snapshot once** (includeSeq handoff) to
-seed every selected book into the store, then **WebSocket deltas** keep those
-books live. Same bookmakers as REST — WS does not replay a full board on connect
-without that handoff. After the socket is healthy, **do not** poll
-``/events/live`` or ``/odds/multi`` in a loop. Slate metadata comes from the WS
-store (plus a one-shot REST bootstrap when the store is empty).
-``resync_required`` / fail-closed ``/odds/updated`` remain REST **only while WS
-is down**. A 429 must not retry-storm; set ``ODDS_API_WS_HANDOFF_REST_ODDS=false``
-only if you intentionally want a WS-warm-only connect.
+Primary live-odds path: **WebSocket ticks**. REST ``/odds/multi`` handoff is
+**off by default** (``ODDS_API_WS_HANDOFF_REST_ODDS=false``) so a paid socket
+never burns the hourly quota on connect. Set that env **true** only for an
+explicit one-shot includeSeq seed. Soft-recover / 1013 reconnects must not
+re-run handoff. After the socket is healthy, **do not** poll ``/events/live``
+or ``/odds/multi`` in a loop. ``resync_required`` / fail-closed
+``/odds/updated`` remain REST **only while WS is down**. A 429 must not
+retry-storm.
 
 Official contract (do not invent):
 - ``wss://api.odds-api.io/v3/ws?apiKey=...`` plus query filters.
@@ -927,6 +926,7 @@ class OddsApiWsFeed:
         self._fallback_rate_limited = False
         self._session_started_at: Optional[float] = None
         self._unhealthy_since: Optional[float] = None
+        self._rest_handoff_attempted = False
         self.last_close_code: Optional[int] = None
         self._ws = None
         self._dirty = asyncio.Event()
@@ -1190,20 +1190,19 @@ class OddsApiWsFeed:
                     pass
 
     async def _handoff_snapshot(self) -> None:
-        """Optional REST includeSeq snapshot before connect (official gapless handoff).
+        """Optional REST includeSeq snapshot. Default **OFF** — WS-warm from ticks.
 
-        Default **ON** (``ODDS_API_WS_HANDOFF_REST_ODDS``): one REST includeSeq multi
-        snapshot seeds all selected books, then WS updates them live — no missing
-        opening lines. Odds-API WS alone only pushes books when they tick.
-
-        Set ``ODDS_API_WS_HANDOFF_REST_ODDS=false`` to skip the seed (WS-warm only).
-        One transient (non-429) retry is allowed. A 429 stops immediately —
-        connect WS without lastSeq instead of retry-storming ``/odds/multi``.
+        Set ``ODDS_API_WS_HANDOFF_REST_ODDS=true`` for a single includeSeq seed.
+        Soft-recover / 1013 reconnects and a restarted recv loop must not
+        re-run this. A 429 stops immediately (no retry storm).
         """
-        if not _env_bool("ODDS_API_WS_HANDOFF_REST_ODDS", "true"):
+        if self._rest_handoff_attempted:
+            return
+        self._rest_handoff_attempted = True
+        if not _env_bool("ODDS_API_WS_HANDOFF_REST_ODDS", "false"):
             print(
-                "[ODDS-API WS] REST odds handoff disabled — "
-                "store warms from live book ticks only (ODDS_API_WS_HANDOFF_REST_ODDS=false)"
+                "[ODDS-API WS] REST odds handoff off — "
+                "store warms from live book ticks (ODDS_API_WS_HANDOFF_REST_ODDS=false)"
             )
             return
         if odds_api_rest_429_blocked():
@@ -1284,11 +1283,10 @@ class OddsApiWsFeed:
 
     async def _run_loop(self) -> None:
         await self.maybe_select_books()
-        first = True
         while self._running:
-            if first:
+            # One-shot only. 1013 / soft-recover must not re-blast /odds/multi.
+            if not self._rest_handoff_attempted:
                 await self._handoff_snapshot()
-                first = False
             # One connection per API key. A second process kicking us off looks like 1013.
             async with self._reconnect_lock:
                 if self._reconnecting:

@@ -618,10 +618,40 @@ def test_thin_ws_store_skips_rest_when_backfill_disabled(monkeypatch):
 
 
 
-def test_handoff_runs_rest_odds_by_default(monkeypatch):
-    """REST→WS handoff seeds the store by default (then WS keeps books live)."""
+def test_handoff_rest_odds_off_by_default(monkeypatch):
+    """Paid WS: do not seed via /odds/multi unless explicitly enabled."""
     monkeypatch.setenv("ODDS_API_KEY", "test-not-a-real-key")
     monkeypatch.delenv("ODDS_API_WS_HANDOFF_REST_ODDS", raising=False)
+
+    class SpyRest(_DummyRest):
+        def __init__(self):
+            self.live_calls = 0
+            self.multi_calls = 0
+
+        async def list_live_events(self, *args, **kwargs):
+            self.live_calls += 1
+            raise AssertionError("default handoff must not call /events/live")
+
+        async def get_odds_multi(self, *args, **kwargs):
+            self.multi_calls += 1
+            raise AssertionError("default handoff must not call /odds/multi")
+
+    async def run() -> None:
+        rest = SpyRest()
+        feed = OddsApiWsFeed(rest, api_key="test-not-a-real-key")
+        await feed._handoff_snapshot()
+        await feed._handoff_snapshot()
+        assert rest.live_calls == 0
+        assert rest.multi_calls == 0
+        assert feed._rest_handoff_attempted is True
+
+    asyncio.run(run())
+
+
+def test_handoff_rest_odds_runs_when_explicitly_enabled(monkeypatch):
+    """Opt-in includeSeq seed: one REST snapshot, then WS ticks."""
+    monkeypatch.setenv("ODDS_API_KEY", "test-not-a-real-key")
+    monkeypatch.setenv("ODDS_API_WS_HANDOFF_REST_ODDS", "true")
 
     class SpyRest(_DummyRest):
         def __init__(self):
@@ -651,6 +681,7 @@ def test_handoff_runs_rest_odds_by_default(monkeypatch):
         rest = SpyRest()
         feed = OddsApiWsFeed(rest, api_key="test-not-a-real-key")
         await feed._handoff_snapshot()
+        await feed._handoff_snapshot()
         assert rest.live_calls == 1
         assert rest.multi_calls == 1
         doc = feed.store.merged_doc(1)
@@ -663,7 +694,7 @@ def test_handoff_runs_rest_odds_by_default(monkeypatch):
 def test_handoff_seeds_soonest_pregame_ncaaf(monkeypatch):
     """REST handoff must include pending NCAAF tip-offs, not only /events/live."""
     monkeypatch.setenv("ODDS_API_KEY", "test-not-a-real-key")
-    monkeypatch.delenv("ODDS_API_WS_HANDOFF_REST_ODDS", raising=False)
+    monkeypatch.setenv("ODDS_API_WS_HANDOFF_REST_ODDS", "true")
     monkeypatch.setenv("ODDS_PREGAME_EVENTS_PER_SPORT", "8")
 
     class SpyRest(_DummyRest):
@@ -739,7 +770,7 @@ def test_handoff_seeds_soonest_pregame_ncaaf(monkeypatch):
 
 def test_handoff_retries_after_transient_rest_error(monkeypatch):
     monkeypatch.setenv("ODDS_API_KEY", "test-not-a-real-key")
-    monkeypatch.delenv("ODDS_API_WS_HANDOFF_REST_ODDS", raising=False)
+    monkeypatch.setenv("ODDS_API_WS_HANDOFF_REST_ODDS", "true")
 
     class FlakyRest(_DummyRest):
         def __init__(self):
@@ -785,7 +816,7 @@ def test_handoff_retries_after_transient_rest_error(monkeypatch):
 def test_handoff_does_not_retry_on_429(monkeypatch):
     """A 429 during includeSeq handoff must not re-blast /events/live + /odds/multi."""
     monkeypatch.setenv("ODDS_API_KEY", "test-not-a-real-key")
-    monkeypatch.delenv("ODDS_API_WS_HANDOFF_REST_ODDS", raising=False)
+    monkeypatch.setenv("ODDS_API_WS_HANDOFF_REST_ODDS", "true")
     monkeypatch.setenv("ODDS_API_REST_429_BASE_SEC", "60")
 
     class RateLimitedRest(_DummyRest):
@@ -844,6 +875,61 @@ def test_handoff_can_be_disabled(monkeypatch):
         assert rest.multi_calls == 0
 
     asyncio.run(run())
+
+
+def test_1013_reconnect_does_not_re_handoff(monkeypatch):
+    """Soft-recover / 1013 must not re-blast /events/live + /odds/multi."""
+    monkeypatch.setenv("ODDS_API_KEY", "test-not-a-real-key")
+    monkeypatch.setenv("ODDS_API_WS_HANDOFF_REST_ODDS", "true")
+    monkeypatch.setenv("ODDS_API_WS_RECONNECT_JITTER", "0")
+    monkeypatch.setenv("ODDS_API_WS_1013_BASE_SEC", "8")
+    monkeypatch.setenv("ODDS_API_WS_1013_MAX_SEC", "120")
+
+    class SpyRest(_DummyRest):
+        def __init__(self):
+            self.live_calls = 0
+            self.multi_calls = 0
+            self.last_seq = 9
+
+        async def list_live_events(self, *args, **kwargs):
+            self.live_calls += 1
+            return [{"id": 1, "league": {"slug": "england-premier-league"}}]
+
+        async def get_odds_multi(self, event_ids, bookmakers, **kwargs):
+            self.multi_calls += 1
+            return [
+                {
+                    "id": 1,
+                    "bookmakers": {
+                        "DraftKings": [{"name": "ML", "odds": [{"home": 2.0, "away": 1.8}]}],
+                    },
+                }
+            ]
+
+    delays: list = []
+
+    async def run() -> None:
+        rest = SpyRest()
+        feed = OddsApiWsFeed(
+            rest,
+            api_key="test-not-a-real-key",
+            connect_fn=_Immediate1013Socket,
+        )
+        feed._running = True
+
+        async def fake_sleep(delay):
+            delays.append(float(delay))
+            if len(delays) >= 4:
+                feed._running = False
+
+        monkeypatch.setattr(ows.asyncio, "sleep", fake_sleep)
+        await feed._run_loop()
+        assert rest.live_calls == 1
+        assert rest.multi_calls == 1
+        assert feed._rest_handoff_attempted is True
+
+    asyncio.run(run())
+    assert len(delays) == 4
 
 
 def test_cold_ws_store_does_not_rest_fill_while_healthy(monkeypatch):

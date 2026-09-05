@@ -231,3 +231,70 @@ def test_ws_down_slate_may_use_rest(monkeypatch):
         asyncio.run(run())
     finally:
         _cleanup()
+
+
+def test_default_run_loop_never_calls_rest_odds(monkeypatch):
+    """Default connect/reconnect path: near-zero REST odds (handoff off)."""
+    monkeypatch.setenv("ODDS_API_KEY", "test-not-a-real-key")
+    monkeypatch.setenv("ODDS_API_WS", "true")
+    monkeypatch.delenv("ODDS_API_WS_HANDOFF_REST_ODDS", raising=False)
+    monkeypatch.setenv("ODDS_API_WS_RECONNECT_JITTER", "0")
+    monkeypatch.setenv("ODDS_API_WS_1013_BASE_SEC", "8")
+    monkeypatch.setenv("ODDS_API_WS_1013_MAX_SEC", "120")
+
+    class CountRest(_SpyRest):
+        async def list_live_events(self, sport=None, force_refresh=False):
+            self.live_calls += 1
+            return []
+
+        async def get_odds_multi(self, *args, **kwargs):
+            self.multi_calls += 1
+            return []
+
+        async def get_odds_updated(self, since, bookmaker, sport=None):
+            self.updated_calls += 1
+            return []
+
+    class _Close1013:
+        close_code = 1013
+
+        def __init__(self, url):
+            self.url = url
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+    rest = CountRest()
+    delays: list = []
+
+    async def run() -> None:
+        feed = OddsApiWsFeed(
+            rest,
+            api_key="test-not-a-real-key",
+            connect_fn=_Close1013,
+        )
+        feed._running = True
+
+        async def fake_sleep(delay):
+            delays.append(float(delay))
+            if len(delays) >= 3:
+                feed._running = False
+
+        monkeypatch.setattr(ows.asyncio, "sleep", fake_sleep)
+        await feed._run_loop()
+        assert rest.multi_calls == 0
+        assert rest.updated_calls == 0
+        assert rest.live_calls == 0
+        assert feed._rest_handoff_attempted is True
+
+    asyncio.run(run())
+    assert len(delays) == 3
