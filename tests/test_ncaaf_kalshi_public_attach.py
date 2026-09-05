@@ -225,3 +225,299 @@ def test_cfb_attaches_kxncaaf_and_rejects_nfl_only_catalog():
     href = cfb["bookmakers"]["Kalshi"][0]["odds"][0]["href"]
     assert href.endswith(HOME_TICKER)
     assert is_kalshi_ticker(HOME_TICKER)
+
+
+# --- Busy Saturday: tickerless Odds-API last + alt strikes (Iowa -27.5) ---
+
+IOWA_HOME = "Iowa Hawkeyes"
+NIU_AWAY = "Northern Illinois Huskies"
+IOWA_EID = 260905027
+IOWA_EVENT = "KXNCAAFGAME-26SEP05NIUIOWA"
+IOWA_ML_HOME = "KXNCAAFGAME-26SEP05NIUIOWA-IOWA"
+IOWA_ML_AWAY = "KXNCAAFGAME-26SEP05NIUIOWA-NIU"
+IOWA_SPR_28 = "KXNCAAFSPREAD-26SEP05NIUIOWA-IOWA28"
+IOWA_SPR_27 = "KXNCAAFSPREAD-26SEP05NIUIOWA-IOWA27"
+IOWA_SPR_4 = "KXNCAAFSPREAD-26SEP05NIUIOWA-IOWA4"
+WYO_EVENT = "KXNCAAFGAME-26SEP05WYOCSU"
+WYO_ML_HOME = "KXNCAAFGAME-26SEP05WYOCSU-CSU"
+WYO_ML_AWAY = "KXNCAAFGAME-26SEP05WYOCSU-WYO"
+SEP12_BAMA = "KXNCAAFGAME-26SEP12ALAUG"
+# Saturday 7:30 PM ET 2026-09-05 (23:30 UTC) — 18h-from-midnight-UTC used to reject this.
+SAT_NIGHT_ET = "2026-09-05T23:30:00Z"
+
+
+def _iowa_doc(*, href="", age_sec=8.0, now=None, hdp=-27.5):
+    import time as _time
+
+    now = float(now if now is not None else _time.time())
+    row = {
+        "home": 1.45,
+        "away": 2.80,
+        "hdp": hdp,
+    }
+    if href:
+        row["href"] = href
+    return {
+        "id": IOWA_EID,
+        "home": IOWA_HOME,
+        "away": NIU_AWAY,
+        "sport": {"name": "American Football", "slug": "american-football"},
+        "league": {"name": "USA - College", "slug": "usa-college"},
+        "live": True,
+        "startTime": SAT_NIGHT_ET,
+        "book_updated_at": {"Kalshi": now - float(age_sec), "FanDuel": now - 2.0},
+        "bookmakers": {
+            "Kalshi": [{"name": "Spread", "odds": [row]}],
+            "FanDuel": [{"name": "Spread", "odds": [{"home": 1.50, "away": 2.60, "hdp": hdp}]}],
+            "DraftKings": [{"name": "Spread", "odds": [{"home": 1.52, "away": 2.55, "hdp": hdp}]}],
+            "NoVig": [{"name": "Spread", "odds": [{"home": 1.51, "away": 2.58, "hdp": hdp}]}],
+        },
+    }
+
+
+def _iowa_public_markets():
+    return [
+        {
+            "ticker": IOWA_ML_HOME,
+            "event_ticker": IOWA_EVENT,
+            "series_ticker": "KXNCAAFGAME",
+            "status": "open",
+            "yes_sub_title": "Iowa",
+            "yes_ask_dollars": "0.6900",
+            "no_ask_dollars": "0.3300",
+        },
+        {
+            "ticker": IOWA_ML_AWAY,
+            "event_ticker": IOWA_EVENT,
+            "series_ticker": "KXNCAAFGAME",
+            "status": "open",
+            "yes_sub_title": "Northern Illinois",
+            "yes_ask_dollars": "0.3300",
+            "no_ask_dollars": "0.6900",
+        },
+        {
+            "ticker": IOWA_SPR_28,
+            "event_ticker": "KXNCAAFSPREAD-26SEP05NIUIOWA",
+            "series_ticker": "KXNCAAFSPREAD",
+            "status": "open",
+            "yes_sub_title": "Iowa wins by over 27.5 points",
+            "floor_strike": 27.5,
+            "yes_ask_dollars": "0.5200",
+            "no_ask_dollars": "0.5000",
+        },
+        {
+            "ticker": IOWA_SPR_27,
+            "event_ticker": "KXNCAAFSPREAD-26SEP05NIUIOWA",
+            "series_ticker": "KXNCAAFSPREAD",
+            "status": "open",
+            "yes_sub_title": "Iowa wins by over 26.5 points",
+            "floor_strike": 26.5,
+            "yes_ask_dollars": "0.4800",
+            "no_ask_dollars": "0.5400",
+        },
+        {
+            "ticker": IOWA_SPR_4,
+            "event_ticker": "KXNCAAFSPREAD-26SEP05NIUIOWA",
+            "series_ticker": "KXNCAAFSPREAD",
+            "status": "open",
+            "yes_sub_title": "Iowa wins by over 3.5 points",
+            "floor_strike": 3.5,
+            "yes_ask_dollars": "0.6100",
+            "no_ask_dollars": "0.4100",
+        },
+        {
+            "ticker": WYO_ML_HOME,
+            "event_ticker": WYO_EVENT,
+            "series_ticker": "KXNCAAFGAME",
+            "status": "open",
+            "yes_sub_title": "Colorado St.",
+            "yes_ask_dollars": "0.5500",
+            "no_ask_dollars": "0.4700",
+        },
+        {
+            "ticker": WYO_ML_AWAY,
+            "event_ticker": WYO_EVENT,
+            "series_ticker": "KXNCAAFGAME",
+            "status": "open",
+            "yes_sub_title": "Wyoming",
+            "yes_ask_dollars": "0.4700",
+            "no_ask_dollars": "0.5500",
+        },
+        {
+            "ticker": "KXNCAAFGAME-26SEP12ALAUG-ALA",
+            "event_ticker": SEP12_BAMA,
+            "series_ticker": "KXNCAAFGAME",
+            "status": "open",
+            "yes_sub_title": "Alabama",
+            "yes_ask_dollars": "0.7000",
+            "no_ask_dollars": "0.3200",
+        },
+        {
+            "ticker": "KXNCAAFGAME-26SEP12ALAUG-UGA",
+            "event_ticker": SEP12_BAMA,
+            "series_ticker": "KXNCAAFGAME",
+            "status": "open",
+            "yes_sub_title": "Georgia",
+            "yes_ask_dollars": "0.3200",
+            "no_ask_dollars": "0.7000",
+        },
+    ]
+
+
+def test_tickerless_fresh_odds_api_kalshi_gets_kxncaaf_href():
+    """Desk: fresh Kalshi decimal, href null → paper card. Enrich, don't skip."""
+    import time as _time
+
+    from kalshi_public_feed import kalshi_already_priced, kalshi_doc_has_real_kx
+
+    now = _time.time()
+    doc = _iowa_doc(href="", age_sec=8.0, now=now)
+    assert kalshi_already_priced(doc, now=now) is True
+    assert kalshi_doc_has_real_kx(doc) is False
+    n = attach_public_kalshi_markets({IOWA_EID: doc}, _iowa_public_markets(), now=now)
+    assert n == 1
+    row = doc["bookmakers"]["Kalshi"][0]["odds"][0]
+    assert row["home"] == 1.45
+    assert row["hdp"] == -27.5
+    assert IOWA_SPR_28 in str(row.get("href") or "")
+    assert IOWA_SPR_28 in str(row.get("ticker") or "")
+    assert IOWA_SPR_27 not in str(row.get("href") or "")
+    assert IOWA_SPR_4 not in str(row.get("href") or "")
+    assert is_kalshi_ticker(row["ticker"])
+    assert not is_paper_kalshi_ticker(row["ticker"])
+
+
+def test_wrong_spread_line_is_not_painted():
+    """+3.5 / neighbor 26.5 must not land on a -27.5 row (ceil fail-closed)."""
+    import time as _time
+
+    now = _time.time()
+    doc = _iowa_doc(href="", hdp=-27.5, now=now)
+    only_alts = [
+        m
+        for m in _iowa_public_markets()
+        if m["ticker"] in (IOWA_SPR_27, IOWA_SPR_4, IOWA_ML_HOME, IOWA_ML_AWAY)
+    ]
+    n = attach_public_kalshi_markets({IOWA_EID: doc}, only_alts, now=now)
+    row = doc["bookmakers"]["Kalshi"][0]["odds"][0]
+    href = str(row.get("href") or "")
+    assert IOWA_SPR_27 not in href
+    assert IOWA_SPR_4 not in href
+    assert IOWA_SPR_28 not in href
+    assert row["home"] == 1.45
+    assert n == 0 or not href
+
+
+def test_fresh_odds_api_with_real_kx_keeps_href():
+    import time as _time
+
+    now = _time.time()
+    keep = "KXNCAAFSPREAD-26SEP05NIUIOWA-IOWA28"
+    doc = _iowa_doc(href=f"https://kalshi.com/markets/{keep}", now=now)
+    n = attach_public_kalshi_markets({IOWA_EID: doc}, _iowa_public_markets(), now=now)
+    href = doc["bookmakers"]["Kalshi"][0]["odds"][0]["href"]
+    assert keep in href
+    assert n in (0, 1)
+
+
+def test_state_and_nested_names_do_not_cross_attach():
+    from kalshi_public_feed import match_public_event, _group_events, tokens_match_team
+
+    assert tokens_match_team("Texas Longhorns", "Texas") is True
+    assert tokens_match_team("Texas Longhorns", "Texas St.") is False
+    assert tokens_match_team("Michigan Wolverines", "Michigan") is True
+    assert tokens_match_team("Michigan Wolverines", "Western Michigan") is False
+    assert tokens_match_team("Iowa Hawkeyes", "Iowa") is True
+    assert tokens_match_team("Iowa Hawkeyes", "Colorado St.") is False
+
+    grouped = _group_events(_iowa_public_markets())
+    iowa = _iowa_doc()
+    assert match_public_event(iowa, grouped) == IOWA_EVENT
+    wyo = {
+        "home": "Colorado State Rams",
+        "away": "Wyoming Cowboys",
+        "startTime": SAT_NIGHT_ET,
+    }
+    assert match_public_event(wyo, grouped) == WYO_EVENT
+    next_week = {
+        "home": "Alabama Crimson Tide",
+        "away": "Georgia Bulldogs",
+        "startTime": SAT_NIGHT_ET,
+    }
+    assert match_public_event(next_week, grouped) is None
+
+
+def test_date_only_cfb_suffix_allows_saturday_night_et():
+    from kalshi_public_feed import _timing_ok
+
+    ev = IOWA_EVENT
+    night = {"startTime": SAT_NIGHT_ET}
+    noon = {"startTime": "2026-09-05T16:00:00Z"}
+    next_sat = {"startTime": "2026-09-12T19:00:00Z"}
+    assert _timing_ok(ev, night) is True
+    assert _timing_ok(ev, noon) is True
+    assert _timing_ok(ev, next_sat) is False
+    soccer_clock = "KXLALIGAGAME-26SEP032140CELSOC"
+    too_far = {"startTime": "2026-09-05T21:40:00Z"}
+    assert _timing_ok(soccer_clock, {"startTime": "2026-09-03T21:40:00Z"}) is True
+    assert _timing_ok(soccer_clock, too_far) is False
+
+
+def test_live_scan_copies_enriched_href_as_only_odds_api_ticker_source():
+    """Odds-API ticker path is bookmakerOdds.href only — client/WS never map a ticker field.
+
+    After enrich, scan must copy the painted href so handle_alert can set side.
+    """
+    import time as _time
+    from pathlib import Path
+
+    from odds_ev_monitor import OddsEVMonitor, extract_kalshi_ticker_from_href
+
+    root = Path(__file__).resolve().parents[1]
+    for name in ("odds_api_client.py", "odds_api_ws.py"):
+        text = (root / name).read_text(encoding="utf-8")
+        assert "href" not in text.lower()
+
+    now = _time.time()
+    doc = _iowa_doc(href="", now=now)
+    assert attach_public_kalshi_markets({IOWA_EID: doc}, _iowa_public_markets(), now=now) == 1
+    mon = OddsEVMonitor(auth_token=None)
+    mon.set_filter(
+        {
+            "betTypes": ["GAMELINES"],
+            "minRoi": 0,
+            "devigFilter": {
+                "sharps": ["FanDuel", "DraftKings", "NoVig"],
+                "method": "POWER",
+                "type": "AVERAGE",
+                "minEv": 0,
+                "minSharpBooks": 3,
+            },
+        }
+    )
+    rows = mon.live_scan_value_bets_from_docs({IOWA_EID: doc})
+    spr = [
+        r
+        for r in rows
+        if str(r.get("_scan_mname") or "").lower() == "spread"
+        and str(r.get("_take_only") or "").lower() == "kalshi"
+    ]
+    assert spr
+    href = (spr[0].get("bookmakerOdds") or {}).get("href") or ""
+    assert extract_kalshi_ticker_from_href(href) == IOWA_SPR_28
+
+
+def test_empty_public_fetch_keeps_last_good_cache():
+    from kalshi_public_feed import _cache, commit_fetched_markets
+
+    prev = dict(_cache)
+    try:
+        _cache.clear()
+        _cache.update({"ts": 1.0, "key": "", "markets": []})
+        first = commit_fetched_markets("KXNCAAFGAME", [{"ticker": IOWA_ML_HOME}])
+        assert first and first[0]["ticker"] == IOWA_ML_HOME
+        kept = commit_fetched_markets("KXNCAAFGAME", [])
+        assert kept and kept[0]["ticker"] == IOWA_ML_HOME
+    finally:
+        _cache.clear()
+        _cache.update(prev)

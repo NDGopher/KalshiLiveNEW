@@ -233,9 +233,13 @@ def test_public_ml_row_includes_draw_and_keeps_priced_odds_api():
 
     priced = _lille_doc()
     assert kalshi_already_priced(priced) is True
+    assert not (priced["bookmakers"]["Kalshi"][0]["odds"][0].get("href") or "")
     n = attach_public_kalshi_markets({LILLE_EID: priced}, [home_m, away_m, draw_m])
-    assert n == 0
-    assert priced["bookmakers"]["Kalshi"][0]["odds"][0]["draw"] == KALSHI_DRAW
+    assert n == 1
+    row = priced["bookmakers"]["Kalshi"][0]["odds"][0]
+    assert row["draw"] == KALSHI_DRAW
+    assert row.get("draw_ticker")
+    assert "KX" in str(row.get("draw_href") or row.get("href") or "")
 
     missing = _lille_doc()
     del missing["bookmakers"]["Kalshi"]
