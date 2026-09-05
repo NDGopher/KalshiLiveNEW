@@ -185,6 +185,21 @@ def kalshi_line_int(line: Any) -> Optional[int]:
         return None
 
 
+def kalshi_suffix_to_floor_strike(line_int: Any) -> Optional[float]:
+    """Inverse of ``kalshi_line_int`` for X.5 sports contracts.
+
+    Ticker suffix 39 → ``floor_strike`` 38.5 (title "Over 38.5").
+    Never ``suffix + 0.5`` — that invents the neighbor strike.
+    """
+    try:
+        n = int(line_int)
+    except (TypeError, ValueError):
+        return None
+    if n <= 0:
+        return None
+    return float(n) - 0.5
+
+
 def market_floor_strike_matches_alert(
     market: Any,
     line: Any = None,

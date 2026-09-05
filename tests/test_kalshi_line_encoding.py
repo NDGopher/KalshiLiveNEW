@@ -21,6 +21,7 @@ from execution_guard import (
     expected_side_for_alert,
     href_ticker_agrees_with_alert,
     kalshi_line_int,
+    kalshi_suffix_to_floor_strike,
     market_floor_strike_matches_alert,
     prepare_executable_order,
     ticker_line_matches_alert,
@@ -56,9 +57,32 @@ def test_ceil_suffix_matches_live_kalshi_titles():
     for line, suffix, floor, _title in LIVE_TOTAL_PAIRS:
         assert kalshi_line_int(line) == suffix
         assert kalshi_line_int(-line) == suffix
+        assert kalshi_suffix_to_floor_strike(suffix) == floor
         assert market_floor_strike_matches_alert({"floor_strike": floor}, line) is True
         if abs(line - 59.5) < 1e-9:
             assert market_floor_strike_matches_alert({"floor_strike": 58.5}, line) is False
+
+
+def test_public_feed_floor_strike_uses_ceil_inverse_not_suffix_plus_half():
+    """Attach totals must not invent 39.5 from ticker …-39 (that is the neighbor)."""
+    from kalshi_public_feed import _floor_strike, _total_row
+
+    api = {"ticker": DUQ_TOTAL_39, "floor_strike": 38.5, "title": "Over 38.5 points scored"}
+    assert _floor_strike(api) == 38.5
+    fallback = {"ticker": DUQ_TOTAL_39, "title": "Over 38.5 points scored"}
+    assert _floor_strike(fallback) == 38.5
+    assert _floor_strike(fallback) != 39.5
+    neighbor = {"ticker": BALL_TOTAL_59}
+    assert _floor_strike(neighbor) == 58.5
+    row = _total_row({
+        "ticker": DUQ_TOTAL_39,
+        "floor_strike": 38.5,
+        "yes_ask_dollars": "0.4800",
+        "no_ask_dollars": "0.5400",
+    })
+    assert row is not None
+    assert row["line"] == 38.5
+    assert row["ticker"] == DUQ_TOTAL_39
 
 
 def test_floor_int_abs_is_the_neighbor_not_the_contract():
@@ -217,3 +241,7 @@ def test_auto_bet_default_off_and_autobet_allow_terminal_skip():
     src_guard = (Path(__file__).resolve().parents[1] / "execution_guard.py").read_text(encoding="utf-8")
     assert "ceil(|line|)" in src_guard or "ceil(abs" in src_guard
     assert "int(abs(float(line)))" not in src_guard
+    pub = (Path(__file__).resolve().parents[1] / "kalshi_public_feed.py").read_text(encoding="utf-8")
+    assert "float(n) + 0.5" not in pub
+    assert "kalshi_suffix_to_floor_strike" in pub
+    assert "[KALSHI PUBLIC] series=" in pub

@@ -19,7 +19,7 @@ from collections import defaultdict
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 from ev_calculator import LIVE_REC_POWER_MAX_AGE_SEC, LIVE_TAKE_MAX_AGE_SEC
-from execution_guard import event_ticker_from_any
+from execution_guard import event_ticker_from_any, kalshi_suffix_to_floor_strike
 from plive_pandora import _norm_team, _team_identity_tokens, odds_event_start_unix
 
 KALSHI_BASE = "https://api.elections.kalshi.com"
@@ -423,8 +423,8 @@ def _floor_strike(market: Dict[str, Any]) -> Optional[float]:
         m = re.search(r"(\d+)$", parts[-1])
         if m:
             n = int(m.group(1))
-            # Kalshi totals are halves only (2 → 2.5). Never invent 1.75 / 1.25.
-            return float(n) + 0.5
+            # Ceil suffix: …-39 → Over 38.5. Never suffix+0.5 (that is the neighbor).
+            return kalshi_suffix_to_floor_strike(n)
     return None
 
 
@@ -1161,6 +1161,7 @@ async def attach_public_kalshi_to_docs(
     markets: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> int:
     """Attach public Kalshi take lines. Fetches when ``markets`` is omitted."""
+    n_series = 0
     if markets is None:
         soccer_docs = [d for d in _as_docs(docs) if sport_key_for_doc(d) == "soccer"]
         if soccer_docs and not (_soccer_series_cache.get("series")):
@@ -1169,7 +1170,12 @@ async def attach_public_kalshi_to_docs(
             except Exception as ex:
                 print(f"[KALSHI PUBLIC] soccer series catalog failed: {ex}")
         series = series_for_docs(docs)
+        n_series = len(series)
         if not series:
+            print(
+                f"[KALSHI PUBLIC] series=0 markets=0 docs={len(_as_docs(docs))} "
+                f"attached=0 yes_ask_refresh=0 (no series for slate)"
+            )
             return 0
         try:
             markets = await fetch_open_series_markets(series)
@@ -1178,6 +1184,10 @@ async def attach_public_kalshi_to_docs(
             return 0
     n = attach_public_kalshi_markets(docs, markets)
     n_ask = apply_public_yes_asks(docs, markets)
+    print(
+        f"[KALSHI PUBLIC] series={n_series} markets={len(markets or [])} "
+        f"docs={len(_as_docs(docs))} attached={n} yes_ask_refresh={n_ask}"
+    )
     if n or n_ask:
         print(
             f"[PIPELINE] Public Kalshi: attached take lines to {n} event(s) "
