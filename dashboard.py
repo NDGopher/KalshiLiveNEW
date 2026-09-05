@@ -5143,24 +5143,21 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
     
     import time
 
-    strict_ok = True
-    if alert is not None:
-        strict_ok = getattr(alert, 'strict_pass', True)
-    elif isinstance(alert_data, dict):
-        strict_ok = alert_data.get('strict_pass', True)
-    if strict_ok is False:
-        return
-    autobet_ok = False
-    if alert is not None:
-        autobet_ok = bool(getattr(alert, "autobet_allow", False))
-    elif isinstance(alert_data, dict):
-        autobet_ok = bool(alert_data.get("autobet_allow", False))
-    if not autobet_ok:
-        # Product lock: only Royals-like Kalshi-best / ≥5 same-sign / two-way few-percent.
-        return
-    
-    # CRITICAL: Check EV threshold FIRST before any processing/logging to avoid wasting time on low-EV alerts
-    # Get filter-specific EV threshold
+    auto_bet_outcome = {"kind": None}  # fill | skip | fail — finally records if still None
+    alert_data = alert_data if isinstance(alert_data, dict) else {}
+
+    _real_store_failed_auto_bet = store_failed_auto_bet
+    _real_store_successful_auto_bet = store_successful_auto_bet
+
+    def store_failed_auto_bet(*args, **kwargs):
+        if auto_bet_outcome["kind"] is None:
+            auto_bet_outcome["kind"] = "fail"
+        return _real_store_failed_auto_bet(*args, **kwargs)
+
+    def store_successful_auto_bet(*args, **kwargs):
+        auto_bet_outcome["kind"] = "fill"
+        return _real_store_successful_auto_bet(*args, **kwargs)
+
     alert_filter_name = getattr(alert, 'filter_name', None) or alert_data.get('filter_name')
     if alert_filter_name and alert_filter_name in auto_bet_settings_by_filter:
         current_ev_min = auto_bet_settings_by_filter[alert_filter_name].get('ev_min', auto_bet_ev_min)
@@ -5168,62 +5165,30 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
     else:
         current_ev_min = auto_bet_ev_min
         current_ev_max = auto_bet_ev_max
-    
+
     ev_percent = alert.ev_percent if alert else alert_data.get('ev_percent', 0)
-    
-    # FAST EV CHECK - Do this FIRST before any processing
-    # Get ticker and side from alert_data for logging (may be None if not matched yet)
     ticker = alert_data.get('ticker')
     side = alert_data.get('side')
-    
-    if ev_percent < current_ev_min:
-        # EV too low - skip immediately without any processing
-        # BUT: Log high-EV alerts (>= 10%) that are being skipped due to EV threshold
-        if ev_percent >= 10.0:
-            store_failed_auto_bet(
-                alert_id=alert_id,
-                alert=alert,
-                alert_data=alert_data,
-                error=f"EV {ev_percent:.2f}% below filter minimum {current_ev_min}%",
-                reason=f"Alert has {ev_percent:.2f}% EV but below filter minimum threshold {current_ev_min}%",
-                ticker=ticker,
-                side=side,
-                ev_percent=ev_percent,
-                odds=alert_data.get('american_odds'),
-                filter_name=alert_filter_name
-            )
-        return
-    if ev_percent > current_ev_max:
-        # EV too high - skip immediately without any processing
-        # BUT: Log high-EV alerts that are being skipped due to EV max
-        if ev_percent >= 10.0:
-            store_failed_auto_bet(
-                alert_id=alert_id,
-                alert=alert,
-                alert_data=alert_data,
-                error=f"EV {ev_percent:.2f}% above filter maximum {current_ev_max}%",
-                reason=f"Alert has {ev_percent:.2f}% EV but above filter maximum threshold {current_ev_max}%",
-                ticker=ticker,
-                side=side,
-                ev_percent=ev_percent,
-                odds=alert_data.get('american_odds'),
-                filter_name=alert_filter_name
-            )
-        return
-    
-    # EV passed - now start trade lifecycle tracking
-    trade_start_time = time.time()  # Track entire trade lifecycle timing
-    
-    # CRITICAL: Determine submarket_key early so we can clean it up on early returns
-    submarket_key = None
-    ticker = alert_data.get('ticker')
-    side = alert_data.get('side')
-    if ticker and side:
-        submarket_key = (ticker.upper(), side.lower())
-    
-    # CRITICAL: Initialize lock timing variables at function start (for successful bet logging)
-    lock_held_start = None  # Will be set when lock is acquired
-    
+    submarket_key = (ticker.upper(), side.lower()) if ticker and side else None
+    lock_held_start = None
+    trade_start_time = time.time()
+
+    def _terminal_skip(error, reason=None):
+        auto_bet_outcome["kind"] = auto_bet_outcome["kind"] or "skip"
+        print(f"[AUTO-BET] TERMINAL skip: alert={alert_id} {error}")
+        store_failed_auto_bet(
+            alert_id=alert_id,
+            alert=alert,
+            alert_data=alert_data,
+            error=error,
+            reason=reason or error,
+            ticker=ticker,
+            side=side,
+            ev_percent=ev_percent,
+            odds=alert_data.get('american_odds'),
+            filter_name=alert_filter_name,
+        )
+
     # Helper function to clean up submarket (used on early returns and in finally)
     async def cleanup_submarket():
         """Clean up submarket tracking - CRITICAL: Must not acquire lock if already held (deadlock prevention)"""
@@ -5263,47 +5228,64 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
                 if alert_id_to_remove:
                     auto_bet_processing_alert_ids.discard(alert_id_to_remove)
     
-    # CRITICAL: Check EV threshold FIRST before any processing/logging to avoid wasting time on low-EV alerts
-    # Get filter-specific EV threshold
-    alert_filter_name = getattr(alert, 'filter_name', None) or alert_data.get('filter_name')
-    if alert_filter_name and alert_filter_name in auto_bet_settings_by_filter:
-        current_ev_min = auto_bet_settings_by_filter[alert_filter_name].get('ev_min', auto_bet_ev_min)
-        current_ev_max = auto_bet_settings_by_filter[alert_filter_name].get('ev_max', auto_bet_ev_max)
-    else:
-        current_ev_min = auto_bet_ev_min
-        current_ev_max = auto_bet_ev_max
-    
-    ev_percent = alert.ev_percent if alert else alert_data.get('ev_percent', 0)
-    
-    # FAST EV CHECK - Do this FIRST before any processing
-    if ev_percent < current_ev_min or ev_percent > current_ev_max:
-        # EV out of range - skip immediately without any processing
-        return
-    
-    # EV passed - now start trade lifecycle tracking and logging
     ev_pct = ev_percent
     teams = alert.teams if alert else alert_data.get('teams', 'N/A')
     pick = alert.pick if alert else alert_data.get('pick', 'N/A')
-    
-    print(f"[AUTO-BET] ========== TRADE LIFECYCLE START ==========")
-    print(f"[AUTO-BET] Alert ID: {alert_id}")
-    print(f"[AUTO-BET] Market: {teams} - {pick}")
-    print(f"[AUTO-BET] EV: {ev_pct:.2f}%")
-    print(f"[AUTO-BET] Filter: {alert_filter_name or 'N/A'}")
-    print(f"[AUTO-BET] Ticker: {ticker}, Side: {side}")
-    print(f"[AUTO-BET] Expected Price: {alert_data.get('price_cents', 'N/A')}¢")
-    print(f"[AUTO-BET] Start Time: {format_hms_us(trade_start_time)}")
-    print(f"[AUTO-BET] =========================================")
-    
-    # Wrap main logic in try-except-finally for error handling
+
+    # Wrap gates + main logic so every path hits except/finally terminal logging.
     try:
+        strict_ok = True
+        if alert is not None:
+            strict_ok = getattr(alert, 'strict_pass', True)
+        else:
+            strict_ok = alert_data.get('strict_pass', True)
+        if strict_ok is False:
+            _terminal_skip("strict_pass=False", "Alert failed strict_pass gate")
+            return
+
+        autobet_ok = False
+        if alert is not None:
+            autobet_ok = bool(getattr(alert, "autobet_allow", False))
+        else:
+            autobet_ok = bool(alert_data.get("autobet_allow", False))
+        if not autobet_ok:
+            # Product lock: only Royals-like Kalshi-best / ≥5 same-sign / two-way few-percent.
+            _terminal_skip(
+                "autobet_allow=False",
+                "Product-shape autobet_allow is False (fail-closed; switch ON does not override)",
+            )
+            return
+
+        if ev_percent < current_ev_min:
+            _terminal_skip(
+                f"EV {ev_percent:.2f}% below filter minimum {current_ev_min}%",
+                f"Alert has {ev_percent:.2f}% EV but below filter minimum threshold {current_ev_min}%",
+            )
+            return
+        if ev_percent > current_ev_max:
+            _terminal_skip(
+                f"EV {ev_percent:.2f}% above filter maximum {current_ev_max}%",
+                f"Alert has {ev_percent:.2f}% EV but above filter maximum threshold {current_ev_max}%",
+            )
+            return
+
+        print(f"[AUTO-BET] ========== TRADE LIFECYCLE START ==========")
+        print(f"[AUTO-BET] Alert ID: {alert_id}")
+        print(f"[AUTO-BET] Market: {teams} - {pick}")
+        print(f"[AUTO-BET] EV: {ev_pct:.2f}%")
+        print(f"[AUTO-BET] Filter: {alert_filter_name or 'N/A'}")
+        print(f"[AUTO-BET] Ticker: {ticker}, Side: {side}")
+        print(f"[AUTO-BET] Expected Price: {alert_data.get('price_cents', 'N/A')}¢")
+        print(f"[AUTO-BET] Start Time: {format_hms_us(trade_start_time)}")
+        print(f"[AUTO-BET] =========================================")
+
         if not auto_bet_enabled:
             print(f"[AUTO-BET] SKIP: Alert {alert_id} - Auto-bet disabled")
-            await cleanup_submarket()
+            _terminal_skip("Auto-bet disabled", "Dashboard auto-bet switch is OFF")
             return
         if str(alert_data.get("take_book") or getattr(alert, "take_book", "") or "").lower() == "plive":
             print(f"[AUTO-BET] SKIP: Alert {alert_id} - PLive take does not auto-bet on Kalshi")
-            await cleanup_submarket()
+            _terminal_skip("PLive take does not auto-bet on Kalshi", "PLive cards never place Kalshi orders")
             return
         
         # NOTE: positions_loaded check removed - we can proceed even if positions aren't loaded yet
@@ -5506,6 +5488,7 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
         # CRITICAL: Acquire lock BEFORE any checks to ensure atomicity
         if not auto_bet_lock:
             print(f"[AUTO-BET] SKIP: Alert {alert_id} - Auto-bet lock not initialized")
+            _terminal_skip("Auto-bet lock not initialized", "auto_bet_lock is None")
             await cleanup_submarket()
             return
             
@@ -5541,6 +5524,10 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
             else:
                 print(f"[AUTO-BET]   ⚠️  Lock holder tracking: holder={auto_bet_lock_holder}, acquired_at={auto_bet_lock_acquired_at}")
             
+            _terminal_skip(
+                "Lock acquisition timeout (5s)",
+                f"Alert waited {lock_acquisition_time:.1f}ms for auto_bet_lock",
+            )
             await cleanup_submarket()
             return
         
@@ -5591,6 +5578,18 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
                         if event_base:
                             current_total = auto_bet_event_totals.get(event_base, 0.0)
                             auto_bet_event_totals[event_base] = max(0.0, current_total - bet_amount)
+                    store_failed_auto_bet(
+                        alert_id=alert_id,
+                        alert=alert,
+                        alert_data=alert_data,
+                        error="Lock watchdog timeout (2s) - task cancelled and lock force-released",
+                        reason=f"Alert has {ev_percent:.2f}% EV but check_and_auto_bet held the lock >2s",
+                        ticker=ticker,
+                        side=side,
+                        ev_percent=ev_percent,
+                        odds=alert_data.get('american_odds'),
+                        filter_name=alert_filter_name,
+                    )
                 except Exception as e:
                     print(f"[AUTO-BET] 🚨🚨🚨 ERROR in watchdog: {e}")
                     import traceback
@@ -5983,6 +5982,7 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
                 decision_path_so_far['final_decision'] = 'SKIPPED'
                 decision_path_so_far['skip_reason'] = reason
                 log_alert_passed_threshold(alert_id, alert, alert_data, filter_settings_dict, decision_path_so_far)
+                _terminal_skip(str(reason), f"Reverse-middle skip: {reason}")
                 # Clean up (lock already released, but clean up sets)
                 auto_bet_processing_submarkets.discard(submarket_key)
                 auto_bet_submarket_to_alert_id.pop(submarket_key, None)
@@ -7421,6 +7421,18 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
                     auto_bet_processing_submarkets.discard(submarket_key)
                     auto_bet_submarket_to_alert_id.pop(submarket_key, None)
                     auto_bet_submarket_tasks.pop(submarket_key, None)
+                    store_failed_auto_bet(
+                        alert_id=alert_id,
+                        alert=alert,
+                        alert_data=alert_data,
+                        error=f"Order {order_id} fill_count=0",
+                        reason="Order accepted but filled 0 contracts",
+                        ticker=ticker,
+                        side=side,
+                        ev_percent=ev_percent,
+                        odds=alert_data.get('american_odds'),
+                        filter_name=alert_filter_name,
+                    )
                     return
                 
                 print(f"[AUTO-BET] ✅ Order {order_id} filled {fill_count} contracts, proceeding to emit notification")
@@ -7830,6 +7842,22 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
                     'market': f"{alert.teams} - {alert.pick}"
                 })
         
+        except asyncio.CancelledError:
+            print(f"[AUTO-BET] TERMINAL fail: alert={alert_id} task cancelled")
+            if auto_bet_outcome["kind"] is None:
+                store_failed_auto_bet(
+                    alert_id=alert_id,
+                    alert=alert,
+                    alert_data=alert_data,
+                    error="Task cancelled",
+                    reason="check_and_auto_bet was cancelled (watchdog or shutdown) before a fill/skip/fail record",
+                    ticker=ticker,
+                    side=side,
+                    ev_percent=ev_percent,
+                    odds=alert_data.get('american_odds'),
+                    filter_name=alert_filter_name,
+                )
+            raise
         except Exception as e:
             print(f"[AUTO-BET] ERROR: Exception during auto-bet: {e}")
             import traceback
@@ -7921,6 +7949,41 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
                         print(f"[AUTO-BET] [CHECK_AND_AUTO_BET] [LOCK] Alert {alert_id} - lock was not locked in finally block (already released?)")
     
     finally:
+        # CRITICAL: Always emit a terminal outcome so silent drops are impossible
+        if auto_bet_outcome["kind"] is None:
+            print(f"[AUTO-BET] TERMINAL fail: alert={alert_id} ended without fill/skip/fail record")
+            try:
+                store_failed_auto_bet(
+                    alert_id=alert_id,
+                    alert=alert,
+                    alert_data=alert_data,
+                    error="Task ended without terminal outcome",
+                    reason="check_and_auto_bet returned without fill, skip, or fail — silent drop",
+                    ticker=ticker,
+                    side=side,
+                    ev_percent=ev_percent,
+                    odds=alert_data.get('american_odds'),
+                    filter_name=alert_filter_name,
+                )
+            except Exception as terminal_exc:
+                print(f"[AUTO-BET] TERMINAL log failed: {terminal_exc}")
+        else:
+            print(f"[AUTO-BET] TERMINAL {auto_bet_outcome['kind']}: alert={alert_id}")
+
+        try:
+            if 'lock_watchdog_task' in locals() and lock_watchdog_task and not lock_watchdog_task.done():
+                lock_watchdog_task.cancel()
+        except Exception:
+            pass
+        try:
+            if auto_bet_lock and auto_bet_lock.locked() and auto_bet_lock_holder == f"Alert {alert_id} ({submarket_key})":
+                auto_bet_lock.release()
+                auto_bet_lock_holder = None
+                auto_bet_lock_acquired_at = None
+                print(f"[AUTO-BET] [CHECK_AND_AUTO_BET] [LOCK] Alert {alert_id} released lock in outer finally")
+        except Exception as lock_exc:
+            print(f"[AUTO-BET] [CHECK_AND_AUTO_BET] [LOCK] outer-finally release error: {lock_exc}")
+
         # CRITICAL: Always clean up alert_id from processing set when done
         try:
             if alert_id in auto_bet_processing_alert_ids:
