@@ -683,6 +683,51 @@ def test_handoff_seeds_soonest_pregame_ncaaf(monkeypatch):
     asyncio.run(run())
 
 
+def test_handoff_retries_after_transient_rest_error(monkeypatch):
+    monkeypatch.setenv("ODDS_API_KEY", "test-not-a-real-key")
+    monkeypatch.delenv("ODDS_API_WS_HANDOFF_REST_ODDS", raising=False)
+
+    class FlakyRest(_DummyRest):
+        def __init__(self):
+            self.live_calls = 0
+            self.last_seq = 3
+
+        async def list_live_events(self, *args, **kwargs):
+            self.live_calls += 1
+            if self.live_calls < 2:
+                raise RuntimeError("ssl boom")
+            return [
+                {
+                    "id": 1,
+                    "sport": {"slug": "football"},
+                    "league": {"slug": "england-premier-league"},
+                }
+            ]
+
+        async def get_odds_multi(self, event_ids, bookmakers, **kwargs):
+            return [
+                {
+                    "id": 1,
+                    "bookmakers": {
+                        "DraftKings": [{"name": "ML", "odds": [{"home": 2.0, "away": 1.8}]}],
+                    },
+                }
+            ]
+
+    async def run() -> None:
+        rest = FlakyRest()
+        feed = OddsApiWsFeed(rest, api_key="test-not-a-real-key")
+        await feed._handoff_snapshot()
+        assert rest.live_calls == 2
+        assert "DraftKings" in (feed.store.merged_doc(1).get("bookmakers") or {})
+
+    async def _fast_sleep(_s):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", _fast_sleep)
+    asyncio.run(run())
+
+
 def test_handoff_can_be_disabled(monkeypatch):
     monkeypatch.setenv("ODDS_API_KEY", "test-not-a-real-key")
     monkeypatch.setenv("ODDS_API_WS_HANDOFF_REST_ODDS", "false")
