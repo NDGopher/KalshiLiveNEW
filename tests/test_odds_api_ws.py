@@ -943,13 +943,20 @@ def test_sport_name_for_odds_updated_maps_slug_and_object():
     assert odds_updated_sport_names(["baseball", "Baseball", "soccer"]) == ["Baseball", "Football"]
 
 
-def test_prioritize_live_events_promotes_epl_over_fa_cup_flood():
+def test_prioritize_live_events_promotes_epl_over_fa_cup_flood(monkeypatch):
     from odds_api_client import prioritize_live_events_for_scan
 
+    monkeypatch.setenv("ODDS_LIVE_SCAN_MAJORS_ONLY", "true")
     # Mimic /events/live: FA Cup / amateur flood first, EPL buried past scan max.
     events = []
     for i in range(100):
-        events.append({"id": 1000 + i, "league": {"slug": "fa-cup" if i % 2 == 0 else "amateur-foo"}})
+        events.append(
+            {
+                "id": 1000 + i,
+                "sport": {"slug": "football"},
+                "league": {"slug": "fa-cup" if i % 2 == 0 else "amateur-foo"},
+            }
+        )
     for i, slug in enumerate(
         [
             "england-premier-league",
@@ -959,13 +966,17 @@ def test_prioritize_live_events_promotes_epl_over_fa_cup_flood():
             "germany-bundesliga",
         ]
     ):
-        events.append({"id": 2000 + i, "league": {"slug": slug}})
+        sport = "baseball" if slug == "usa-mlb" else "football"
+        events.append({"id": 2000 + i, "sport": {"slug": sport}, "league": {"slug": slug}})
 
     raw_top = [e["league"]["slug"] for e in events[:80]]
     assert "england-premier-league" not in raw_top
 
     picked = prioritize_live_events_for_scan(events, 80)
     slugs = [e["league"]["slug"] for e in picked]
+    # Majors-only: FA Cup / amateur must not pad the window.
+    assert "fa-cup" not in slugs
+    assert "amateur-foo" not in slugs
     assert slugs.count("england-premier-league") == 2
     assert "spain-laliga" in slugs
     assert "usa-mlb" in slugs
@@ -975,6 +986,52 @@ def test_prioritize_live_events_promotes_epl_over_fa_cup_flood():
         "usa-mlb",
         "germany-bundesliga",
     }
+
+
+def test_prioritize_majors_only_keeps_all_ncaaf_drops_bahrain(monkeypatch):
+    from odds_api_client import prioritize_live_events_for_scan
+
+    monkeypatch.setenv("ODDS_LIVE_SCAN_MAJORS_ONLY", "true")
+    events = [
+        {"id": 1, "sport": {"slug": "football"}, "league": {"slug": "bahrain-premier-league"}},
+        {"id": 2, "sport": {"slug": "football"}, "league": {"slug": "angola-girabola"}},
+        {"id": 3, "sport": {"slug": "american-football"}, "league": {"slug": "usa-college"}},
+        {"id": 4, "sport": {"slug": "american-football"}, "league": {"slug": "usa-college"}},
+        {"id": 5, "sport": {"slug": "football"}, "league": {"slug": "france-ligue-1"}},
+        {"id": 6, "sport": {"slug": "cycling"}, "league": {"slug": "cycling-tour-of-britain-stage-4"}},
+    ]
+    picked = prioritize_live_events_for_scan(events, 80)
+    slugs = [e["league"]["slug"] for e in picked]
+    assert slugs.count("usa-college") == 2
+    assert "france-ligue-1" in slugs
+    assert "bahrain-premier-league" not in slugs
+    assert "angola-girabola" not in slugs
+    assert "cycling-tour-of-britain-stage-4" not in slugs
+    assert len(picked) == 3
+
+
+
+def test_prioritize_majors_keeps_ncaab_nhl_drops_minor_soccer(monkeypatch):
+    from odds_api_client import prioritize_live_events_for_scan
+
+    monkeypatch.setenv("ODDS_LIVE_SCAN_MAJORS_ONLY", "true")
+    events = [
+        {"id": 1, "sport": {"slug": "football"}, "league": {"slug": "bahrain-premier-league"}},
+        {"id": 2, "sport": {"slug": "basketball"}, "league": {"slug": "usa-ncaa-basketball"}},
+        {"id": 3, "sport": {"slug": "ice-hockey"}, "league": {"slug": "usa-nhl"}},
+        {"id": 4, "sport": {"slug": "basketball"}, "league": {"slug": "usa-nba"}},
+        {"id": 5, "sport": {"slug": "american-football"}, "league": {"slug": "usa-college"}},
+        {"id": 6, "sport": {"slug": "football"}, "league": {"slug": "england-premier-league"}},
+    ]
+    picked = prioritize_live_events_for_scan(events, 80)
+    slugs = [e["league"]["slug"] for e in picked]
+    assert "usa-ncaa-basketball" in slugs
+    assert "usa-nhl" in slugs
+    assert "usa-nba" in slugs
+    assert "usa-college" in slugs
+    assert "england-premier-league" in slugs
+    assert "bahrain-premier-league" not in slugs
+    assert len(picked) == 5
 
 
 def test_rest_updated_fallback_requires_sport_display_name(monkeypatch):

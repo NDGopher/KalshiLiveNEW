@@ -366,6 +366,11 @@ _PRIORITY_LIVE_LEAGUE_SLUGS: frozenset = frozenset(
         "germany-bundesliga",
         "italy-serie-a",
         "france-ligue-1",
+        "portugal-primeira-liga",
+        "netherlands-eredivisie",
+        "mexico-liga-mx",
+        "brazil-serie-a",
+        "argentina-liga-profesional",
         "usa-mlb",
         "usa-nba",
         "usa-nfl",
@@ -373,6 +378,11 @@ _PRIORITY_LIVE_LEAGUE_SLUGS: frozenset = frozenset(
         "usa-mls",
         "usa-college",  # NCAAF / college football on Odds-API
         "usa-ncaaf",
+        "usa-ncaa",
+        "usa-ncaab",
+        "usa-ncaa-basketball",
+        "usa-college-basketball",
+        "usa-ncaa-football",
         "uefa-champions-league",
         "uefa-europa-league",
         "uefa-europa-conference-league",
@@ -389,6 +399,7 @@ _PRIORITY_LIVE_SPORT_SLUGS: frozenset = frozenset(
         "ice-hockey",
     }
 )
+# Lower-league / cup / youth floods — and thin markets that never clear minSharp.
 _DEPRIORITIZE_LEAGUE_TOKENS: Tuple[str, ...] = (
     "amateur",
     "primavera",
@@ -404,6 +415,29 @@ _DEPRIORITIZE_LEAGUE_TOKENS: Tuple[str, ...] = (
     "fa-cup",  # huge flood; still soccer but not EPL
     "championship-round",
     "qualification",
+    "girabola",
+    "angola",
+    "bahrain",
+    "botswana",
+    "armenia",
+    "azerbaijan",
+    "malta",
+    "ghana",
+    "nigeria",
+    "kuwait",
+    "divize",
+    "kolmonen",
+    "druga-nl",
+    "nb-iii",
+    "ofb-cup",
+    "club-friendlies",
+    "friendlies",
+    "tercer",
+    "regionalliga",
+    "oberliga",
+    "3-liga",
+    "ii-liga",
+    "iii-liga",
 )
 
 
@@ -423,6 +457,29 @@ def live_event_sport_slug(ev: Dict[str, Any]) -> str:
     return ""
 
 
+def is_major_scan_event(ev: Dict[str, Any]) -> bool:
+    """True for board-priority events: must-cover majors, never minor soccer.
+
+    Musts: NCAAF/NFL (all american-football), NBA/NCAAB, NHL, MLB, MLS, top soccer.
+    Minor soccer / cups stay out unless listed in ``_PRIORITY_LIVE_LEAGUE_SLUGS``.
+    """
+    slug = live_event_league_slug(ev)
+    sport = live_event_sport_slug(ev)
+    if slug in _PRIORITY_LIVE_LEAGUE_SLUGS:
+        return True
+    # Every live american-football game (NCAAF/NFL) belongs on the board.
+    if sport == "american-football":
+        return True
+    # US basketball + NHL: league slug variants differ across Odds-API feeds.
+    if sport == "basketball" and any(
+        tok in slug for tok in ("nba", "ncaa", "college", "ncaab")
+    ):
+        return True
+    if sport == "ice-hockey" and ("nhl" in slug or slug.startswith("usa-")):
+        return True
+    return False
+
+
 def live_event_scan_rank(ev: Dict[str, Any]) -> Tuple[int, int, int, str]:
     """Sort key for live scan / WS handoff (lower = earlier).
 
@@ -434,7 +491,7 @@ def live_event_scan_rank(ev: Dict[str, Any]) -> Tuple[int, int, int, str]:
     slug = live_event_league_slug(ev)
     sport = live_event_sport_slug(ev)
     demote = 1 if any(tok in slug for tok in _DEPRIORITIZE_LEAGUE_TOKENS) else 0
-    major = 0 if slug in _PRIORITY_LIVE_LEAGUE_SLUGS else 1
+    major = 0 if is_major_scan_event(ev) else 1
     sport_tier = 0 if sport in _PRIORITY_LIVE_SPORT_SLUGS else 1
     return (demote, major, sport_tier, slug)
 
@@ -443,13 +500,29 @@ def prioritize_live_events_for_scan(
     events: Sequence[Dict[str, Any]],
     limit: int,
 ) -> List[Dict[str, Any]]:
-    """Return up to ``limit`` live events with majors first (EPL before FA Cup flood)."""
+    """Return up to ``limit`` live events with majors first (EPL/NCAAF before junk).
+
+    Default ``ODDS_LIVE_SCAN_MAJORS_ONLY=true``: only must-cover majors
+    (NCAAF/NFL/NBA/NCAAB/NHL/MLB + top soccer). Do **not** pad with minor
+    soccer — that burns odds budget and starves real boards. Set
+    ``ODDS_LIVE_SCAN_MAJORS_ONLY=false`` to restore fill-with-rest behavior.
+    """
     lim = max(0, int(limit))
     if lim <= 0:
         return []
     indexed = list(enumerate(events or []))
     indexed.sort(key=lambda pair: (live_event_scan_rank(pair[1]), pair[0]))
-    return [ev for _i, ev in indexed[:lim]]
+    ordered = [ev for _i, ev in indexed]
+    majors_only = os.getenv("ODDS_LIVE_SCAN_MAJORS_ONLY", "true").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    if majors_only:
+        majors = [ev for ev in ordered if is_major_scan_event(ev)]
+        return majors[:lim]
+    return ordered[:lim]
 
 
 def sport_name_for_odds_updated(sport: Any) -> Optional[str]:

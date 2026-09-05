@@ -108,6 +108,31 @@ def test_team_match_to_odds_doc():
     assert PLIVE_BOOK_NAME == "PLive"
 
 
+def test_football_events_separated_from_mlb_and_join_ncaaf():
+    store = PliveStore()
+    store.apply_meta(
+        "cfb1",
+        {"home": "Nebraska Cornhuskers", "away": "Ohio Bobcats", "sportId": 3},
+    )
+    store.apply_meta(
+        "mlb1",
+        {"home": "New York Yankees", "away": "Boston Red Sox", "sportId": 1},
+    )
+    assert "cfb1" in store.football_events()
+    assert "cfb1" not in store.mlb_events()
+    assert "mlb1" not in store.football_events()
+    eid = match_plive_event_to_odds_doc(
+        store.football_events(), "Nebraska Cornhuskers", "Ohio Bobcats"
+    )
+    assert eid == "cfb1"
+    from plive_pandora import _odds_doc_is_american_football
+
+    assert _odds_doc_is_american_football(
+        {"sport": {"slug": "american-football"}, "home": "Nebraska Cornhuskers", "away": "Ohio Bobcats"}
+    )
+    assert not _odds_doc_is_american_football({"sport": {"slug": "football"}})
+
+
 def test_plive_is_its_own_book_not_betfair():
     from odds_api_client import _canonical_odds_api_bookmaker, api_wire_bookmakers
 

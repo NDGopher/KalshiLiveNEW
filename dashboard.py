@@ -495,7 +495,8 @@ saved_filters[DEFAULT_FILTER_NAME] = DEFAULT_FILTER_PAYLOAD
 saved_filters[CBB_FILTER_NAME] = CBB_FILTER_PAYLOAD
 # Odds-API.io: default filter displayBooks = ENV master list (ODDS_API_BOOKMAKERS). Monitors always
 # request /odds/multi for that full list; a filter may list fewer displayBooks only for alert-card columns.
-DEFAULT_FILTER_PAYLOAD["bettingBooks"] = ["Kalshi"]
+# Kalshi + PLive are both take venues for the live board (auto-bet stays Kalshi-only).
+DEFAULT_FILTER_PAYLOAD["bettingBooks"] = ["Kalshi", "PLive"]
 display_books_list = odds_api_master_bookmakers()
 for _extra_bk in extra_local_bookmakers():
     if not any(str(_extra_bk).strip().lower() == str(x).strip().lower() for x in display_books_list):
@@ -556,7 +557,7 @@ SOCCER_FILTER_NAME = "Soccer Live (2 Sharps)"
 soccer_sharps = [b for b in sharps_list if _dnorm(b) != "betmgm"]
 SOCCER_FILTER_PAYLOAD = {
     "state": "ND",
-    "bettingBooks": ["Kalshi"],
+    "bettingBooks": ["Kalshi", "PLive"],
     "displayBooks": list(display_books_list),
     "leagues": ["SOCCER_ALL"],
     "excludedCategories": [
@@ -4601,8 +4602,25 @@ def run_monitor_loop():
                 # BUT: Only create task if not already processing this alert_id (prevents race conditions)
                 # ALSO: Check if submarket is already being processed (prevents duplicate tasks for same submarket with different alert IDs)
                 # CRITICAL: Use lock to make check-and-mark atomic - mark submarket as processing HERE to prevent duplicate tasks
+                # Paper Kalshi / PLive display takes have no real side — skip auto-bet
+                # (previously NameError'd on high_ev_should_trigger / invalid side).
+                if _is_paper_kalshi_alert(alert) or _is_plive_take_alert(alert):
+                    return
+                high_ev_should_trigger = False
+                alert_filter_name = getattr(alert, "filter_name", None) or alert_data.get("filter_name")
+                filter_ev_min = (
+                    auto_bet_settings_by_filter.get(alert_filter_name, {}).get("ev_min", auto_bet_ev_min)
+                    if alert_filter_name
+                    else auto_bet_ev_min
+                )
+                if alert.ev_percent >= filter_ev_min and auto_bet_enabled:
+                    if alert_filter_name and alert_filter_name in selected_auto_bettor_filters:
+                        high_ev_should_trigger = True
                 ticker = alert_data.get('ticker') or ''
                 side = alert_data.get('side') or ''
+                # Synthetic paper tickers (KALSHI|…) are display-only.
+                if isinstance(ticker, str) and ticker.upper().startswith("KALSHI|"):
+                    return
                 submarket_key_for_check = (ticker.upper() if ticker else '', side.lower() if side else '')
                 if submarket_key_for_check[0] and submarket_key_for_check[1]:
                     # CRITICAL: Use lock to atomically check AND mark submarket as processing

@@ -2868,9 +2868,18 @@ class OddsEVMonitor:
         if prioritized and filtered:
             top = prioritized[0]
             lg = (top.get("league") or {}) if isinstance(top.get("league"), dict) else {}
+            from collections import Counter
+
+            from odds_api_client import live_event_league_slug, live_event_sport_slug
+
+            lg_counts = Counter(live_event_league_slug(e) or "?" for e in prioritized)
+            sp_counts = Counter(live_event_sport_slug(e) or "?" for e in prioritized)
+            top_lg = ", ".join(f"{s}={n}" for s, n in lg_counts.most_common(6))
+            top_sp = ", ".join(f"{s}={n}" for s, n in sp_counts.most_common(4))
             print(
                 f"[PIPELINE] Live scan window={len(event_ids)}/{len(filtered)} "
-                f"(max={max_ids}, majors-first; sample={lg.get('slug') or lg.get('name') or '?'})"
+                f"(max={max_ids}, majors-only; sample={lg.get('slug') or lg.get('name') or '?'} | "
+                f"sports=[{top_sp}] leagues=[{top_lg}])"
             )
 
         odds_by_id: Dict[int, Dict[str, Any]] = {}
@@ -3373,6 +3382,19 @@ class OddsEVMonitor:
                 take_outlier_display = False
                 if len(fair_eligible) >= min_sharp:
                     use_fair = fair_eligible
+                elif (
+                    len(fair_eligible) >= display_min_sharp
+                    and (_display_extra_relaxed() or _diagnostic_mode())
+                ):
+                    # Missing one sharp (often Circa on NCAAF) — still show the card.
+                    use_fair = fair_eligible
+                    take_outlier_display = True
+                    if _diagnostic_mode():
+                        print(
+                            f"[PIPELINE] Display card via {len(fair_eligible)}/{min_sharp} sharps "
+                            f"(display_min={display_min_sharp}) take={take_canon} {take_american} "
+                            f"| \"{mname}\" side={bet_side} | {teams}"
+                        )
                 elif len(baseline_fair) >= display_min_sharp and (
                     _display_extra_relaxed() or _diagnostic_mode()
                 ):
@@ -3640,7 +3662,12 @@ class OddsEVMonitor:
         relaxed_ok = bool(relaxed_roi and relaxed_devig and kal_ok and odds_ok)
 
         _wide = _diagnostic_mode() or _display_extra_relaxed()
-        if not strict_ok and not (relaxed_ok and _wide):
+        # Display-only rows already cleared the plus-EV board path above (hard gates
+        # failed, raw EV still prints). Do not re-kill them on odds_range / min_sharp —
+        # that emptied the FE while NCAAF still had priced Kalshi takes.
+        if display_only and is_plus_print_ev(ev_percent):
+            pass
+        elif not strict_ok and not (relaxed_ok and _wide):
             if _wide:
                 parts = []
                 if not strict_roi:
