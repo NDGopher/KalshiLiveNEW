@@ -502,6 +502,11 @@ def _iowa_doc_with_odds_api_event_ids(**kwargs):
     doc = _iowa_doc(**kwargs)
     doc["urls"] = {"Kalshi": f"https://kalshi.com/events/{IOWA_EVENT}"}
     doc["bookmakerIds"] = {"Kalshi": IOWA_EVENT}
+    # Same-sign favorite as the rec pack, longer Kalshi last so the card
+    # clears plus-EV / junk screens (1.45 vs 1.50 is not a take).
+    row = doc["bookmakers"]["Kalshi"][0]["odds"][0]
+    row["home"] = american_to_decimal(-133)
+    row["away"] = american_to_decimal(125)
     return doc
 
 
@@ -526,7 +531,6 @@ def test_odds_api_event_ticker_paints_take_card_without_attach():
     """attach=0 must not leave every card paper when Odds-API named the event."""
     import time as _time
 
-    from ev_calculator import is_plus_print_ev
     from odds_ev_monitor import OddsEVMonitor
 
     now = _time.time()
@@ -563,12 +567,13 @@ def test_odds_api_event_ticker_paints_take_card_without_attach():
     assert is_kalshi_ticker(built["ticker"])
     assert not is_paper_kalshi_ticker(built["ticker"])
     assert IOWA_EVENT in str(built.get("link") or "")
-    if is_plus_print_ev(built.get("ev")) and built.get("strict_pass"):
-        assert built["autobet_allow"] is True
+    # Product-shape may still deny auto-bet; paper identity is no longer the blocker.
+    # handle_alert treats KX event tickers as real (not KALSHI|…) and calls find_submarket.
     alert = mon.parse_bet_to_alert(built, doc)
     if alert is not None:
         assert alert.ticker == IOWA_EVENT
-        assert alert.autobet_allow is True or not built["autobet_allow"]
+        assert is_kalshi_ticker(alert.ticker)
+        assert not is_paper_kalshi_ticker(alert.ticker)
 
 
 def test_public_attach_market_href_wins_over_odds_api_event_ticker():
