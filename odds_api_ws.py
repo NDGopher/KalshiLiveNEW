@@ -54,6 +54,7 @@ from odds_api_client import (
     odds_updated_sport_names,
     sport_name_for_odds_updated,
     sport_slug_query_for_api,
+    stamp_odds_api_kalshi_event_identity,
 )
 
 WS_DEFAULT_URL = "wss://api.odds-api.io/v3/ws"
@@ -647,7 +648,21 @@ class OddsWsStore:
             ):
                 if ev.get(key) is not None:
                     meta[key] = ev.get(key)
+            # Kalshi event identity lives on the REST event, not the odds row.
+            # Merge so a later /events slate without urls does not wipe /odds.
+            for id_key in ("urls", "bookmakerIds", "bookmaker_ids"):
+                incoming = ev.get(id_key)
+                if not isinstance(incoming, dict) or not incoming:
+                    continue
+                prev = meta.get(id_key)
+                if isinstance(prev, dict):
+                    merged = dict(prev)
+                    merged.update(incoming)
+                    meta[id_key] = merged
+                else:
+                    meta[id_key] = dict(incoming)
             meta["id"] = eid
+            stamp_odds_api_kalshi_event_identity(meta)
             maybe_log_mlb_clock_sample(self, eid, meta, source="slate")
 
     def apply_rest_docs(self, docs: Iterable[Dict[str, Any]]) -> None:
@@ -780,6 +795,13 @@ class OddsWsStore:
                 meta.setdefault("urls", {})
                 if isinstance(meta["urls"], dict):
                     meta["urls"][bookie] = msg.get("url")
+            for id_key in ("bookmakerId", "bookmaker_id"):
+                if msg.get(id_key):
+                    meta.setdefault("bookmakerIds", {})
+                    if isinstance(meta["bookmakerIds"], dict):
+                        meta["bookmakerIds"][bookie] = msg.get(id_key)
+                    break
+            stamp_odds_api_kalshi_event_identity(meta)
             if msg.get("timestamp") is not None:
                 meta["timestamp"] = msg.get("timestamp")
             self.generation += 1
@@ -827,6 +849,7 @@ class OddsWsStore:
             for book in bks
             if self.book_updated_at.get((event_id, book)) is not None
         }
+        stamp_odds_api_kalshi_event_identity(meta)
         return meta
 
     def slate_event_ids(self) -> List[int]:

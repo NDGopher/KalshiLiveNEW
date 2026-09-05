@@ -463,20 +463,11 @@ def test_date_only_cfb_suffix_allows_saturday_night_et():
     assert _timing_ok(soccer_clock, too_far) is False
 
 
-def test_live_scan_copies_enriched_href_as_only_odds_api_ticker_source():
-    """Odds-API ticker path is bookmakerOdds.href only — client/WS never map a ticker field.
-
-    After enrich, scan must copy the painted href so handle_alert can set side.
-    """
+def test_live_scan_copies_enriched_href_as_market_ticker():
+    """Public attach still paints market-level href; scan copies it for side."""
     import time as _time
-    from pathlib import Path
 
     from odds_ev_monitor import OddsEVMonitor, extract_kalshi_ticker_from_href
-
-    root = Path(__file__).resolve().parents[1]
-    for name in ("odds_api_client.py", "odds_api_ws.py"):
-        text = (root / name).read_text(encoding="utf-8")
-        assert "href" not in text.lower()
 
     now = _time.time()
     doc = _iowa_doc(href="", now=now)
@@ -505,6 +496,134 @@ def test_live_scan_copies_enriched_href_as_only_odds_api_ticker_source():
     assert spr
     href = (spr[0].get("bookmakerOdds") or {}).get("href") or ""
     assert extract_kalshi_ticker_from_href(href) == IOWA_SPR_28
+
+
+def _iowa_doc_with_odds_api_event_ids(**kwargs):
+    doc = _iowa_doc(**kwargs)
+    doc["urls"] = {"Kalshi": f"https://kalshi.com/events/{IOWA_EVENT}"}
+    doc["bookmakerIds"] = {"Kalshi": IOWA_EVENT}
+    return doc
+
+
+def test_odds_api_event_ticker_fields_are_documented_and_parsed():
+    """bookmakerIds / urls carry the event KX. Odds rows do not (documented)."""
+    from odds_api_client import (
+        coerce_odds_api_kalshi_ticker,
+        odds_api_kalshi_event_ticker,
+        odds_api_kalshi_row_ticker,
+        resolve_kalshi_take_ticker,
+    )
+
+    doc = _iowa_doc_with_odds_api_event_ids(href="")
+    assert odds_api_kalshi_event_ticker(doc) == IOWA_EVENT
+    assert coerce_odds_api_kalshi_ticker(doc["urls"]["Kalshi"]) == IOWA_EVENT
+    assert odds_api_kalshi_row_ticker(doc["bookmakers"]["Kalshi"][0]["odds"][0]) is None
+    assert resolve_kalshi_take_ticker(doc["bookmakers"]["Kalshi"][0]["odds"][0], doc) == IOWA_EVENT
+    assert coerce_odds_api_kalshi_ticker("KXSCAN-NOT-REAL") is None
+
+
+def test_odds_api_event_ticker_paints_take_card_without_attach():
+    """attach=0 must not leave every card paper when Odds-API named the event."""
+    import time as _time
+
+    from ev_calculator import is_plus_print_ev
+    from odds_ev_monitor import OddsEVMonitor
+
+    now = _time.time()
+    doc = _iowa_doc_with_odds_api_event_ids(href="", now=now)
+    mon = OddsEVMonitor(auth_token=None)
+    mon.set_filter(
+        {
+            "betTypes": ["GAMELINES"],
+            "minRoi": 0,
+            "devigFilter": {
+                "sharps": ["FanDuel", "DraftKings", "NoVig"],
+                "method": "POWER",
+                "type": "AVERAGE",
+                "minEv": 0,
+                "minSharpBooks": 3,
+            },
+        }
+    )
+    rows = mon.live_scan_value_bets_from_docs({IOWA_EID: doc})
+    spr = [
+        r
+        for r in rows
+        if str(r.get("_scan_mname") or "").lower() == "spread"
+        and str(r.get("_take_only") or "").lower() == "kalshi"
+        and r.get("betSide") == "home"
+    ]
+    assert spr
+    bo = spr[0]["bookmakerOdds"]
+    assert not (bo.get("href") or "")
+    assert bo.get("eventTicker") == IOWA_EVENT
+    built = mon._value_bet_to_normalized_bet(spr[0], doc, take_book="Kalshi")
+    assert built is not None
+    assert built["ticker"] == IOWA_EVENT
+    assert is_kalshi_ticker(built["ticker"])
+    assert not is_paper_kalshi_ticker(built["ticker"])
+    assert IOWA_EVENT in str(built.get("link") or "")
+    if is_plus_print_ev(built.get("ev")) and built.get("strict_pass"):
+        assert built["autobet_allow"] is True
+    alert = mon.parse_bet_to_alert(built, doc)
+    if alert is not None:
+        assert alert.ticker == IOWA_EVENT
+        assert alert.autobet_allow is True or not built["autobet_allow"]
+
+
+def test_public_attach_market_href_wins_over_odds_api_event_ticker():
+    """Market-level KX from public attach is preferred over the event ticker."""
+    import time as _time
+
+    from odds_ev_monitor import OddsEVMonitor, extract_kalshi_ticker_from_href
+
+    now = _time.time()
+    doc = _iowa_doc_with_odds_api_event_ids(href="", now=now)
+    assert attach_public_kalshi_markets({IOWA_EID: doc}, _iowa_public_markets(), now=now) == 1
+    mon = OddsEVMonitor(auth_token=None)
+    mon.set_filter(
+        {
+            "betTypes": ["GAMELINES"],
+            "minRoi": 0,
+            "devigFilter": {
+                "sharps": ["FanDuel", "DraftKings", "NoVig"],
+                "method": "POWER",
+                "type": "AVERAGE",
+                "minEv": 0,
+                "minSharpBooks": 3,
+            },
+        }
+    )
+    rows = mon.live_scan_value_bets_from_docs({IOWA_EID: doc})
+    spr = [
+        r
+        for r in rows
+        if str(r.get("_scan_mname") or "").lower() == "spread"
+        and str(r.get("_take_only") or "").lower() == "kalshi"
+    ]
+    href = (spr[0].get("bookmakerOdds") or {}).get("href") or ""
+    assert extract_kalshi_ticker_from_href(href) == IOWA_SPR_28
+    built = mon._value_bet_to_normalized_bet(spr[0], doc, take_book="Kalshi")
+    assert built is not None
+    assert built["ticker"] == IOWA_SPR_28
+
+
+def test_odds_api_event_ticker_does_not_block_public_market_enrich():
+    """Stamping event identity on the doc must leave tickerless rows enrichable."""
+    import time as _time
+
+    from kalshi_public_feed import kalshi_doc_has_real_kx, kalshi_row_has_real_kx
+    from odds_api_client import stamp_odds_api_kalshi_event_identity
+
+    now = _time.time()
+    doc = _iowa_doc_with_odds_api_event_ids(href="", now=now)
+    assert stamp_odds_api_kalshi_event_identity(doc) == IOWA_EVENT
+    row = doc["bookmakers"]["Kalshi"][0]["odds"][0]
+    assert kalshi_row_has_real_kx(row) is False
+    assert kalshi_doc_has_real_kx(doc) is False
+    n = attach_public_kalshi_markets({IOWA_EID: doc}, _iowa_public_markets(), now=now)
+    assert n == 1
+    assert IOWA_SPR_28 in str(row.get("href") or "")
 
 
 def test_empty_public_fetch_keeps_last_good_cache():

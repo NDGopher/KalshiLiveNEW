@@ -1,8 +1,11 @@
 """Public Kalshi market listing → Odds-API take-book attach.
 
-Odds-API supplies the rec pack. Soccer Kalshi on that feed is often a
-frozen last. This module lists open GAME/SPREAD/TOTAL markets with an
-unsigned GET and maps the executable YES ask onto Odds-API events.
+Odds-API supplies the rec pack and, for Kalshi, an **event** ticker
+(``bookmakerIds.Kalshi`` / ``urls.Kalshi`` / WS ``url``). That is enough
+for handle_alert → find_submarket. This module is the fallback / enricher
+for **market-level** KX… (ceil suffix) and public YES-ask depth when the
+Odds-API row has no href. Attach=0 must not leave every card as paper
+``KALSHI|…`` if Odds-API already named the event.
 
 Private-key credentials are not used here. Orders still require a key.
 Fail-closed: zero or two-plus event matches, swapped/ambiguous teams,
