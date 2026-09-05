@@ -28,6 +28,8 @@ class EvAlert:
         self.devig_books = data.get("devig_books", [])
         self.market_url = data.get("market_url", "")
         self.ticker = data.get("ticker", "")
+        side_raw = str(data.get("side") or "").strip().lower()
+        self.side = side_raw if side_raw in ("yes", "no") else None
         self.timestamp = datetime.now()
         self.raw_html = data.get("raw_html", "")
         self.price_cents = None
@@ -75,6 +77,7 @@ class EvAlert:
             "fair_odds": self.fair_odds,
             "market_url": self.market_url,
             "ticker": self.ticker or self.extract_ticker_from_url(),
+            "side": self.side,
             "timestamp": self.timestamp.isoformat(),
             "strict_pass": self.strict_pass,
             "ev_source": self.ev_source,
