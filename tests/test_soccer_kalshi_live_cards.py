@@ -133,6 +133,16 @@ def test_sport_key_soccer_not_mlb_nfl():
     assert sport_key_for_doc({"league": "MLB", "sport": "baseball"}) == "mlb"
     assert sport_key_for_doc({"league": "NFL", "sport": "american-football"}) == "nfl"
     assert sport_key_for_doc({"league": "NCAAF", "sport": "american-football"}) == "ncaaf"
+    # Odds-API CFB is USA - College / usa-college, not the letters NCAAF.
+    assert (
+        sport_key_for_doc(
+            {
+                "league": {"name": "USA - College", "slug": "usa-college"},
+                "sport": {"slug": "american-football"},
+            }
+        )
+        == "ncaaf"
+    )
     ligue = {"league": {"name": "France Ligue 1"}, "sport": {"slug": "football"}}
     assert sport_key_for_doc(ligue) == "soccer"
     scotland = {"league": "Scotland Premiership", "sport": "football"}

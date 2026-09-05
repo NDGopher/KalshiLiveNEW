@@ -128,17 +128,15 @@ def _as_docs(docs: Union[Dict[Any, Dict[str, Any]], Sequence[Dict[str, Any]]]) -
 
 
 def _league_blob(doc: Dict[str, Any]) -> str:
-    lg = doc.get("league")
-    if isinstance(lg, dict):
-        league = str(lg.get("name") or lg.get("slug") or "")
-    else:
-        league = str(lg or "")
-    sp = doc.get("sport") or doc.get("sport_slug")
-    if isinstance(sp, dict):
-        sport = str(sp.get("slug") or sp.get("name") or "")
-    else:
-        sport = str(sp or "")
-    return f"{league} {sport}".lower()
+    """League + sport text. Include name and slug so usa-college is visible."""
+    parts: List[str] = []
+    for key in ("league", "league_slug", "sport", "sport_slug"):
+        val = doc.get(key)
+        if isinstance(val, dict):
+            parts.extend(str(val.get(x) or "") for x in ("name", "slug"))
+        elif val:
+            parts.append(str(val))
+    return " ".join(parts).lower()
 
 
 def _sport_slug_from_doc(doc: Dict[str, Any]) -> str:
@@ -149,6 +147,32 @@ def _sport_slug_from_doc(doc: Dict[str, Any]) -> str:
         if sp:
             return str(sp).lower()
     return ""
+
+
+def _compact_blob(blob: str) -> str:
+    return re.sub(r"[\s_\-]+", " ", str(blob or "").lower()).strip()
+
+
+def _is_american_football(doc: Dict[str, Any], blob: str = "") -> bool:
+    blob = blob or _league_blob(doc)
+    if any(x in blob for x in ("american-football", "american football", "americanfootball")):
+        return True
+    slug = _sport_slug_from_doc(doc).replace("_", "-")
+    return slug in ("american-football", "americanfootball")
+
+
+def _college_hint(blob: str) -> bool:
+    """Odds-API CFB/CBB often says USA - College / usa-college, not NCAAF."""
+    compact = _compact_blob(blob)
+    if any(tok in compact for tok in ("ncaaf", "ncaab", "ncaamb", "usa ncaaf", "usa ncaab")):
+        return True
+    if re.search(r"\bcfb\b", compact):
+        return True
+    if re.search(r"\bncaa\b", compact):
+        return True
+    if "usa college" in compact:
+        return True
+    return bool(re.search(r"\bcollege\b", compact))
 
 
 def _doc_is_soccer(doc: Dict[str, Any], blob: str = "") -> bool:
@@ -163,8 +187,11 @@ def _doc_is_soccer(doc: Dict[str, Any], blob: str = "") -> bool:
             "ncaab",
             "college football",
             "college basketball",
+            "cfb",
         )
     ):
+        return False
+    if _is_american_football(doc, blob):
         return False
     if any(x in blob for x in ("mlb", "baseball", "nba", "nhl", "wnba")):
         return False
@@ -180,10 +207,21 @@ def _doc_is_soccer(doc: Dict[str, Any], blob: str = "") -> bool:
 
 
 def sport_key_for_doc(doc: Dict[str, Any]) -> Optional[str]:
+    """Map an Odds-API event onto a Kalshi series family.
+
+    ``american-football`` alone is NFL. College (usa-college / NCAAF / CFB)
+    must win first or CFB docs pull KXNFL* and public attach stays 0.
+    """
     blob = _league_blob(doc)
+    college = _college_hint(blob)
+    am_fb = _is_american_football(doc, blob)
     if "ncaab" in blob or "ncaamb" in blob or "college basketball" in blob:
         return "ncaab"
-    if "ncaaf" in blob or "college football" in blob:
+    if college and "basketball" in blob and not am_fb:
+        return "ncaab"
+    if "ncaaf" in blob or "college football" in blob or re.search(r"\bcfb\b", _compact_blob(blob)):
+        return "ncaaf"
+    if college and am_fb:
         return "ncaaf"
     if "wnba" in blob:
         return "wnba"
@@ -193,7 +231,7 @@ def sport_key_for_doc(doc: Dict[str, Any]) -> Optional[str]:
         return "nba"
     if "nhl" in blob or "hockey" in blob:
         return "nhl"
-    if "nfl" in blob or "american-football" in blob or "american football" in blob:
+    if "nfl" in blob or am_fb:
         return "nfl"
     if _doc_is_soccer(doc, blob):
         return "soccer"
