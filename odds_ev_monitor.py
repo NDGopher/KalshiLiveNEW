@@ -21,7 +21,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
@@ -742,10 +742,106 @@ async def _diag_fetch_pregame_major_blocks(client: Any, cap: int) -> Tuple[List[
     return mlb, nba, nhl
 
 
+def event_commence_dt(ev: Dict[str, Any]) -> Optional[datetime]:
+    """Parse Odds-API commence/start for scan ordering. None if missing/unparseable."""
+    if not isinstance(ev, dict):
+        return None
+    raw = (
+        ev.get("date")
+        or ev.get("startTime")
+        or ev.get("start")
+        or ev.get("commence")
+        or ev.get("commence_time")
+        or ev.get("time")
+    )
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, (int, float)):
+        try:
+            ts = float(raw)
+            if ts > 1e12:
+                ts = ts / 1000.0
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        except (TypeError, ValueError, OSError):
+            return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _pregame_row_keep(ev: Dict[str, Any]) -> bool:
+    """Keep upcoming/pending rows. Drop settled and already-live (those come from /events/live)."""
+    if not isinstance(ev, dict) or not _event_odds_actionable(ev):
+        return False
+    st = str(ev.get("status") or ev.get("state") or "").lower().strip().replace(" ", "")
+    if st in ("live", "inprogress", "inplay", "started", "running"):
+        return False
+    return True
+
+
+def _pregame_row_sort_key(
+    ev: Dict[str, Any], now: Optional[datetime] = None
+) -> Tuple[int, datetime]:
+    """Soonest future kickoff first; missing date next; stale past-pending last."""
+    when = now if now is not None else datetime.now(timezone.utc)
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    dt = event_commence_dt(ev)
+    sentinel = datetime.max.replace(tzinfo=timezone.utc)
+    if dt is None:
+        return (1, sentinel)
+    if dt >= when:
+        return (0, dt)
+    return (2, dt)
+
+
+def select_pregame_events_for_scan(
+    rows: List[Dict[str, Any]],
+    cap: int,
+    *,
+    now: Optional[datetime] = None,
+    seen_ids: Optional[Set[int]] = None,
+) -> List[Dict[str, Any]]:
+    """Fill a per-sport pregame cap with soonest upcoming events, not catalog order.
+
+    Odds-API ``/events`` lists settled / historical rows first. A raw ``[:35]`` cut
+    therefore never reaches tonight's NCAAF tip-offs (Georgia, Penn State, Oregon).
+    """
+    lim = max(0, int(cap))
+    if lim <= 0:
+        return []
+    seen: Set[int] = set(seen_ids or ())
+    candidates: List[Dict[str, Any]] = []
+    for ev in rows or []:
+        if not _pregame_row_keep(ev):
+            continue
+        eid = ev.get("id")
+        if eid is None:
+            continue
+        try:
+            ke = int(eid)
+        except (TypeError, ValueError):
+            continue
+        if ke in seen:
+            continue
+        seen.add(ke)
+        candidates.append(ev)
+    candidates.sort(key=lambda e: _pregame_row_sort_key(e, now))
+    return candidates[:lim]
+
+
 async def _diag_fetch_pregame_by_sports(client: Any, cap_per_sport: int) -> List[Dict[str, Any]]:
     """
     Pregame /events rows for each sport from ``odds_api_sports_list`` (``ODDS_API_SPORTS`` or liquidity defaults).
     Sequential per sport to avoid connection bursts; responses use the client's TTL cache.
+    Skips settled/live and prefers soonest kickoff so NCAAF night slates are not buried.
     """
     slugs = _broad_pregame_sport_slugs()
     seen: Set[int] = set()
@@ -758,17 +854,15 @@ async def _diag_fetch_pregame_by_sports(client: Any, cap_per_sport: int) -> List
             continue
         if not isinstance(rows, list):
             continue
-        for ev in rows[:cap_per_sport]:
+        picked = select_pregame_events_for_scan(rows, cap_per_sport, seen_ids=seen)
+        for ev in picked:
             eid = ev.get("id")
             if eid is None:
                 continue
             try:
-                ke = int(eid)
+                seen.add(int(eid))
             except (TypeError, ValueError):
                 continue
-            if ke in seen:
-                continue
-            seen.add(ke)
             out.append(ev)
     return out
 

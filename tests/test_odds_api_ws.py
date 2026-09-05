@@ -606,6 +606,128 @@ def test_handoff_runs_rest_odds_by_default(monkeypatch):
     asyncio.run(run())
 
 
+def test_handoff_seeds_soonest_pregame_ncaaf(monkeypatch):
+    """REST handoff must include pending NCAAF tip-offs, not only /events/live."""
+    monkeypatch.setenv("ODDS_API_KEY", "test-not-a-real-key")
+    monkeypatch.delenv("ODDS_API_WS_HANDOFF_REST_ODDS", raising=False)
+    monkeypatch.setenv("ODDS_PREGAME_EVENTS_PER_SPORT", "8")
+
+    class SpyRest(_DummyRest):
+        def __init__(self):
+            self.snap_ids: list = []
+            self.last_seq = 7
+
+        async def list_live_events(self, *args, **kwargs):
+            return [
+                {
+                    "id": 1,
+                    "sport": {"slug": "football"},
+                    "league": {"slug": "england-premier-league"},
+                    "home": "Arsenal",
+                    "away": "Chelsea",
+                }
+            ]
+
+        async def list_events_for_sport(self, sport_slug, league=None, status=None):
+            from odds_api_client import sport_slug_query_for_api
+
+            if sport_slug_query_for_api(str(sport_slug)) != "american-football":
+                return []
+            return [
+                {
+                    "id": 88,
+                    "status": "settled",
+                    "date": "2026-09-05T14:00:00Z",
+                    "sport": {"slug": "american-football"},
+                    "league": {"slug": "usa-college"},
+                    "home": "Settled",
+                    "away": "Done",
+                },
+                {
+                    "id": 99,
+                    "status": "pending",
+                    "date": "2026-09-05T19:30:00Z",
+                    "sport": {"slug": "american-football"},
+                    "league": {"slug": "usa-college"},
+                    "home": "Georgia Bulldogs",
+                    "away": "Tennessee State Tigers",
+                },
+            ]
+
+        async def get_odds_multi(self, event_ids, bookmakers, **kwargs):
+            self.snap_ids = [int(x) for x in event_ids]
+            return [
+                {
+                    "id": int(eid),
+                    "bookmakers": {
+                        "DraftKings": [{"name": "ML", "odds": [{"home": 2.0, "away": 1.8}]}],
+                        "FanDuel": [{"name": "ML", "odds": [{"home": 2.0, "away": 1.8}]}],
+                        "Bet365": [{"name": "ML", "odds": [{"home": 2.0, "away": 1.8}]}],
+                        "Kalshi": [{"name": "ML", "odds": [{"home": 2.1, "away": 1.7}]}],
+                    },
+                }
+                for eid in event_ids
+            ]
+
+    async def run() -> None:
+        rest = SpyRest()
+        feed = OddsApiWsFeed(rest, api_key="test-not-a-real-key")
+        await feed._handoff_snapshot()
+        assert 99 in rest.snap_ids
+        assert 88 not in rest.snap_ids
+        doc = feed.store.merged_doc(99)
+        bks = doc.get("bookmakers") or {}
+        assert "DraftKings" in bks
+        assert "Kalshi" in bks
+
+    asyncio.run(run())
+
+
+def test_handoff_retries_after_transient_rest_error(monkeypatch):
+    monkeypatch.setenv("ODDS_API_KEY", "test-not-a-real-key")
+    monkeypatch.delenv("ODDS_API_WS_HANDOFF_REST_ODDS", raising=False)
+
+    class FlakyRest(_DummyRest):
+        def __init__(self):
+            self.live_calls = 0
+            self.last_seq = 3
+
+        async def list_live_events(self, *args, **kwargs):
+            self.live_calls += 1
+            if self.live_calls < 2:
+                raise RuntimeError("ssl boom")
+            return [
+                {
+                    "id": 1,
+                    "sport": {"slug": "football"},
+                    "league": {"slug": "england-premier-league"},
+                }
+            ]
+
+        async def get_odds_multi(self, event_ids, bookmakers, **kwargs):
+            return [
+                {
+                    "id": 1,
+                    "bookmakers": {
+                        "DraftKings": [{"name": "ML", "odds": [{"home": 2.0, "away": 1.8}]}],
+                    },
+                }
+            ]
+
+    async def run() -> None:
+        rest = FlakyRest()
+        feed = OddsApiWsFeed(rest, api_key="test-not-a-real-key")
+        await feed._handoff_snapshot()
+        assert rest.live_calls == 2
+        assert "DraftKings" in (feed.store.merged_doc(1).get("bookmakers") or {})
+
+    async def _fast_sleep(_s):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", _fast_sleep)
+    asyncio.run(run())
+
+
 def test_handoff_can_be_disabled(monkeypatch):
     monkeypatch.setenv("ODDS_API_KEY", "test-not-a-real-key")
     monkeypatch.setenv("ODDS_API_WS_HANDOFF_REST_ODDS", "false")
@@ -1032,6 +1154,38 @@ def test_prioritize_majors_keeps_ncaab_nhl_drops_minor_soccer(monkeypatch):
     assert "england-premier-league" in slugs
     assert "bahrain-premier-league" not in slugs
     assert len(picked) == 5
+
+
+def test_majors_only_drops_handball_bundesliga_keeps_soccer(monkeypatch):
+    from odds_api_client import is_major_scan_event, prioritize_live_events_for_scan
+
+    monkeypatch.setenv("ODDS_LIVE_SCAN_MAJORS_ONLY", "true")
+    handball = {
+        "id": 1,
+        "sport": {"slug": "handball"},
+        "league": {"slug": "germany-bundesliga"},
+        "home": "VfL Gummersbach",
+        "away": "MT Melsungen",
+    }
+    soccer = {
+        "id": 2,
+        "sport": {"slug": "football"},
+        "league": {"slug": "germany-bundesliga"},
+        "home": "Bayern Munich",
+        "away": "Dortmund",
+    }
+    cfb = {
+        "id": 3,
+        "sport": {"slug": "american-football"},
+        "league": {"slug": "usa-college"},
+        "home": "Georgia Bulldogs",
+        "away": "Tennessee State Tigers",
+    }
+    assert is_major_scan_event(handball) is False
+    assert is_major_scan_event(soccer) is True
+    assert is_major_scan_event(cfb) is True
+    picked = prioritize_live_events_for_scan([handball, soccer, cfb], 80)
+    assert [e["id"] for e in picked] == [2, 3]
 
 
 def test_rest_updated_fallback_requires_sport_display_name(monkeypatch):
