@@ -102,6 +102,7 @@ from auto_bet_sheet import (
     build_auto_bet_sheet_record,
     ensure_sheet_extra_headers,
 )
+from auto_bet_sizing import size_auto_bet_order
 from ev_calculator import decimal_to_american, is_plus_print_ev
 from stoppage_gate import clock_fields_for_live_odds
 
@@ -250,7 +251,7 @@ auto_bet_settings_by_filter = {}  # Dict of filter_name -> settings dict
 nhl_over_bet_amount = 202.0  # NHL over bet amount in dollars (configurable from frontend, shared across all filters)
 px_novig_multiplier = 2.0  # Multiplier for bet amount when both ProphetX and Novig are in devig books (default 2.0x)
 
-# Market-type specific bet amounts (applied before PX+Novig multiplier)
+# Market-type specific bet amounts (legacy defaults; auto-bet order cost is the filter amount)
 moneyline_bet_amount = 151.0  # Moneyline bet amount in dollars (35.75% ROI justifies larger bets)
 total_bet_amount = 101.0  # Total Points/Goals bet amount in dollars (keep at default)
 spread_bet_amount = 75.0  # Point Spread bet amount in dollars (1.10% ROI - reduce bet size)
@@ -1921,10 +1922,20 @@ def init_google_sheets():
 
 
 def write_auto_bet_to_sheets(bet_data: Dict):
-    """Write auto-bet record to Google Sheets (with CSV fallback)"""
+    """Persist an auto-bet row: always append CSV, then try Google Sheets.
+
+    Executed fills must land in auto_bets.csv even when Sheets is configured
+    and succeeds. The previous Sheets-first return skipped CSV, so BET_PLACED
+    jsonl rows (order_id / price / contracts / cost) never got an executed CSV
+    line (HCU@Rice Over 47.5, 2026-09-05).
+    """
     global google_sheets_client
-    
-    # Try Google Sheets first
+
+    try:
+        write_auto_bet_to_csv(bet_data)
+    except Exception as csv_exc:
+        print(f"[AUTO-BET CSV] ❌ persist failed: {csv_exc}")
+
     if google_sheets_client and GOOGLE_SHEETS_SPREADSHEET_ID:
         try:
             import gspread
@@ -1941,33 +1952,30 @@ def write_auto_bet_to_sheets(bet_data: Dict):
             row = auto_bet_sheet_row(bet_data)
             worksheet.append_row(row)
             print(f"[GOOGLE SHEETS] OK: Wrote bet to sheet: {bet_data.get('ticker')} - {bet_data.get('pick')}")
-            return
-        
         except Exception as e:
-            print(f"[GOOGLE SHEETS] ❌ Error writing to sheet: {e}, falling back to CSV")
-    
-    # Fallback to CSV
-    write_auto_bet_to_csv(bet_data)
+            print(f"[GOOGLE SHEETS] ❌ Error writing to sheet: {e} (CSV already written)")
 
 
 def write_auto_bet_to_csv(bet_data: Dict):
-    """Write auto-bet record to CSV file (appends if file exists)"""
-    file_exists = os.path.exists(AUTO_BET_CSV_FILE)
-    
+    """Append one auto-bet row to auto_bets.csv (executed and SKIPPED)."""
+    file_exists = os.path.exists(AUTO_BET_CSV_FILE) and os.path.getsize(AUTO_BET_CSV_FILE) > 0
+
     fieldnames = list(AUTO_BET_CSV_FIELDNAMES)
+    row = {key: (bet_data or {}).get(key, "") for key in fieldnames}
 
     try:
         with open(AUTO_BET_CSV_FILE, 'a', newline='', encoding='utf-8') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction="ignore")
 
-            # Write header if file is new
             if not file_exists:
                 writer.writeheader()
 
-            writer.writerow(bet_data)
-            print(f"[AUTO-BET CSV] OK: Wrote bet to {AUTO_BET_CSV_FILE}: {bet_data.get('ticker')} - {bet_data.get('pick')}")
+            writer.writerow(row)
+            csvfile.flush()
+            print(f"[AUTO-BET CSV] OK: Wrote bet to {AUTO_BET_CSV_FILE}: {row.get('ticker')} - {row.get('pick')} status={row.get('status')}")
     except Exception as e:
         print(f"[AUTO-BET CSV] ❌ Error writing to CSV: {e}")
+        raise
 
 
 def log_alert_passed_threshold(alert_id, alert, alert_data, filter_settings, decision_path):
@@ -6714,45 +6722,56 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
             # This prevents failed attempts from counting toward the limit
             # We'll add it after the bet succeeds (see line ~1504)
             
-            # Determine bet amount based on market type, then apply special rules
-            # Priority: NHL overs > Market type > PX+Novig multiplier
-            # Use the amount we read at the start (current_amount) to ensure consistency
+            # Stake: configured filter amount is the order budget.
+            # Spend ~amount dollars at the limit price: contracts = floor(amount/price).
+            # Legacy market-type sizes (ML $151 / Total $101 / Spread $75 / NHL $202)
+            # and PX+Novig 2x are logged then clamped — never silently 4x the filter
+            # amount (HCU@Rice Over 47.5: $25 filter → ~198 contracts / ~$97 at 49¢).
             global nhl_over_bet_amount, px_novig_multiplier, moneyline_bet_amount, total_bet_amount, spread_bet_amount
-            bet_amount = current_amount
-            
-            # Check for NHL overs first (takes precedence)
+            proposed_amount = current_amount
+
             is_nhl_over = False
             if ticker and ticker.upper().startswith('KXNHL'):
                 current_pick = (alert.pick or alert_data.get('pick', '')).upper()
                 if 'OVER' in current_pick and ('total' in market_type.lower() or 'TOTAL' in ticker):
-                    bet_amount = nhl_over_bet_amount
+                    proposed_amount = nhl_over_bet_amount
                     is_nhl_over = True
-            
-            # Apply market-type specific bet amounts (only if not NHL over)
+
             if not is_nhl_over:
                 if normalized_market_type == 'Moneyline':
-                    bet_amount = moneyline_bet_amount
-                    print(f"[AUTO-BET] Moneyline detected - using ${moneyline_bet_amount:.2f} bet amount (35.75% ROI justifies larger bets)")
+                    proposed_amount = moneyline_bet_amount
+                    print(f"[AUTO-BET] Moneyline detected - legacy size ${moneyline_bet_amount:.2f} (clamped to filter amount)")
                 elif normalized_market_type == 'Total Points' or normalized_market_type == 'Total Goals':
-                    bet_amount = total_bet_amount
-                    print(f"[AUTO-BET] Total detected - using ${total_bet_amount:.2f} bet amount")
+                    proposed_amount = total_bet_amount
+                    print(f"[AUTO-BET] Total detected - legacy size ${total_bet_amount:.2f} (clamped to filter amount)")
                 elif normalized_market_type == 'Point Spread':
-                    bet_amount = spread_bet_amount
-                    print(f"[AUTO-BET] Point Spread detected - using ${spread_bet_amount:.2f} bet amount (1.10% ROI - reduced bet size)")
-            
-            # Apply multiplier if both ProphetX and Novig are in devig books (only if not NHL over)
-            # This multiplies the market-type specific amount
+                    proposed_amount = spread_bet_amount
+                    print(f"[AUTO-BET] Point Spread detected - legacy size ${spread_bet_amount:.2f} (clamped to filter amount)")
+
             if not is_nhl_over:
                 devig_books = getattr(alert, 'devig_books', []) or alert_data.get('devig_books', [])
                 _devig_l = {str(b).strip().lower() for b in (devig_books or [])}
                 if 'prophetx' in _devig_l and 'novig' in _devig_l:
-                    base_amount = bet_amount  # Store before multiplier
-                    bet_amount = bet_amount * px_novig_multiplier
-                    print(f"[AUTO-BET] ProphetX + Novig detected - applying {px_novig_multiplier}x multiplier: ${base_amount:.2f} -> ${bet_amount:.2f}")
-            
-            # Calculate contracts and place bet (minimal logging for speed)
-            contracts = market_matcher.calculate_contracts_from_dollars(bet_amount, expected_price_cents)
-            print(f"[AUTO-BET] Placing bet: {alert.teams} - {alert.pick} | {ticker} {side} | ${bet_amount:.2f} ({contracts} contracts @ {expected_price_cents}¢)")
+                    base_amount = proposed_amount
+                    proposed_amount = proposed_amount * px_novig_multiplier
+                    print(f"[AUTO-BET] ProphetX + Novig detected - legacy {px_novig_multiplier}x ${base_amount:.2f} -> ${proposed_amount:.2f} (clamped to filter amount)")
+
+            bet_amount, contracts, limit_cost = size_auto_bet_order(
+                current_amount, expected_price_cents, proposed_amount
+            )
+            if proposed_amount and bet_amount + 1e-9 < float(proposed_amount):
+                print(f"[AUTO-BET] Clamped stake ${float(proposed_amount):.2f} -> ${bet_amount:.2f} (filter amount is the hard cap)")
+            if contracts < 1:
+                print(f"[AUTO-BET] SKIP: Alert {alert_id} - fail-closed stake sizing (amount=${bet_amount:.2f} @ {expected_price_cents}¢)")
+                if event_base:
+                    current_total = auto_bet_event_totals.get(event_base, 0.0)
+                    auto_bet_event_totals[event_base] = max(0.0, current_total - (current_amount or 0.0))
+                _terminal_skip(
+                    "fail-closed stake sizing",
+                    f"Cannot size order: filter amount ${bet_amount:.2f} at {expected_price_cents}¢ yields 0 contracts",
+                )
+                return
+            print(f"[AUTO-BET] Placing bet: {alert.teams} - {alert.pick} | {ticker} {side} | ${bet_amount:.2f} ({contracts} contracts @ {expected_price_cents}¢, limit cost ${limit_cost:.2f})")
             
             # Place the bet (lock is still held)
             # Strategy: Taker limit order with 1 second expiration - guarantees execution at BB price

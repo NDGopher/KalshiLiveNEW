@@ -36,7 +36,7 @@ That combination is enough for the baseball-only pin:
 - The old per-poll `/odds/multi` hot loop is **not** the primary path when the WS is healthy (a 10-book REST poller will 429 a Growth WS account).
 - **Global auto-bet defaults OFF** at process start (fail-closed). The last ON/OFF is restored from `user_filters_state.json` (`auto_bet_enabled`). Enable via dashboard `POST /api/set_auto_bet` or `bot_control enable_auto_bet`.
 - EvAlerts still come from `ev_calculator.py` (POWER / WORST_CASE / AVERAGE).
-- Default filter remains **Kalshi All Sports (3 Sharps Live)** (GAMELINES, minSharpBooks 3, POWER/AVERAGE vs Kalshi, bettingBooks=`[Kalshi]`). Auto-bet product shape is **≥3 comparison recs on the same LINE** (odds + vs − is not a block; Kalshi need not be best). EV ≤20% is fine. Auto `ev_min` default **2%** (desk can lower/raise; CBB stays 10–25%). Auto-bet American band **-200..+200** (~30–70¢). CBB stays WORST_CASE / minSharp 2. **Soccer Live (2 Sharps)** is a third dashboard filter (SOCCER_ALL, GAMELINES, minSharp 2, POWER/AVERAGE). BetMGM is excluded from the soccer **sharp pack only** (tiles / account selection stay). 1H / team totals are excluded. Soccer auto-bet stays OFF. Default auto-bet stake is **$25** when unset (`DEFAULT_AUTO_BET_AMOUNT`). Market-type sizes stay `151 / 101 / 75 / 202 / 404`, `user_max_bet=100`, PX+Novig 2x. Persisted in `user_filters_state.json`. PLive cards never auto-bet.
+- Default filter remains **Kalshi All Sports (3 Sharps Live)** (GAMELINES, minSharpBooks 3, POWER/AVERAGE vs Kalshi, bettingBooks=`[Kalshi]`). Auto-bet product shape is **≥3 comparison recs on the same LINE** (odds + vs − is not a block; Kalshi need not be best). EV ≤20% is fine. Auto `ev_min` default **2%** (desk can lower/raise; CBB stays 10–25%). Auto-bet American band **-200..+200** (~30–70¢). CBB stays WORST_CASE / minSharp 2. **Soccer Live (2 Sharps)** is a third dashboard filter (SOCCER_ALL, GAMELINES, minSharp 2, POWER/AVERAGE). BetMGM is excluded from the soccer **sharp pack only** (tiles / account selection stay). 1H / team totals are excluded. Soccer auto-bet stays OFF. Default auto-bet stake is **$25** when unset (`DEFAULT_AUTO_BET_AMOUNT`). **Auto-bet order cost respects that filter amount:** spend ~amount dollars at the limit price (`contracts = floor(amount / price)`); fail-closed / clamp — never silently 4x via legacy market-type sizes. Market-type constants stay `151 / 101 / 75 / 202 / 404`, `user_max_bet=100`, PX+Novig 2x, but they do not replace the configured filter stake. Successful places always append an `executed` row to `auto_bets.csv` (order_id, prices, contracts, cost) even when Google Sheets is configured. Persisted in `user_filters_state.json`. PLive cards never auto-bet.
 
 ### `user_filters_state.json` keys
 
@@ -48,7 +48,7 @@ Single persist file (atomic replace via `_persist_filters_state` / `_load_filter
 | `selected_dashboard_filters` | Dashboard monitor list | Product filters |
 | `selected_auto_bettor_filters` | Filters allowed to auto-bet | `[]` |
 | `auto_bet_enabled` | Global auto-bet ON/OFF | `false` (fail-closed) |
-| `auto_bet_amount` | Top-level stake | `25` |
+| `auto_bet_amount` | Top-level stake (order budget: `floor(amount/price)` contracts) | `25` |
 | `auto_bet_ev_min` / `auto_bet_ev_max` | Top-level EV bounds | `2` / `25` |
 | `auto_bet_odds_min` / `auto_bet_odds_max` | Top-level American odds band | `-200` / `200` |
 | `auto_bet_settings_by_filter` | Per-filter EV / odds / amount / enabled | Amount `25`, enabled `false` |

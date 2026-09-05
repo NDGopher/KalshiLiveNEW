@@ -1648,13 +1648,10 @@ class MarketMatcher:
         return None
     
     def calculate_contracts_from_dollars(self, dollars: float, price_cents: int) -> int:
-        """Calculate number of contracts from dollar amount"""
-        if price_cents <= 0:
-            return 0
-        
-        price = price_cents / 100.0
-        contracts = int(dollars / price)
-        return max(1, contracts)  # At least 1 contract
+        """Spend ~dollars at price_cents: floor(amount/price). Fail-closed (0 if invalid)."""
+        from auto_bet_sizing import contracts_for_stake_dollars
+
+        return contracts_for_stake_dollars(dollars, price_cents)
     
     def calculate_max_contracts(self, liquidity_dollars: float, price_cents: int) -> int:
         """Calculate maximum contracts available at current price"""
