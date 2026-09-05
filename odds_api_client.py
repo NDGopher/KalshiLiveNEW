@@ -389,6 +389,27 @@ _PRIORITY_LIVE_LEAGUE_SLUGS: frozenset = frozenset(
     }
 )
 
+# Soccer slugs in the priority set. Odds-API reuses ``germany-bundesliga`` for
+# handball; those must not steal majors-only slots from EPL / NCAAF.
+_SOCCER_MAJOR_LEAGUE_SLUGS: frozenset = frozenset(
+    {
+        "england-premier-league",
+        "spain-laliga",
+        "germany-bundesliga",
+        "italy-serie-a",
+        "france-ligue-1",
+        "portugal-primeira-liga",
+        "netherlands-eredivisie",
+        "mexico-liga-mx",
+        "brazil-serie-a",
+        "argentina-liga-profesional",
+        "usa-mls",
+        "uefa-champions-league",
+        "uefa-europa-league",
+        "uefa-europa-conference-league",
+    }
+)
+
 # Prefer liquidity sports so Angola/ATP junk does not crowd out soccer/CFB majors.
 _PRIORITY_LIVE_SPORT_SLUGS: frozenset = frozenset(
     {
@@ -466,6 +487,9 @@ def is_major_scan_event(ev: Dict[str, Any]) -> bool:
     slug = live_event_league_slug(ev)
     sport = live_event_sport_slug(ev)
     if slug in _PRIORITY_LIVE_LEAGUE_SLUGS:
+        # Soccer names are not unique across sports (handball Bundesliga, etc.).
+        if slug in _SOCCER_MAJOR_LEAGUE_SLUGS and sport and sport != "football":
+            return False
         return True
     # Every live american-football game (NCAAF/NFL) belongs on the board.
     if sport == "american-football":

@@ -1034,6 +1034,38 @@ def test_prioritize_majors_keeps_ncaab_nhl_drops_minor_soccer(monkeypatch):
     assert len(picked) == 5
 
 
+def test_majors_only_drops_handball_bundesliga_keeps_soccer(monkeypatch):
+    from odds_api_client import is_major_scan_event, prioritize_live_events_for_scan
+
+    monkeypatch.setenv("ODDS_LIVE_SCAN_MAJORS_ONLY", "true")
+    handball = {
+        "id": 1,
+        "sport": {"slug": "handball"},
+        "league": {"slug": "germany-bundesliga"},
+        "home": "VfL Gummersbach",
+        "away": "MT Melsungen",
+    }
+    soccer = {
+        "id": 2,
+        "sport": {"slug": "football"},
+        "league": {"slug": "germany-bundesliga"},
+        "home": "Bayern Munich",
+        "away": "Dortmund",
+    }
+    cfb = {
+        "id": 3,
+        "sport": {"slug": "american-football"},
+        "league": {"slug": "usa-college"},
+        "home": "Georgia Bulldogs",
+        "away": "Tennessee State Tigers",
+    }
+    assert is_major_scan_event(handball) is False
+    assert is_major_scan_event(soccer) is True
+    assert is_major_scan_event(cfb) is True
+    picked = prioritize_live_events_for_scan([handball, soccer, cfb], 80)
+    assert [e["id"] for e in picked] == [2, 3]
+
+
 def test_rest_updated_fallback_requires_sport_display_name(monkeypatch):
     monkeypatch.setenv("ODDS_API_SPORTS", "baseball")
     monkeypatch.setenv("ODDS_API_REST_UPDATED_FALLBACK", "true")
