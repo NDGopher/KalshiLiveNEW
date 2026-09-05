@@ -290,6 +290,60 @@ def test_totals_name_in_payload_replaces_totals_only():
     assert tot["odds"][0]["max"] == 9.5
 
 
+def test_slate_and_rest_preserve_kalshi_event_identity():
+    """Odds-API urls / bookmakerIds must survive WS store merge (not just home/away)."""
+    from odds_api_client import odds_api_kalshi_event_ticker
+
+    store = OddsWsStore()
+    store.apply_slate(
+        [
+            {
+                "id": 260905027,
+                "home": "Iowa Hawkeyes",
+                "away": "Northern Illinois Huskies",
+                "league": {"slug": "usa-college"},
+                "urls": {"Kalshi": "https://kalshi.com/events/KXNCAAFGAME-26SEP05NIUIOWA"},
+                "bookmakerIds": {"Kalshi": "KXNCAAFGAME-26SEP05NIUIOWA"},
+            }
+        ]
+    )
+    store.apply_rest_docs(
+        [
+            {
+                "id": 260905027,
+                "home": "Iowa Hawkeyes",
+                "bookmakers": {
+                    "Kalshi": [{"name": "Spread", "odds": [{"hdp": -27.5, "home": 1.45, "away": 2.80}]}],
+                },
+            }
+        ]
+    )
+    merged = store.merged_doc(260905027)
+    assert merged["urls"]["Kalshi"].endswith("KXNCAAFGAME-26SEP05NIUIOWA")
+    assert merged["bookmakerIds"]["Kalshi"] == "KXNCAAFGAME-26SEP05NIUIOWA"
+    assert odds_api_kalshi_event_ticker(merged) == "KXNCAAFGAME-26SEP05NIUIOWA"
+    assert merged["kalshiEventTicker"] == "KXNCAAFGAME-26SEP05NIUIOWA"
+    row = merged["bookmakers"]["Kalshi"][0]["odds"][0]
+    assert not row.get("href")
+
+
+def test_ws_updated_kalshi_url_becomes_event_ticker():
+    store = OddsWsStore()
+    store.apply_message(
+        {
+            "type": "updated",
+            "seq": 1,
+            "id": 99,
+            "bookie": "Kalshi",
+            "url": "https://kalshi.com/events/KXNCAAFGAME-26SEP05NIUIOWA",
+            "markets": [{"name": "ML", "odds": [{"home": 1.2, "away": 4.5}]}],
+        }
+    )
+    merged = store.merged_doc(99)
+    assert merged["urls"]["Kalshi"].endswith("KXNCAAFGAME-26SEP05NIUIOWA")
+    assert merged["kalshiEventTicker"] == "KXNCAAFGAME-26SEP05NIUIOWA"
+
+
 def test_store_deleted_and_no_markets():
     store = OddsWsStore()
     store.apply_message(

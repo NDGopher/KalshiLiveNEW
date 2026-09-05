@@ -31,6 +31,26 @@ Env:
 
 EV math (Kalshi vs sharps) lives in ev_calculator.py; multi-book aggregation uses
 ev_percent_three_methods_multi_sharp when you pass several sharp two-way panels.
+
+Kalshi identity on Odds-API payloads (docs.odds-api.io/guides/prediction-markets
+and websockets) — event-level only, not per-outcome market tickers:
+
+  CARRIES a real KX… (or a URL that contains one):
+    bookmakerIds.Kalshi     — Kalshi event ticker, e.g. KXNCAAFGAME-26SEP05NIUIOWA
+    urls.Kalshi             — https://kalshi.com/events/KX…
+    WS created/updated.url  — same event URL; store keeps it in event_meta.urls[bookie]
+
+  DOES NOT carry (scan defensively; do not invent):
+    per-outcome market ticker / market_id / selection id
+    bookmakerOdds.href on REST or WS odds rows (href is our attach/enrich field)
+    YES/NO side — Odds-API uses home/away/over/under/draw decimals
+
+  Still resolved via public Kalshi markets API:
+    market-level KX…-TEAM<ceil(|line|)> (or GAME-TEAM for ML)
+    YES-ask overlay / orderbook depth when Odds-API last is stale
+
+An event ticker is enough for handle_alert → find_submarket (fail-closed ceil
+line / Under=NO / dog=NO). Public attach remains the market-ticker enricher.
 """
 from __future__ import annotations
 
@@ -46,6 +66,8 @@ from urllib.parse import urlencode
 import aiohttp
 from dotenv import load_dotenv
 
+from execution_guard import is_kalshi_ticker
+
 # Load .env before any code reads os.environ (standalone: cwd may differ from package dir).
 _PROJECT_DIR = Path(__file__).resolve().parent
 load_dotenv(_PROJECT_DIR / ".env", override=True, encoding="utf-8-sig")
@@ -57,6 +79,130 @@ load_dotenv(Path.cwd() / ".env.env", override=False, encoding="utf-8-sig")
 def _parse_csv(name: str, default: str) -> List[str]:
     raw = os.getenv(name, default)
     return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+# Last KX… token in a URL or bare id. Event URLs end with the event ticker;
+# a nested /markets/… path ends with the more specific market ticker.
+_KX_IN_TEXT = re.compile(r"(KX[A-Z0-9]+(?:-[A-Z0-9]+)+)", re.I)
+_ODDS_API_ROW_TICKER_KEYS = (
+    "ticker",
+    "market_ticker",
+    "marketTicker",
+    "market_id",
+    "marketId",
+    "href",
+    "home_href",
+    "away_href",
+    "draw_href",
+    "over_href",
+    "under_href",
+    "home_ticker",
+    "away_ticker",
+    "draw_ticker",
+    "over_ticker",
+    "under_ticker",
+)
+
+
+def _odds_api_book_map_get(mapping: Any, book: str = "Kalshi") -> Any:
+    if not isinstance(mapping, dict):
+        return None
+    want = str(book).strip().lower()
+    for key, val in mapping.items():
+        if str(key).strip().lower() == want:
+            return val
+    return None
+
+
+def coerce_odds_api_kalshi_ticker(value: Any) -> Optional[str]:
+    """Accept a bare KX… ticker or a kalshi.com URL that contains one."""
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    matches = _KX_IN_TEXT.findall(raw)
+    for cand in reversed(matches):
+        tok = str(cand).upper()
+        if is_kalshi_ticker(tok):
+            return tok
+    if is_kalshi_ticker(raw):
+        return raw.upper()
+    return None
+
+
+def odds_api_kalshi_row_ticker(row: Any) -> Optional[str]:
+    """Per-outcome identity if Odds-API ever puts a KX on the odds row.
+
+    Documented Kalshi rows are home/away/draw + lay/depth only. We still
+    read href/ticker/market_id so a future payload does not stay paper.
+    """
+    if not isinstance(row, dict):
+        return None
+    for key in _ODDS_API_ROW_TICKER_KEYS:
+        tok = coerce_odds_api_kalshi_ticker(row.get(key))
+        if tok:
+            return tok
+    return None
+
+
+def odds_api_kalshi_event_ticker(*sources: Any) -> Optional[str]:
+    """Event-level KX from Odds-API ``bookmakerIds`` / ``urls`` (or a stamp)."""
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        for map_key in ("bookmakerIds", "bookmaker_ids"):
+            tok = coerce_odds_api_kalshi_ticker(_odds_api_book_map_get(src.get(map_key)))
+            if tok:
+                return tok
+        tok = coerce_odds_api_kalshi_ticker(_odds_api_book_map_get(src.get("urls")))
+        if tok:
+            return tok
+        tok = coerce_odds_api_kalshi_ticker(src.get("kalshiEventTicker") or src.get("eventTicker"))
+        if tok:
+            return tok
+    return None
+
+
+def odds_api_kalshi_event_url(*sources: Any) -> Optional[str]:
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        raw = _odds_api_book_map_get(src.get("urls"))
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+        extra = src.get("eventHref")
+        if isinstance(extra, str) and extra.strip():
+            return extra.strip()
+        tok = odds_api_kalshi_event_ticker(src)
+        if tok:
+            return f"https://kalshi.com/events/{tok}"
+    return None
+
+
+def resolve_kalshi_take_ticker(row: Any = None, *docs: Any) -> Optional[str]:
+    """Executable Kalshi identity for a take card.
+
+    Prefer a market-level KX on the odds row (public attach / rare Odds-API
+    href). Else the Odds-API event ticker — enough for find_submarket.
+    """
+    tok = odds_api_kalshi_row_ticker(row)
+    if tok:
+        return tok
+    return odds_api_kalshi_event_ticker(*docs)
+
+
+def stamp_odds_api_kalshi_event_identity(doc: Dict[str, Any]) -> Optional[str]:
+    """Copy event ticker onto ``kalshiEventTicker`` without touching odds rows.
+
+    Row href stays empty so public attach can still paint market-level KX.
+    """
+    if not isinstance(doc, dict):
+        return None
+    tok = odds_api_kalshi_event_ticker(doc)
+    if tok:
+        doc["kalshiEventTicker"] = tok
+    return tok
 
 
 def _as_odds_multi_list(data: Any) -> List[Dict[str, Any]]:

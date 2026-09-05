@@ -66,9 +66,12 @@ from ev_calculator import (
 from odds_api_client import (
     get_shared_odds_client,
     major_league_slug_for_events,
+    odds_api_kalshi_event_ticker,
+    odds_api_kalshi_event_url,
     odds_api_master_bookmakers,
     odds_api_sports_list,
     reset_shared_odds_client,
+    resolve_kalshi_take_ticker,
     sport_slug_query_for_api,
     _norm_book,
 )
@@ -1962,11 +1965,14 @@ class OddsEVMonitor:
                 alert.ev_source = "plive_take"
                 alert.ticker = str(bet.get("ticker") or f"PLIVE|{teams}|{selection}|{qualifier}")
             else:
-                alert.ticker = (
-                    self.extract_ticker_from_link(link)
-                    or bet.get("ticker")
-                    or paper_kalshi_ticker(teams, selection, qualifier)
-                )
+                bet_t = bet.get("ticker")
+                link_t = self.extract_ticker_from_link(link)
+                if is_kalshi_ticker(bet_t):
+                    alert.ticker = bet_t
+                elif is_kalshi_ticker(link_t):
+                    alert.ticker = link_t
+                else:
+                    alert.ticker = paper_kalshi_ticker(teams, selection, qualifier)
             alert.price_cents = price_cents
             alert.line = line
             alert.live = alert_data.get("live")
@@ -2616,6 +2622,16 @@ class OddsEVMonitor:
                 "score": clock_fields.get("score") or "",
                 "game_status": clock_fields.get("game_status") or "",
             }
+            event_ticker = odds_api_kalshi_event_ticker(doc)
+            event_url = odds_api_kalshi_event_url(doc)
+            if event_ticker:
+                ev_stub["kalshiEventTicker"] = event_ticker
+            if isinstance(doc.get("urls"), dict):
+                ev_stub["urls"] = doc["urls"]
+            if isinstance(doc.get("bookmakerIds"), dict):
+                ev_stub["bookmakerIds"] = doc["bookmakerIds"]
+            elif isinstance(doc.get("bookmaker_ids"), dict):
+                ev_stub["bookmaker_ids"] = doc["bookmaker_ids"]
             for mname, kal_mk in _kalshi_scan_gameline_markets(bks):
                 odds_rows = kal_mk.get("odds") or []
                 if not odds_rows:
@@ -2645,6 +2661,10 @@ class OddsEVMonitor:
                             "away": k_row.get("away"),
                             bet_side: dec,
                         }
+                        if event_ticker:
+                            bo["eventTicker"] = event_ticker
+                        if event_url and not str(side_href or "").strip():
+                            bo["eventHref"] = event_url
                         for kk in ("hdp", "max", "line", "over", "under", "draw"):
                             if k_row.get(kk) is not None:
                                 bo[kk] = k_row.get(kk)
@@ -3248,9 +3268,10 @@ class OddsEVMonitor:
 
         bo = vb.get("bookmakerOdds") or {}
         href = bo.get("href") if isinstance(bo, dict) else None
-        ticker = extract_kalshi_ticker_from_href(href)
+        ticker = resolve_kalshi_take_ticker(bo if isinstance(bo, dict) else None, odds_doc, ev_obj, vb)
         if is_synthetic_kxscan_ticker(ticker) or is_synthetic_kxscan_ticker(vb.get("_synthetic_ticker")):
             ticker = None
+        event_url = odds_api_kalshi_event_url(odds_doc, ev_obj, bo if isinstance(bo, dict) else None)
 
         take_canon = _norm_book(str(take_book or "Kalshi")) or "Kalshi"
         take_only = vb.get("_take_only")
@@ -3829,7 +3850,7 @@ class OddsEVMonitor:
             "ev": ev_percent,
             "limit": liq_usd,
             "fairOdds": fair_odds_am,
-            "link": href or "",
+            "link": href or event_url or "",
             "book_updated_at": book_ts,
             "kalshi_last_trade_ts": kalshi_trade_ts,
             "displayBooks": display,

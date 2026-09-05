@@ -1,13 +1,23 @@
 """Public Kalshi market listing → Odds-API take-book attach.
 
-Odds-API supplies the rec pack. Soccer Kalshi on that feed is often a
-frozen last. This module lists open GAME/SPREAD/TOTAL markets with an
-unsigned GET and maps the executable YES ask onto Odds-API events.
+Odds-API supplies the rec pack and, for Kalshi, an **event** ticker
+(``bookmakerIds.Kalshi`` / ``urls.Kalshi`` / WS ``url``). That is enough
+for handle_alert → find_submarket. This module is the fallback / enricher
+for **market-level** KX… (ceil suffix) and public YES-ask depth when the
+Odds-API row has no href. Attach=0 must not leave every card as paper
+``KALSHI|…`` if Odds-API already named the event.
 
 Private-key credentials are not used here. Orders still require a key.
 Fail-closed: zero or two-plus event matches, swapped/ambiguous teams,
-or a missing ask → no attach. Fresh Odds-API Kalshi is kept. Stale or
-missing Odds-API Kalshi is overwritten and stamped now. PLive is untouched.
+or a missing ask → no attach. Fresh Odds-API Kalshi **with a real KX
+ticker** is kept. Tickerless / paper Odds-API Kalshi is not "already
+priced" — public attach may paint executable tickers. Stale Odds-API
+Kalshi is overwritten and stamped now. PLive is untouched.
+
+Date-only CFB suffixes (``26SEP05MICHOSU``, midnight UTC) are matched
+by US slate day, not the 18h clock window used when the suffix has a
+kickoff time. Team identity is subset + school-qualifier leftover, not
+any shared token (``State`` / ``Texas`` / ``Michigan``).
 """
 from __future__ import annotations
 
@@ -19,8 +29,13 @@ from collections import defaultdict
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 from ev_calculator import LIVE_REC_POWER_MAX_AGE_SEC, LIVE_TAKE_MAX_AGE_SEC
-from execution_guard import event_ticker_from_any
-from plive_pandora import _norm_team, _team_identity_tokens, odds_event_start_unix
+from execution_guard import (
+    event_ticker_from_any,
+    kalshi_line_int,
+    market_floor_strike_matches_alert,
+    parse_kalshi_ticker,
+)
+from plive_pandora import _TEAM_STOPWORDS, _norm_team, _team_identity_tokens, odds_event_start_unix
 
 KALSHI_BASE = "https://api.elections.kalshi.com"
 KALSHI_MARKETS_PATH = "/trade-api/v2/markets"
@@ -105,6 +120,32 @@ _SUFFIX_RE = re.compile(
     r"^(?P<date>\d{2}[A-Z]{3}\d{2})(?P<time>\d{4})?(?P<codes>[A-Z]+)$"
 )
 
+# School tokens that distinguish Texas vs Texas State, Michigan vs
+# Western Michigan. Leftover qualifier → different school, not a match.
+_SCHOOL_QUALIFIERS = frozenset(
+    {
+        "state",
+        "tech",
+        "university",
+        "univ",
+        "college",
+        "international",
+        "atlantic",
+        "southern",
+        "northern",
+        "eastern",
+        "western",
+        "central",
+        "am",
+        "a&m",
+        "poly",
+        "christian",
+        "baptist",
+        "a",
+        "m",
+    }
+)
+
 _cache_lock: Optional[asyncio.Lock] = None
 _cache: Dict[str, Any] = {"ts": 0.0, "key": "", "markets": []}
 _soccer_series_cache: Dict[str, Any] = {"ts": 0.0, "series": []}
@@ -115,6 +156,29 @@ def _lock() -> asyncio.Lock:
     if _cache_lock is None:
         _cache_lock = asyncio.Lock()
     return _cache_lock
+
+
+def commit_fetched_markets(key: str, markets: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Write the public-market cache. Empty refresh keeps the last good list."""
+    got = [m for m in (markets or []) if isinstance(m, dict)]
+    if got:
+        _cache["ts"] = time.time()
+        _cache["key"] = key
+        _cache["markets"] = list(got)
+        return list(got)
+    prev = list(_cache.get("markets") or [])
+    if prev:
+        print(
+            f"[KALSHI PUBLIC] empty refresh kept {len(prev)} cached market(s) "
+            f"(failed or empty list for {key})"
+        )
+        _cache["ts"] = time.time()
+        _cache["key"] = key
+        return prev
+    _cache["ts"] = time.time()
+    _cache["key"] = key
+    _cache["markets"] = []
+    return []
 
 
 def market_href(ticker: str) -> str:
@@ -423,9 +487,12 @@ def _floor_strike(market: Dict[str, Any]) -> Optional[float]:
         m = re.search(r"(\d+)$", parts[-1])
         if m:
             n = int(m.group(1))
-            # Kalshi totals are halves only (2 → 2.5). Never invent 1.75 / 1.25.
-            return float(n) + 0.5
+            # Suffix is ceil(|line|) (#29): 39 → 38.5. Never invent 1.75 / 1.25.
+            return float(n) - 0.5
     return None
+
+
+_WINS_BY_RE = re.compile(r"^(?P<team>.+?)\s+wins by over\b", re.I)
 
 
 def _title(market: Dict[str, Any]) -> str:
@@ -434,6 +501,19 @@ def _title(market: Dict[str, Any]) -> str:
         if val:
             return str(val)
     return ""
+
+
+def _team_from_title(title: str) -> str:
+    """'Iowa wins by over 27.5 points' → 'Iowa'. Bare 'Iowa' stays."""
+    raw = str(title or "").strip()
+    m = _WINS_BY_RE.match(raw)
+    if m:
+        return m.group("team").strip()
+    return raw
+
+
+def _market_team_title(market: Dict[str, Any]) -> str:
+    return _team_from_title(_title(market))
 
 
 def _family(market: Dict[str, Any]) -> str:
@@ -480,7 +560,7 @@ def parse_event_suffix(event_ticker: str) -> Tuple[Optional[int], Optional[str],
         mon = _MONTH.get(date_s[2:5])
         dd = int(date_s[5:7])
         if mon and dd:
-            from datetime import datetime, timezone
+            from datetime import date, datetime, timedelta, timezone
 
             hh = int(time_s[:2]) if len(time_s) == 4 else 0
             mm = int(time_s[2:4]) if len(time_s) == 4 else 0
@@ -508,14 +588,49 @@ def _code_matches_team(code: str, team: str) -> bool:
     return any(t.startswith(c) or c.startswith(t[: len(c)]) for t in tokens if t)
 
 
+def _kalshi_norm_phrase(s: str) -> str:
+    """Expand St./St → state so Kalshi 'Penn St.' matches 'Penn State'."""
+    t = _norm_team(s)
+    t = re.sub(r"\bst\.?\b", "state", t)
+    t = t.replace("&", " ")
+    return " ".join(t.split())
+
+
+def _kalshi_team_tokens(s: str) -> Set[str]:
+    return {
+        w
+        for w in _kalshi_norm_phrase(s).split()
+        if w and len(w) >= 2 and w not in _TEAM_STOPWORDS
+    }
+
+
+def _team_match_score(odds_name: str, kalshi_name: str) -> Optional[int]:
+    """Subset identity. Leftover school qualifier (State/Tech/Western) → None.
+
+    Any-token overlap (``State``, ``Texas``, ``Michigan``) is not a match —
+    that turned a Saturday NCAAF catalog into 2+ hits and attach 0.
+    """
+    ot = _kalshi_team_tokens(odds_name)
+    kt = _kalshi_team_tokens(kalshi_name)
+    if not ot or not kt:
+        return None
+    if ot == kt:
+        return 200 + len(ot)
+    if kt <= ot:
+        leftover = ot - kt
+        if leftover & _SCHOOL_QUALIFIERS:
+            return None
+        return 80 + len(kt)
+    if ot <= kt:
+        leftover = kt - ot
+        if leftover & _SCHOOL_QUALIFIERS:
+            return None
+        return 80 + len(ot)
+    return None
+
+
 def tokens_match_team(odds_name: str, kalshi_name: str) -> bool:
-    a = _team_identity_tokens(odds_name)
-    b = _team_identity_tokens(kalshi_name)
-    if not a or not b:
-        return False
-    if a == b or a <= b or b <= a:
-        return True
-    return bool(a & b)
+    return _team_match_score(odds_name, kalshi_name) is not None
 
 
 def _is_draw_title(title: str) -> bool:
@@ -529,10 +644,12 @@ def assign_kalshi_title_side(title: str, odds_home: str, odds_away: str) -> Opti
     """Map a Kalshi yes-title onto odds home/away/draw. Ambiguous → None."""
     if _is_draw_title(title):
         return "draw"
-    hit_h = tokens_match_team(odds_home, title)
-    hit_a = tokens_match_team(odds_away, title)
+    hit_h = _team_match_score(odds_home, title)
+    hit_a = _team_match_score(odds_away, title)
     if hit_h and hit_a:
-        return None
+        if hit_h == hit_a:
+            return None
+        return "home" if hit_h > hit_a else "away"
     if hit_h:
         return "home"
     if hit_a:
@@ -605,12 +722,43 @@ def kalshi_book_stamp(doc: Dict[str, Any]) -> Any:
     return None
 
 
+def kalshi_row_has_real_kx(row: Dict[str, Any]) -> bool:
+    """True when an odds row already carries an executable KX ticker or href."""
+    if not isinstance(row, dict):
+        return False
+    keys = (
+        "ticker",
+        "home_ticker",
+        "away_ticker",
+        "draw_ticker",
+        "over_ticker",
+        "under_ticker",
+    )
+    href_keys = ("href", "home_href", "away_href", "draw_href", "over_href", "under_href")
+    for key in keys:
+        tok = str(row.get(key) or "").strip().upper()
+        if tok.startswith("KX"):
+            return True
+    for key in href_keys:
+        tok = _ticker_from_href(row.get(key))
+        if tok.startswith("KX"):
+            return True
+    return False
+
+
+def kalshi_doc_has_real_kx(doc: Dict[str, Any]) -> bool:
+    return bool(kalshi_tickers_from_doc(doc))
+
+
 def kalshi_already_priced(doc: Dict[str, Any], now: Optional[float] = None) -> bool:
     """True only for a priced Odds-API Kalshi quote that is still fresh.
 
     Missing price → False (public may attach). A stamp older than the take
     window on soccer live, or the 45s rec window otherwise, is stale and
     does not block the public YES ask. Unstamped fixtures stay priced.
+
+    Fresh + priced does **not** require a KX ticker. Attach must still
+    enrich tickerless rows instead of treating this as a skip.
     """
     if not kalshi_has_priced_decimal(doc):
         return False
@@ -702,11 +850,44 @@ def _codes_compatible(event_ticker: str, home: str, away: str) -> bool:
     return True
 
 
+def _suffix_re_match(event_ticker: str):
+    parts = str(event_ticker or "").upper().split("-")
+    if len(parts) < 2:
+        return None
+    return _SUFFIX_RE.match(parts[1])
+
+
+def _date_only_slate_ok(k_start: int, o_start: int) -> bool:
+    """Date-only Kalshi suffixes are midnight UTC. Compare US slate day ±1.
+
+    The 18h clock window rejects Saturday 3:30/7:00 ET CFB (19–23h after
+    00:00 UTC) and was the live 'spike 1–2 then flat' on a busy slate.
+    Next week (SEP12 vs SEP05) stays out.
+    """
+    from datetime import datetime, timezone
+
+    try:
+        from zoneinfo import ZoneInfo
+
+        ny = ZoneInfo("America/New_York")
+    except Exception:
+        from datetime import timedelta
+
+        ny = timezone(timedelta(hours=-4))
+    k_date = datetime.fromtimestamp(int(k_start), tz=timezone.utc).date()
+    o_date = datetime.fromtimestamp(int(o_start), tz=ny).date()
+    return abs((k_date - o_date).days) <= 1
+
+
 def _timing_ok(event_ticker: str, doc: Dict[str, Any]) -> bool:
     k_start, _a, _b = parse_event_suffix(event_ticker)
     o_start = odds_event_start_unix(doc)
     if k_start and o_start:
-        return abs(int(k_start) - int(o_start)) <= max(0, START_TOLERANCE_SEC)
+        m = _suffix_re_match(event_ticker)
+        has_clock = bool(m and m.group("time"))
+        if has_clock:
+            return abs(int(k_start) - int(o_start)) <= max(0, START_TOLERANCE_SEC)
+        return _date_only_slate_ok(int(k_start), int(o_start))
     return True
 
 
@@ -717,11 +898,13 @@ def _unique_title_sides(
     for title in titles:
         if not title or str(title).lower() in ("over", "under") or _is_draw_title(title):
             continue
-        hit_h = tokens_match_team(home, title)
-        hit_a = tokens_match_team(away, title)
+        hit_h = _team_match_score(home, title)
+        hit_a = _team_match_score(away, title)
         if hit_h and hit_a:
-            return None
-        if hit_h:
+            if hit_h == hit_a:
+                return None
+            assigned.add("home" if hit_h > hit_a else "away")
+        elif hit_h:
             assigned.add("home")
         elif hit_a:
             assigned.add("away")
@@ -744,7 +927,7 @@ def match_public_event(
         if not _timing_ok(ev, doc):
             continue
         ml_titles = [_title(m) for m in (buckets.get("moneyline") or [])]
-        spr_titles = [_title(m) for m in (buckets.get("spread") or [])]
+        spr_titles = [_market_team_title(m) for m in (buckets.get("spread") or [])]
         ml_sides = _unique_title_sides(ml_titles, home, away)
         if ml_sides == {"home", "away"}:
             hits.append(ev)
@@ -819,7 +1002,7 @@ def _spread_row(market: Dict[str, Any], home: str, away: str) -> Optional[Dict[s
     strike = _floor_strike(market)
     if strike is None or strike <= 0:
         return None
-    fav_side = assign_kalshi_title_side(_title(market), home, away)
+    fav_side = assign_kalshi_title_side(_market_team_title(market), home, away)
     if fav_side is None:
         return None
     yes_dec = decimal_from_ask(_ask_prob(market, "yes"))
@@ -868,6 +1051,102 @@ def _total_row(market: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
+def _numeric_line_close(a: Any, b: Any) -> bool:
+    try:
+        return abs(float(a) - float(b)) < 1e-6
+    except (TypeError, ValueError):
+        return False
+
+
+def _market_matches_alert_line(market: Dict[str, Any], line: Any) -> bool:
+    """Exact strike: ceil(|line|) suffix + floor_strike == |line|. Neighbor denied."""
+    if not isinstance(market, dict) or line is None or line == "":
+        return False
+    try:
+        mag = abs(float(line))
+    except (TypeError, ValueError):
+        return False
+    parsed = parse_kalshi_ticker(market.get("ticker"))
+    want = kalshi_line_int(mag)
+    if parsed and parsed.line_int is not None and want is not None:
+        if parsed.line_int != want:
+            return False
+        return market_floor_strike_matches_alert(market, mag)
+    raw = market.get("floor_strike")
+    if raw is None or raw == "":
+        return False
+    try:
+        return abs(float(raw) - mag) < 1e-6
+    except (TypeError, ValueError):
+        return False
+
+
+def _unique_strike_market(
+    markets: Sequence[Dict[str, Any]],
+    line: Any,
+    home: str = "",
+    away: str = "",
+    *,
+    kind: str = "total",
+) -> Optional[Dict[str, Any]]:
+    """Fail-closed: 0 or 2+ markets at this strike → None. Spread checks fav side."""
+    if line is None or line == "":
+        return None
+    try:
+        signed = float(line)
+        mag = abs(signed)
+    except (TypeError, ValueError):
+        return None
+    hits: List[Dict[str, Any]] = []
+    for m in markets or []:
+        if not isinstance(m, dict) or not _market_matches_alert_line(m, mag):
+            continue
+        if kind == "spread" and home and away:
+            fav = assign_kalshi_title_side(_market_team_title(m), home, away)
+            if fav is None:
+                continue
+            expected = "home" if signed < 0 else "away" if signed > 0 else None
+            if expected and fav != expected:
+                continue
+        hits.append(m)
+    if len(hits) != 1:
+        return None
+    return hits[0]
+
+
+def _odds_rows_for_strikes(
+    markets: Sequence[Dict[str, Any]],
+    home: str,
+    away: str,
+    *,
+    kind: str,
+) -> List[Dict[str, Any]]:
+    """Main line first, then remaining exact-strike alts (Iowa -27.5, not only -3.5)."""
+    out: List[Dict[str, Any]] = []
+    seen: List[float] = []
+    ordered: List[Dict[str, Any]] = []
+    main = _pick_main(markets)
+    if main:
+        ordered.append(main)
+    for m in markets or []:
+        if m is main or not isinstance(m, dict):
+            continue
+        ordered.append(m)
+    builder = _spread_row if kind == "spread" else (lambda m, _h, _a: _total_row(m))
+    for m in ordered:
+        row = builder(m, home, away)
+        if not row:
+            continue
+        key = abs(float(row.get("hdp") or row.get("line") or 0.0))
+        if any(_numeric_line_close(key, s) for s in seen):
+            continue
+        seen.append(key)
+        out.append(row)
+        if len(out) >= 12:
+            break
+    return out
+
+
 def book_from_event(
     buckets: Dict[str, List[Dict[str, Any]]],
     home: str,
@@ -877,13 +1156,95 @@ def book_from_event(
     ml = _ml_row(buckets.get("moneyline") or [], home, away)
     if ml:
         out.append({"name": "ML", "odds": [ml]})
-    spr = _spread_row(_pick_main(buckets.get("spread") or []) or {}, home, away)
-    if spr:
-        out.append({"name": "Spread", "odds": [spr]})
-    tot = _total_row(_pick_main(buckets.get("total") or []) or {})
-    if tot:
-        out.append({"name": "Totals", "odds": [tot]})
+    spr_rows = _odds_rows_for_strikes(buckets.get("spread") or [], home, away, kind="spread")
+    if spr_rows:
+        out.append({"name": "Spread", "odds": spr_rows})
+    tot_rows = _odds_rows_for_strikes(buckets.get("total") or [], home, away, kind="total")
+    if tot_rows:
+        out.append({"name": "Totals", "odds": tot_rows})
     return out
+
+
+def _copy_ticker_fields(dst: Dict[str, Any], src: Dict[str, Any]) -> bool:
+    changed = False
+    for key in (
+        "ticker",
+        "href",
+        "home_ticker",
+        "away_ticker",
+        "draw_ticker",
+        "over_ticker",
+        "under_ticker",
+        "home_href",
+        "away_href",
+        "draw_href",
+        "over_href",
+        "under_href",
+    ):
+        val = src.get(key)
+        if val and dst.get(key) != val:
+            dst[key] = val
+            changed = True
+    return changed
+
+
+def enrich_public_kalshi_hrefs(
+    doc: Dict[str, Any],
+    buckets: Dict[str, List[Dict[str, Any]]],
+    now: Optional[float] = None,
+) -> int:
+    """Paint real KX hrefs onto existing Odds-API Kalshi rows. Keep decimals.
+
+    Fresh tickerless last stays the take. Public catalog supplies identity
+    only. Exact strike — neighbor / wrong fav denied.
+    """
+    raw = _kalshi_book_list(doc)
+    if not raw:
+        return 0
+    home = str(doc.get("home") or "")
+    away = str(doc.get("away") or "")
+    painted = 0
+    for mk in raw:
+        if not isinstance(mk, dict):
+            continue
+        name = str(mk.get("name") or "").lower()
+        if "spread" in name:
+            family = "spread"
+        elif "total" in name:
+            family = "total"
+        else:
+            family = "moneyline"
+        for row in mk.get("odds") or []:
+            if not isinstance(row, dict) or kalshi_row_has_real_kx(row):
+                continue
+            if family == "moneyline":
+                ml = _ml_row(buckets.get("moneyline") or [], home, away)
+                if ml and _copy_ticker_fields(row, ml):
+                    painted += 1
+                continue
+            if family == "spread":
+                line = row.get("hdp")
+                mkt = _unique_strike_market(
+                    buckets.get("spread") or [], line, home, away, kind="spread"
+                )
+                built = _spread_row(mkt or {}, home, away) if mkt else None
+                if built and _copy_ticker_fields(row, built):
+                    painted += 1
+                continue
+            line = row.get("hdp") if row.get("hdp") is not None else row.get("max")
+            if line is None:
+                line = row.get("line")
+            mkt = _unique_strike_market(
+                buckets.get("total") or [], line, home, away, kind="total"
+            )
+            built = _total_row(mkt) if mkt else None
+            if built and _copy_ticker_fields(row, built):
+                painted += 1
+    if painted:
+        clock = float(now if now is not None else time.time())
+        # Identity only — do not refresh book_updated_at (prices unchanged).
+        _ = clock
+    return painted
 
 
 def _ticker_from_href(href: Any) -> str:
@@ -998,17 +1359,29 @@ def attach_public_kalshi_markets(
 ) -> int:
     """Inject Odds-API-shaped ``bookmakers['Kalshi']`` from public markets. Mutates docs.
 
-    Fresh priced Odds-API Kalshi is kept. Stale or missing is replaced with the
-    public YES ask and stamped now. WS-up does not skip this path.
+    Fresh priced Odds-API Kalshi **with** a real KX ticker is kept.
+    Fresh priced **without** href/ticker is enriched (hrefs only; decimals stay).
+    Stale or missing is replaced with the public YES ask and stamped now.
+    WS-up does not skip this path.
     """
     grouped = _group_events(markets)
     clock = float(now if now is not None else time.time())
     attached = 0
     for doc in _as_docs(docs):
-        if kalshi_already_priced(doc, now=clock):
-            continue
         ev = match_public_event(doc, grouped)
         if not ev:
+            continue
+        fresh = kalshi_already_priced(doc, now=clock)
+        if fresh and kalshi_doc_has_real_kx(doc):
+            # Still enrich any tickerless alt rows (Iowa -27.5 next to a KX main).
+            n_en = enrich_public_kalshi_hrefs(doc, grouped[ev], now=clock)
+            if n_en:
+                attached += 1
+            continue
+        if fresh and kalshi_has_priced_decimal(doc):
+            n_en = enrich_public_kalshi_hrefs(doc, grouped[ev], now=clock)
+            if n_en:
+                attached += 1
             continue
         book = book_from_event(
             grouped[ev],
@@ -1094,10 +1467,7 @@ async def fetch_open_series_markets(
             await session.close()
 
     async with _lock():
-        _cache["ts"] = time.time()
-        _cache["key"] = key
-        _cache["markets"] = markets
-    return markets
+        return commit_fetched_markets(key, markets)
 
 
 async def fetch_soccer_series_catalog(
@@ -1178,9 +1548,12 @@ async def attach_public_kalshi_to_docs(
             return 0
     n = attach_public_kalshi_markets(docs, markets)
     n_ask = apply_public_yes_asks(docs, markets)
-    if n or n_ask:
-        print(
-            f"[PIPELINE] Public Kalshi: attached take lines to {n} event(s) "
-            f"yes_ask_refresh={n_ask} (no private key; WS-up does not skip)"
-        )
+    n_docs = len(_as_docs(docs))
+    n_kx = sum(1 for d in _as_docs(docs) if kalshi_doc_has_real_kx(d))
+    print(
+        f"[PIPELINE] Public Kalshi: attached take lines to {n} event(s) "
+        f"yes_ask_refresh={n_ask} markets={len(markets or [])} "
+        f"docs={n_docs} realKX={n_kx} "
+        f"(no private key; tickerless Odds-API is enriched, not skipped)"
+    )
     return n + n_ask
