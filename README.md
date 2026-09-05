@@ -34,9 +34,24 @@ That combination is enough for the baseball-only pin:
 - **No `status=` param** so you get **prematch + live** on the one connection (the API allows only `live` *or* `prematch`, not both).
 - REST stays for `/events` + `/events/live` slate repair and `resync_required` snapshots (`includeSeq=true` → `X-OddsAPI-Seq` → reconnect `lastSeq`).
 - The old per-poll `/odds/multi` hot loop is **not** the primary path when the WS is healthy (a 10-book REST poller will 429 a Growth WS account).
-- **Global auto-bet stays OFF** at startup. Same existing filter knobs and dollar sizes. Enable auto-bet from the dashboard when you trust the feed.
+- **Global auto-bet defaults OFF** at process start (fail-closed). The last ON/OFF is restored from `user_filters_state.json` (`auto_bet_enabled`). Enable via dashboard `POST /api/set_auto_bet` or `bot_control enable_auto_bet`.
 - EvAlerts still come from `ev_calculator.py` (POWER / WORST_CASE / AVERAGE).
-- Default filter remains **Kalshi All Sports (3 Sharps Live)** (GAMELINES, minSharpBooks 3, POWER/AVERAGE vs Kalshi, bettingBooks=`[Kalshi]`). Auto-bet American band **-200..+200** (~30–70¢). CBB stays WORST_CASE / minSharp 2 / auto EV 10–25%. **Soccer Live (2 Sharps)** is a third dashboard filter (SOCCER_ALL, GAMELINES, minSharp 2, POWER/AVERAGE). BetMGM is excluded from the soccer **sharp pack only** (tiles / account selection stay). 1H / team totals are excluded. Soccer auto-bet stays OFF. Dollar sizes stay `101 / 151 / 101 / 75 / 202 / 404`, `user_max_bet=100`, PX+Novig 2x. Persisted in `user_filters_state.json`.
+- Default filter remains **Kalshi All Sports (3 Sharps Live)** (GAMELINES, minSharpBooks 3, POWER/AVERAGE vs Kalshi, bettingBooks=`[Kalshi]`). Auto-bet American band **-200..+200** (~30–70¢). CBB stays WORST_CASE / minSharp 2 / auto EV 10–25%. **Soccer Live (2 Sharps)** is a third dashboard filter (SOCCER_ALL, GAMELINES, minSharp 2, POWER/AVERAGE). BetMGM is excluded from the soccer **sharp pack only** (tiles / account selection stay). 1H / team totals are excluded. Soccer auto-bet stays OFF. Default auto-bet stake is **$25** when unset (`DEFAULT_AUTO_BET_AMOUNT`). Market-type sizes stay `151 / 101 / 75 / 202 / 404`, `user_max_bet=100`, PX+Novig 2x. Persisted in `user_filters_state.json`.
+
+### `user_filters_state.json` keys
+
+Single persist file (atomic replace via `_persist_filters_state` / `_load_filters_state`). Written by filter save/select and by `set_auto_bet` / `bot_control` enable-disable / Telegram start-stop.
+
+| Key | Purpose | Missing-key default |
+|-----|---------|---------------------|
+| `saved_filters` | Named filter payloads | Built-in DEFAULT / CBB / Soccer |
+| `selected_dashboard_filters` | Dashboard monitor list | Product filters |
+| `selected_auto_bettor_filters` | Filters allowed to auto-bet | `[]` |
+| `auto_bet_enabled` | Global auto-bet ON/OFF | `false` (fail-closed) |
+| `auto_bet_amount` | Top-level stake | `25` |
+| `auto_bet_ev_min` / `auto_bet_ev_max` | Top-level EV bounds | `5` / `25` |
+| `auto_bet_odds_min` / `auto_bet_odds_max` | Top-level American odds band | `-200` / `200` |
+| `auto_bet_settings_by_filter` | Per-filter EV / odds / amount / enabled | Amount `25`, enabled `false` |
 
 ## 10 bookmakers (Odds-API.io catalog names)
 

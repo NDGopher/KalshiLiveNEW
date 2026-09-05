@@ -237,6 +237,7 @@ per_event_max_bet = 404.0  # Default max bet per event in dollars (user-configur
 
 # Auto-bet settings (global toggle)
 auto_bet_enabled = False  # Default OFF at startup; enable from dashboard when ready
+# Last ON/OFF + stake/EV bounds are overlaid from user_filters_state.json after defaults.
 
 # Per-filter auto-bet settings
 # Format: {filter_name: {'ev_min': float, 'ev_max': float, 'odds_min': int, 'odds_max': int, 'amount': float, 'enabled': bool}}
@@ -254,7 +255,8 @@ auto_bet_ev_min = 5.0  # Minimum EV percentage (auto-bettor uses conservative 5%
 auto_bet_ev_max = 25.0  # Maximum EV percentage
 auto_bet_odds_min = -200  # Minimum American odds (matches new conservative filter range)
 auto_bet_odds_max = 200  # Maximum American odds (matches new conservative filter range)
-auto_bet_amount = 101.0  # Auto-bet amount in dollars
+DEFAULT_AUTO_BET_AMOUNT = 25.0  # Desk default when no saved amount
+auto_bet_amount = 25.0  # Auto-bet amount in dollars
 
 # Track auto-bet submarkets to prevent duplicates (ticker + side combination)
 auto_bet_submarkets = set()  # Set of (ticker, side) tuples
@@ -601,15 +603,70 @@ saved_filters[SOCCER_FILTER_NAME] = SOCCER_FILTER_PAYLOAD
 selected_dashboard_filters = [DEFAULT_FILTER_NAME, CBB_FILTER_NAME, SOCCER_FILTER_NAME]
 selected_auto_bettor_filters = []
 
+# Initialize per-filter auto-bet settings with defaults (overlaid from disk below).
+auto_bet_settings_by_filter[DEFAULT_FILTER_NAME] = {
+    'ev_min': 5.0,
+    'ev_max': 25.0,
+    'odds_min': -200,
+    'odds_max': 200,
+    'amount': 25.0,
+    'enabled': False,
+}
+auto_bet_settings_by_filter[CBB_FILTER_NAME] = {
+    'ev_min': 10.0,
+    'ev_max': 25.0,
+    'odds_min': -200,
+    'odds_max': 200,
+    'amount': 25.0,
+    'enabled': False,
+}
+auto_bet_settings_by_filter[SOCCER_FILTER_NAME] = {
+    'ev_min': 5.0,
+    'ev_max': 25.0,
+    'odds_min': -200,
+    'odds_max': 200,
+    'amount': 25.0,
+    'enabled': False,
+}
+
+
+def _coerce_auto_bet_amount(value, default=None) -> float:
+    """Positive dollar stake; ``DEFAULT_AUTO_BET_AMOUNT`` (25) when unset/invalid."""
+    if default is None:
+        default = DEFAULT_AUTO_BET_AMOUNT
+    try:
+        amt = float(value)
+        if amt > 0:
+            return amt
+    except (TypeError, ValueError):
+        pass
+    return float(default)
+
 
 def _persist_filters_state() -> None:
-    """Write ``saved_filters`` and selection lists to ``USER_FILTERS_STATE_FILE`` (atomic replace)."""
+    """Atomic write of filters + auto-bet toggle/stake/EV to ``user_filters_state.json``.
+
+    Keys: ``saved_filters``, ``selected_dashboard_filters``, ``selected_auto_bettor_filters``,
+    ``auto_bet_enabled``, ``auto_bet_amount``, ``auto_bet_ev_min``, ``auto_bet_ev_max``,
+    ``auto_bet_odds_min``, ``auto_bet_odds_max``, ``auto_bet_settings_by_filter``.
+    """
     try:
         payload = {
             "version": 1,
             "saved_filters": dict(saved_filters),
             "selected_dashboard_filters": list(selected_dashboard_filters),
             "selected_auto_bettor_filters": list(selected_auto_bettor_filters),
+            "auto_bet_enabled": bool(auto_bet_enabled),
+            "auto_bet_amount": float(auto_bet_amount),
+            "auto_bet_ev_min": float(auto_bet_ev_min),
+            "auto_bet_ev_max": float(auto_bet_ev_max),
+            "auto_bet_odds_min": int(auto_bet_odds_min),
+            "auto_bet_odds_max": int(auto_bet_odds_max),
+            "auto_bet_settings_by_filter": {
+                str(name): dict(settings)
+                for name, settings in auto_bet_settings_by_filter.items()
+                if isinstance(settings, dict)
+            },
         }
         tmp = USER_FILTERS_STATE_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -619,8 +676,51 @@ def _persist_filters_state() -> None:
         print(f"[DASHBOARD] Could not persist filter state ({USER_FILTERS_STATE_FILE}): {exc}")
 
 
+def _overlay_auto_bet_persist(data: dict) -> None:
+    """Restore auto-bet ON/OFF, stake, EV/odds bounds, and per-filter amounts from disk.
+
+    Missing ``auto_bet_enabled`` stays False (fail-closed). Missing amount stays 25.
+    """
+    global auto_bet_enabled, auto_bet_amount, auto_bet_ev_min, auto_bet_ev_max
+    global auto_bet_odds_min, auto_bet_odds_max, auto_bet_settings_by_filter
+    if not isinstance(data, dict):
+        return
+    if "auto_bet_enabled" in data:
+        auto_bet_enabled = bool(data.get("auto_bet_enabled"))
+    if "auto_bet_amount" in data:
+        auto_bet_amount = _coerce_auto_bet_amount(data.get("auto_bet_amount"))
+    if "auto_bet_ev_min" in data:
+        try:
+            auto_bet_ev_min = float(data["auto_bet_ev_min"])
+        except (TypeError, ValueError):
+            pass
+    if "auto_bet_ev_max" in data:
+        try:
+            auto_bet_ev_max = float(data["auto_bet_ev_max"])
+        except (TypeError, ValueError):
+            pass
+    if "auto_bet_odds_min" in data:
+        try:
+            auto_bet_odds_min = int(data["auto_bet_odds_min"])
+        except (TypeError, ValueError):
+            pass
+    if "auto_bet_odds_max" in data:
+        try:
+            auto_bet_odds_max = int(data["auto_bet_odds_max"])
+        except (TypeError, ValueError):
+            pass
+    settings = data.get("auto_bet_settings_by_filter")
+    if isinstance(settings, dict):
+        for name, cfg in settings.items():
+            if not isinstance(name, str) or not isinstance(cfg, dict):
+                continue
+            dest = auto_bet_settings_by_filter.setdefault(name, {})
+            dest.update(cfg)
+            dest["amount"] = _coerce_auto_bet_amount(dest.get("amount"))
+
+
 def _load_filters_state() -> None:
-    """Overlay disk state onto ``saved_filters`` / selections (invalid names dropped)."""
+    """Overlay disk state onto ``saved_filters`` / selections / auto-bet (invalid names dropped)."""
     global saved_filters, selected_dashboard_filters, selected_auto_bettor_filters
     if not os.path.isfile(USER_FILTERS_STATE_FILE):
         return
@@ -649,6 +749,12 @@ def _load_filters_state() -> None:
         selected_auto_bettor_filters = [
             str(x) for x in auto_sel if isinstance(x, str) and x in saved_filters
         ]
+    _overlay_auto_bet_persist(data)
+    print(
+        f"[DASHBOARD] Auto-bet persist loaded: enabled={auto_bet_enabled} "
+        f"amount=${auto_bet_amount:.2f} ev={auto_bet_ev_min}-{auto_bet_ev_max} "
+        f"filters={selected_auto_bettor_filters}"
+    )
 
 
 _load_filters_state()
@@ -1746,32 +1852,6 @@ async def _live_odds_build_snapshot_isolated(
     finally:
         await c.close()
 
-
-# Initialize per-filter auto-bet settings with defaults
-auto_bet_settings_by_filter[DEFAULT_FILTER_NAME] = {
-    'ev_min': 5.0,
-    'ev_max': 25.0,
-    'odds_min': -200,
-    'odds_max': 200,
-    'amount': 101.0,
-    'enabled': False,
-}
-auto_bet_settings_by_filter[CBB_FILTER_NAME] = {
-    'ev_min': 10.0,
-    'ev_max': 25.0,
-    'odds_min': -200,
-    'odds_max': 200,
-    'amount': 101.0,
-    'enabled': False,
-}
-auto_bet_settings_by_filter[SOCCER_FILTER_NAME] = {
-    'ev_min': 5.0,
-    'ev_max': 25.0,
-    'odds_min': -200,
-    'odds_max': 200,
-    'amount': 101.0,
-    'enabled': False,
-}
 
 # Auto-bet tracking for Google Sheets export and win/loss analysis
 AUTO_BET_CSV_FILE = os.path.join(os.path.dirname(__file__), "auto_bets.csv")  # Backup CSV
@@ -8567,9 +8647,11 @@ def bot_control():
     
     if action == 'enable_auto_bet':
         auto_bet_enabled = True
+        _persist_filters_state()
         return jsonify({'success': True, 'message': 'Auto-betting enabled', 'auto_bet_enabled': True})
     elif action == 'disable_auto_bet':
         auto_bet_enabled = False
+        _persist_filters_state()
         return jsonify({'success': True, 'message': 'Auto-betting disabled', 'auto_bet_enabled': False})
     elif action == 'stop_service' or action == 'stop_bot':
         # Stop the monitoring loop (but keep Flask server running)
@@ -8993,7 +9075,8 @@ def set_auto_bet():
         print(f"Auto-bet duplicate tracking cleared")
     
     print(f"Auto-bet settings updated: enabled={auto_bet_enabled}, EV={auto_bet_ev_min}%-{auto_bet_ev_max}%, Odds={auto_bet_odds_min}-{auto_bet_odds_max}, Amount=${auto_bet_amount:.2f}, NHL Over=${nhl_over_bet_amount:.2f}, PX+Novig Multiplier={px_novig_multiplier}x, Tracked submarkets: {len(auto_bet_submarkets)}")
-    
+    _persist_filters_state()
+
     return jsonify({
         'success': True,
         'enabled': auto_bet_enabled,
@@ -9018,6 +9101,7 @@ def handle_telegram_callback(callback_data: str, callback_id: str = None):
             auto_bet_enabled = True
             if old_enabled != auto_bet_enabled:
                 send_auto_bet_state_change(auto_bet_enabled)
+            _persist_filters_state()
             # Answer callback query
             if callback_id:
                 answer_callback_query(callback_id, "✅ Auto-betting started!")
@@ -9028,6 +9112,7 @@ def handle_telegram_callback(callback_data: str, callback_id: str = None):
             auto_bet_enabled = False
             if old_enabled != auto_bet_enabled:
                 send_auto_bet_state_change(auto_bet_enabled)
+            _persist_filters_state()
             # Answer callback query
             if callback_id:
                 answer_callback_query(callback_id, "⛔ Auto-betting stopped!")
@@ -9069,6 +9154,7 @@ Tracked Submarkets: {len(auto_bet_submarkets)}"""
                 new_amount = float(amount_str)
                 old_amount = auto_bet_amount  # auto_bet_amount already declared as global at function start
                 auto_bet_amount = new_amount
+                _persist_filters_state()
                 send_telegram_message(f"✅ Bet amount changed from ${old_amount:.2f} to ${new_amount:.2f}")
                 if callback_id:
                     answer_callback_query(callback_id, f"Set to ${new_amount:.2f}!")
@@ -9210,6 +9296,7 @@ def telegram_webhook():
             auto_bet_enabled = True
             if old_enabled != auto_bet_enabled:
                 send_auto_bet_state_change(auto_bet_enabled)
+                _persist_filters_state()
                 return jsonify({'success': True})  # Don't send duplicate message
             else:
                 response_text = "✅ Auto-betting is already active!"
@@ -9225,6 +9312,7 @@ def telegram_webhook():
             auto_bet_enabled = False
             if old_enabled != auto_bet_enabled:
                 send_auto_bet_state_change(auto_bet_enabled)
+                _persist_filters_state()
                 return jsonify({'success': True})  # Don't send duplicate message
             else:
                 response_text = "⛔ Auto-betting is already inactive!"
@@ -10761,6 +10849,7 @@ def initialize_dashboard():
                     auto_bet_enabled = True
                     if old_enabled != auto_bet_enabled:
                         send_auto_bet_state_change(auto_bet_enabled)
+                        _persist_filters_state()
                         return  # Don't send duplicate message
                     else:
                         response_text = "✅ Auto-betting is already active!"
@@ -10776,6 +10865,7 @@ def initialize_dashboard():
                     auto_bet_enabled = False
                     if old_enabled != auto_bet_enabled:
                         send_auto_bet_state_change(auto_bet_enabled)
+                        _persist_filters_state()
                         return  # Don't send duplicate message
                     else:
                         response_text = "⛔ Auto-betting is already inactive!"

@@ -1675,7 +1675,7 @@ async function loadAutoBetSettings() {
                     ev_max: 25.0,
                     odds_min: -200,
                     odds_max: 200,
-                    amount: 101.0,
+                    amount: 25.0,
                     enabled: true
                 };
                 const isSelected = data.selected_auto_bettor_filters && data.selected_auto_bettor_filters.includes(filterName);
@@ -1705,7 +1705,7 @@ async function loadAutoBetSettings() {
                     </div>
                     <div class="auto-bet-row">
                         <label>Bet Amount: $</label>
-                        <input type="number" class="auto-bet-input filter-amount" data-filter="${escapeHtml(filterName)}" value="${filterSettings.amount || 101.0}" min="1" step="1">
+                        <input type="number" class="auto-bet-input filter-amount" data-filter="${escapeHtml(filterName)}" value="${filterSettings.amount || 25.0}" min="1" step="1">
                     </div>
                 `;
                 
@@ -1728,7 +1728,7 @@ async function loadAutoBetSettings() {
                 if (evMaxInput) evMaxInput.value = data.ev_max || 20.0;
                 if (oddsMinInput) oddsMinInput.value = data.odds_min || -150;
                 if (oddsMaxInput) oddsMaxInput.value = data.odds_max || 150;
-                if (amountInput) amountInput.value = data.amount || 100.0;
+                if (amountInput) amountInput.value = data.amount || 25.0;
             }
         }
     } catch (error) {
@@ -1768,7 +1768,7 @@ async function saveAutoBetSettings(quiet = false) {
                     ev_max: parseFloat(evMaxInput.value) || 25.0,
                     odds_min: parseInt(oddsMinInput.value) || -200,
                     odds_max: parseInt(oddsMaxInput.value) || 200,
-                    amount: parseFloat(amountInput.value) || 101.0,
+                    amount: parseFloat(amountInput.value) || 25.0,
                     enabled: checkbox.checked
                 };
                 
