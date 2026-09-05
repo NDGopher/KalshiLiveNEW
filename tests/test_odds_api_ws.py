@@ -494,6 +494,12 @@ def test_bet365_latency_suffix_canonicalizes():
     assert _canonical_odds_api_bookmaker("Bet365 (no latency)") == "Bet365"
     assert _canonical_odds_api_bookmaker("Bet365 (low latency)") == "Bet365"
     assert _canonical_odds_api_bookmaker("bet365 no latency") == "Bet365"
+    assert _canonical_odds_api_bookmaker("Bet365 NJ") == "Bet365"
+    assert _canonical_odds_api_bookmaker("DraftKings (no latency)") == "DraftKings"
+    assert _canonical_odds_api_bookmaker("FanDuel - NJ") == "FanDuel"
+    assert _canonical_odds_api_bookmaker("betfair sportsbook") == _canonical_odds_api_bookmaker(
+        "betfair"
+    )
 
 
 def test_ws_bet365_latency_label_stores_as_bet365():
@@ -509,6 +515,100 @@ def test_ws_bet365_latency_label_stores_as_bet365():
     )
     assert "Bet365" in store.merged_doc(55)["bookmakers"]
     assert "Bet365 (no latency)" not in store.merged_doc(55)["bookmakers"]
+
+
+def test_thin_ws_store_skips_rest_when_backfill_disabled(monkeypatch):
+    """WS-first default: thin Polymarket-only store is NOT REST-filled every poll."""
+    monkeypatch.setenv("ODDS_API_KEY", "test-not-a-real-key")
+    monkeypatch.setenv("ODDS_API_WS", "true")
+    monkeypatch.setenv("ODDS_API_WS_REST_BACKFILL", "false")
+    monkeypatch.setenv("ODDS_API_WS_COLD_SEED", "false")
+
+    class SpyRest(_DummyRest):
+        def __init__(self):
+            self.multi_calls = 0
+
+        async def get_odds_multi(self, *args, **kwargs):
+            self.multi_calls += 1
+            raise AssertionError("thin backfill disabled — must not call REST")
+
+    async def run() -> None:
+        rest = SpyRest()
+        feed = OddsApiWsFeed(rest, api_key="test-not-a-real-key")
+        _mark_feed_healthy(feed)
+        feed.store.apply_rest_docs(
+            [
+                {
+                    "id": 42,
+                    "home": "Arsenal",
+                    "away": "Chelsea",
+                    "bookmakers": {
+                        "Polymarket": [{"name": "ML", "odds": [{"home": 2.1, "away": 3.3, "draw": 3.0}]}],
+                    },
+                }
+            ]
+        )
+        _install_shared_feed(feed)
+        docs, src = await resolve_odds_docs(rest, [42], ["DraftKings", "Polymarket"])
+        assert src == "websocket"
+        assert rest.multi_calls == 0
+        assert list((docs[0].get("bookmakers") or {}).keys()) == ["Polymarket"]
+
+    try:
+        asyncio.run(run())
+    finally:
+        ows._shared_feed = None
+        ows._recovery_lock = None
+        ows._ws_rest_backfill_lock = None
+        ows._ws_rest_backfill_until = 0.0
+
+
+def test_cold_ws_store_seeds_empty_events_via_rest(monkeypatch):
+    """Cold seed (default path): events with zero books get a one-shot REST seed."""
+    monkeypatch.setenv("ODDS_API_KEY", "test-not-a-real-key")
+    monkeypatch.setenv("ODDS_API_WS", "true")
+    monkeypatch.setenv("ODDS_API_WS_REST_BACKFILL", "false")
+    monkeypatch.setenv("ODDS_API_WS_COLD_SEED", "true")
+    monkeypatch.setenv("ODDS_API_WS_REST_BACKFILL_COOLDOWN_SEC", "30")
+
+    class SeedRest(_DummyRest):
+        def __init__(self):
+            self.multi_calls = 0
+
+        async def get_odds_multi(self, event_ids, bookmakers, **kwargs):
+            self.multi_calls += 1
+            return [
+                {
+                    "id": 42,
+                    "home": "Arsenal",
+                    "away": "Chelsea",
+                    "sport": "football",
+                    "bookmakers": {
+                        "DraftKings": [{"name": "ML", "odds": [{"home": 2.0, "away": 3.5, "draw": 3.2}]}],
+                        "FanDuel": [{"name": "ML", "odds": [{"home": 2.05, "away": 3.4, "draw": 3.1}]}],
+                        "Bet365": [{"name": "ML", "odds": [{"home": 1.95, "away": 3.6, "draw": 3.3}]}],
+                    },
+                }
+            ]
+
+    async def run() -> None:
+        rest = SeedRest()
+        feed = OddsApiWsFeed(rest, api_key="test-not-a-real-key")
+        _mark_feed_healthy(feed)
+        feed.store.apply_slate([{"id": 42, "home": "Arsenal", "away": "Chelsea"}])
+        _install_shared_feed(feed)
+        docs, src = await resolve_odds_docs(rest, [42], ["DraftKings", "FanDuel", "Bet365"])
+        assert src == "websocket_rest_fill"
+        assert rest.multi_calls == 1
+        assert {"DraftKings", "FanDuel", "Bet365"} <= set((docs[0].get("bookmakers") or {}).keys())
+
+    try:
+        asyncio.run(run())
+    finally:
+        ows._shared_feed = None
+        ows._recovery_lock = None
+        ows._ws_rest_backfill_lock = None
+        ows._ws_rest_backfill_until = 0.0
 
 
 def test_thin_ws_store_rest_backfills_missing_books(monkeypatch):

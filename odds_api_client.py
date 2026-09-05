@@ -40,7 +40,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlencode
 
 import aiohttp
@@ -125,6 +125,22 @@ _BOOKMAKER_API_ALIASES = {
     "bet365 no latency": "Bet365",
 }
 
+# Prefix → catalog name for regional / latency-decorated WS labels
+# (e.g. ``Bet365 NJ``, ``DraftKings (no latency)``).
+_BOOKMAKER_PREFIX_CANON = (
+    ("bet365", "Bet365"),
+    ("draftkings", "DraftKings"),
+    ("fanduel", "FanDuel"),
+    ("betmgm", "BetMGM"),
+    ("polymarket", "Polymarket"),
+    ("kalshi", "Kalshi"),
+    ("caesars", "Caesars"),
+    ("circa", "Circa"),
+    ("novig", "NoVig"),
+)
+
+_unknown_ws_bookies_logged: Set[str] = set()
+
 # Local books that must never be sent on Odds-API.io REST / WS select.
 _LOCAL_ONLY_BOOKS = frozenset({"plive"})
 
@@ -139,22 +155,74 @@ def api_wire_bookmakers(names: Optional[List[str]] = None) -> List[str]:
     return [b for b in src if not is_local_only_bookmaker(b)]
 
 
-def _canonical_odds_api_bookmaker(name: str) -> str:
-    n = _norm_book(name)
-    low = n.lower()
-    # WS bookie labels sometimes include a latency tag, e.g. ``Bet365 (no latency)``.
-    for suffix in (" (no latency)", " (low latency)"):
+def _strip_ws_bookie_decorations(low: str, n: str) -> Tuple[str, str]:
+    """Remove latency / parenthetical decorations from WS bookie labels."""
+    for suffix in (
+        " (no latency)",
+        " (low latency)",
+        " (high latency)",
+        " (with latency)",
+    ):
         if low.endswith(suffix):
             n = n[: -len(suffix)].strip()
             low = n.lower()
             break
+    # Generic parenthetical: ``Bet365 (something)`` → ``Bet365``.
+    if "(" in low and low.endswith(")"):
+        base = n[: n.rfind("(")].strip()
+        if base:
+            n = base
+            low = n.lower()
+    for suffix in (" no latency", " low latency", " high latency"):
+        if low.endswith(suffix):
+            n = n[: -len(suffix)].strip()
+            low = n.lower()
+            break
+    return low, n
+
+
+def _prefix_canonical_bookmaker(low: str) -> Optional[str]:
+    for prefix, canon in _BOOKMAKER_PREFIX_CANON:
+        if low == prefix or low.startswith(prefix + " ") or low.startswith(prefix + "-"):
+            return canon
+    # Betfair Sportsbook / Exchange-style labels → catalog alias.
+    if low == "betfair" or low.startswith("betfair ") or low.startswith("betfair-"):
+        return _BOOKMAKER_API_ALIASES["betfair"]
+    return None
+
+
+def _canonical_odds_api_bookmaker(name: str) -> str:
+    n = _norm_book(name)
+    low = n.lower()
+    low, n = _strip_ws_bookie_decorations(low, n)
     aliased = _BOOKMAKER_API_ALIASES.get(low)
     if aliased is not None:
         return aliased
-    # Unify Betfair Sportsbook / Exchange-style labels to the catalog name.
-    if low.startswith("betfair "):
-        return _BOOKMAKER_API_ALIASES["betfair"]
+    prefixed = _prefix_canonical_bookmaker(low)
+    if prefixed is not None:
+        return prefixed
     return n
+
+
+def note_unknown_ws_bookie(raw: str) -> None:
+    """One-shot log when a WS bookie label does not map onto ODDS_API_BOOKMAKERS."""
+    raw_s = str(raw or "").strip()
+    if not raw_s:
+        return
+    canon = _canonical_odds_api_bookmaker(raw_s)
+    if is_local_only_bookmaker(canon):
+        return
+    master = {_canonical_odds_api_bookmaker(b).lower() for b in odds_api_master_bookmakers()}
+    if canon.lower() in master:
+        return
+    key = raw_s.lower()
+    if key in _unknown_ws_bookies_logged:
+        return
+    _unknown_ws_bookies_logged.add(key)
+    print(
+        f"[ODDS-API WS] unknown bookie label {raw_s!r} → {canon!r} "
+        f"(not in ODDS_API_BOOKMAKERS; check mapping)"
+    )
 
 
 # Growth 10-book catalog names. BookMaker.eu is catalog-inactive — do not add it.

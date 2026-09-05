@@ -44,6 +44,7 @@ from odds_api_client import (
     api_wire_bookmakers,
     get_shared_odds_client,
     is_local_only_bookmaker,
+    note_unknown_ws_bookie,
     odds_api_master_bookmakers,
     odds_api_sports_list,
     odds_updated_sport_names,
@@ -60,6 +61,28 @@ MAX_MARKETS = 20
 MAX_SPORTS = 10
 MAX_LEAGUES = 20
 MAX_EVENT_IDS = 50
+
+
+def _handoff_seed_max() -> int:
+    """REST handoff may seed more than WS eventIds max (50); align with live scan.
+
+    Odds-API WS only pushes books that *tick*. The official pattern is a one-shot
+    REST ``includeSeq`` snapshot into the store, then live deltas on WS. Seed size
+    should cover ``ODDS_LIVE_SCAN_MAX_EVENTS`` so soccer majors are not left cold.
+    """
+    try:
+        scan = int(os.getenv("ODDS_LIVE_SCAN_MAX_EVENTS", "80") or "80")
+    except ValueError:
+        scan = 80
+    try:
+        handoff = int(
+            os.getenv("ODDS_API_WS_HANDOFF_MAX_EVENTS", str(max(scan, MAX_EVENT_IDS)))
+            or str(scan)
+        )
+    except ValueError:
+        handoff = max(scan, MAX_EVENT_IDS)
+    return max(MAX_EVENT_IDS, min(handoff, 200))
+
 ALLOWED_CHANNELS = ("odds", "scores", "status")
 ALLOWED_STATUS = ("live", "prematch")
 # Server asked us to back off — never treat these as a healthy session.
@@ -713,6 +736,8 @@ class OddsWsStore:
         eid = _event_id(msg.get("id"))
         bookie_raw = msg.get("bookie")
         bookie = _canonical_odds_api_bookmaker(str(bookie_raw)) if bookie_raw else None
+        if bookie_raw:
+            note_unknown_ws_bookie(str(bookie_raw))
 
         if t == "score":
             if eid is not None:
@@ -1138,7 +1163,7 @@ class OddsApiWsFeed:
             # so a first-50 cut never seeds soccer majors into the WS store.
             from odds_api_client import prioritize_live_events_for_scan
 
-            seed = prioritize_live_events_for_scan(list(liv or []), MAX_EVENT_IDS)
+            seed = prioritize_live_events_for_scan(list(liv or []), _handoff_seed_max())
             ids: List[int] = []
             for ev in seed:
                 eid = _event_id(ev.get("id") if isinstance(ev, dict) else None)
@@ -1404,21 +1429,33 @@ async def _maybe_rest_backfill_thin_ws_docs(
     *,
     odds_cache_ttl: Optional[float] = None,
 ) -> Tuple[List[Dict[str, Any]], str]:
-    """When WS is up but missing DK/FD/Bet365/etc., merge a REST /odds/multi snapshot.
+    """Optionally seed the WS store from REST when books are missing.
 
-    Odds-API WS only pushes books that tick. Cold or sparse soccer feeds often
-    leave the healthy store with Polymarket/BetMGM/Kalshi while REST still has
-    7/10 books for EPL. Without this, ``resolve_odds_docs`` short-circuits on
-    websocket and sharp gates never see DraftKings/FanDuel/Bet365.
+    Odds-API WS is a *delta* stream for selected bookmakers — same books as REST,
+    but only when they tick. Official pattern: one REST ``includeSeq`` handoff into
+    the store at connect, then live updates on WS
+    (https://docs.odds-api.io/guides/websockets).
+
+    Defaults (WS-first):
+    - ``ODDS_API_WS_COLD_SEED`` (default true): one-shot REST only for events with
+      *zero* priced master books (handoff miss / new slate entry).
+    - ``ODDS_API_WS_REST_BACKFILL`` (default false): optional thin-store fill when
+      any event is below ``ODDS_API_WS_REST_BACKFILL_MIN_BOOKS`` (legacy safety net).
     """
     global _ws_rest_backfill_until
-    if not _env_bool("ODDS_API_WS_REST_BACKFILL", "true"):
+    thin = _env_bool("ODDS_API_WS_REST_BACKFILL", "false")
+    cold = _env_bool("ODDS_API_WS_COLD_SEED", "true")
+    if not thin and not cold:
         return docs, "websocket"
-    try:
-        min_books = int(os.getenv("ODDS_API_WS_REST_BACKFILL_MIN_BOOKS", "4") or "4")
-    except ValueError:
-        min_books = 4
-    min_books = max(0, min(min_books, 10))
+    if thin:
+        try:
+            min_books = int(os.getenv("ODDS_API_WS_REST_BACKFILL_MIN_BOOKS", "4") or "4")
+        except ValueError:
+            min_books = 4
+        min_books = max(0, min(min_books, 10))
+    else:
+        # Cold seed only: fire when at least one event has no priced master books.
+        min_books = 1
     books = list(bookmakers) if bookmakers else odds_api_master_bookmakers()
     if not _ws_docs_need_rest_book_backfill(docs, books, min_books=min_books):
         return docs, "websocket"
@@ -1464,7 +1501,7 @@ async def _maybe_rest_backfill_thin_ws_docs(
         merged = feed.store.merged_docs(event_ids)
         after = [_priced_master_book_count(d, books) for d in merged]
         print(
-            "[ODDS-API WS] REST book backfill: "
+            "[ODDS-API WS] REST store seed/backfill: "
             f"events={len(event_ids)} min_books_before={min(before) if before else 0} "
             f"min_books_after={min(after) if after else 0} "
             f"avg_before={(sum(before)/len(before)) if before else 0:.1f} "
