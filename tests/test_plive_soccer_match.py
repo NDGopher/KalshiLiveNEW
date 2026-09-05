@@ -16,6 +16,7 @@ from plive_pandora import (
     coeff_room_for_event,
     match_plive_event_to_odds_doc,
     match_plive_soccer_to_odds_doc,
+    plive_football_sport_ids,
     plive_soccer_sport_ids,
     plive_sport_id,
     plive_sport_ids,
@@ -56,14 +57,16 @@ def _plive_ev(eid: str = "5001", **overrides):
     return ev
 
 
-def test_default_plive_sport_ids_include_mlb_and_both_soccer_buckets(monkeypatch):
+def test_default_plive_sport_ids_include_mlb_football_and_soccer(monkeypatch):
     monkeypatch.delenv("PLIVE_SPORT_IDS", raising=False)
     monkeypatch.delenv("PLIVE_SPORT_ID", raising=False)
     monkeypatch.delenv("PLIVE_PAGE", raising=False)
     monkeypatch.delenv("PLIVE_HASH", raising=False)
     assert plive_sport_id() == 1
-    assert plive_sport_ids() == [1, 5, 220]
+    assert plive_sport_ids() == [1, 3, 5, 220]
     assert plive_soccer_sport_ids() == (5, 220)
+    assert plive_football_sport_ids() == (3,)
+    assert PLIVE_SPORT_CATALOG_FALLBACK[3] == "Football"
     assert PLIVE_SPORT_CATALOG_FALLBACK[5] == "Soccer"
     assert PLIVE_SPORT_CATALOG_FALLBACK[220] == "Top Soccer"
 

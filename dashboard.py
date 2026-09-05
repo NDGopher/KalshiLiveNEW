@@ -495,7 +495,8 @@ saved_filters[DEFAULT_FILTER_NAME] = DEFAULT_FILTER_PAYLOAD
 saved_filters[CBB_FILTER_NAME] = CBB_FILTER_PAYLOAD
 # Odds-API.io: default filter displayBooks = ENV master list (ODDS_API_BOOKMAKERS). Monitors always
 # request /odds/multi for that full list; a filter may list fewer displayBooks only for alert-card columns.
-DEFAULT_FILTER_PAYLOAD["bettingBooks"] = ["Kalshi"]
+# Kalshi + PLive are both take venues for the live board (auto-bet stays Kalshi-only).
+DEFAULT_FILTER_PAYLOAD["bettingBooks"] = ["Kalshi", "PLive"]
 display_books_list = odds_api_master_bookmakers()
 for _extra_bk in extra_local_bookmakers():
     if not any(str(_extra_bk).strip().lower() == str(x).strip().lower() for x in display_books_list):
@@ -556,7 +557,7 @@ SOCCER_FILTER_NAME = "Soccer Live (2 Sharps)"
 soccer_sharps = [b for b in sharps_list if _dnorm(b) != "betmgm"]
 SOCCER_FILTER_PAYLOAD = {
     "state": "ND",
-    "bettingBooks": ["Kalshi"],
+    "bettingBooks": ["Kalshi", "PLive"],
     "displayBooks": list(display_books_list),
     "leagues": ["SOCCER_ALL"],
     "excludedCategories": [

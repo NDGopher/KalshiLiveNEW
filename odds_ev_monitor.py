@@ -3382,6 +3382,19 @@ class OddsEVMonitor:
                 take_outlier_display = False
                 if len(fair_eligible) >= min_sharp:
                     use_fair = fair_eligible
+                elif (
+                    len(fair_eligible) >= display_min_sharp
+                    and (_display_extra_relaxed() or _diagnostic_mode())
+                ):
+                    # Missing one sharp (often Circa on NCAAF) — still show the card.
+                    use_fair = fair_eligible
+                    take_outlier_display = True
+                    if _diagnostic_mode():
+                        print(
+                            f"[PIPELINE] Display card via {len(fair_eligible)}/{min_sharp} sharps "
+                            f"(display_min={display_min_sharp}) take={take_canon} {take_american} "
+                            f"| \"{mname}\" side={bet_side} | {teams}"
+                        )
                 elif len(baseline_fair) >= display_min_sharp and (
                     _display_extra_relaxed() or _diagnostic_mode()
                 ):
