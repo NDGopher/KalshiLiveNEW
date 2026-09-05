@@ -21,6 +21,8 @@ from execution_guard import (
     event_ticker_from_any,
     format_hms_us,
     has_trading_credentials,
+    kalshi_line_int,
+    market_floor_strike_matches_alert,
     public_get_headers,
 )
 
@@ -1645,9 +1647,10 @@ class KalshiClient:
         Build the exact market ticker from event ticker, market type, line, and selection.
         This is MUCH faster than querying 1000 markets and filtering!
         
-        Format examples:
-        - Total 143.5: KXNCAAMBTOTAL-26JAN31DUKEVT-143
-        - Spread -5.5 Marquette: KXNCAAMBSPREAD-26JAN31MARQHALL-MARQ5
+        Format examples (suffix is ceil(|line|), the YES-over integer):
+        - Total 38.5: KXNCAAFTOTAL-26SEP05DUQAFA-39  (title "Over 38.5")
+        - Total 59.5: KXNCAAFTOTAL-26SEP05BALLOSU-60  (title "Over 59.5")
+        - Spread -1.5 DET: KXMLBSPREAD-…-DET2  (title "wins by over 1.5")
         - Moneyline Wagner: KXNCAAMBGAME-26JAN31FDUWAG-WAG
         """
         coerced = event_ticker_from_any(event_ticker)
@@ -1677,19 +1680,23 @@ class KalshiClient:
         if 'total' in market_type_lower or 'over' in market_type_lower or 'under' in market_type_lower:
             if line is None:
                 return None
-            # Total: KXNCAAMBTOTAL-26JAN31DUKEVT-143 (143 = integer part of 143.5)
-            line_int = int(float(line))
+            # Total: KXNCAAFTOTAL-26SEP05DUQAFA-39 (39 = ceil(38.5); title "Over 38.5")
+            line_int = kalshi_line_int(line)
+            if line_int is None:
+                return None
             total_series = base_series.replace('GAME', 'TOTAL').replace('SPREAD', 'TOTAL')
             return f"{total_series}-{event_suffix}-{line_int}"
         
         elif 'spread' in market_type_lower or 'puck line' in market_type_lower:
             if line is None or not selection:
                 return None
-            # Spread: KXNCAAMBSPREAD-26JAN31MARQHALL-MARQ5 (MARQ = team code, 5 = integer part of 5.5)
+            # Spread: …-AFA10 = "Air Force wins by over 9.5" (suffix ceil(9.5)=10)
             # CRITICAL: For underdog spreads (+line), Kalshi uses the FAVORITE's team code!
-            # Example: "Arizona State +11.5" = KXNCAAMBSPREAD-26JAN31ARIZASU-ARIZ11 (uses ARIZ, not ASU)
+            # Example: "Arizona State +11.5" = …-ARIZ12 (uses ARIZ, not ASU; ceil(11.5)=12)
             line_float = float(line)
-            line_int = int(abs(line_float))
+            line_int = kalshi_line_int(line_float)
+            if line_int is None:
+                return None
             spread_series = base_series.replace('GAME', 'SPREAD').replace('TOTAL', 'SPREAD')
             
             # Check if this is an underdog spread (positive line)
@@ -2443,6 +2450,18 @@ class KalshiClient:
                     # CRITICAL: Ensure ticker field is set (API might return it nested)
                     if 'ticker' not in market or not market.get('ticker'):
                         market['ticker'] = built_ticker
+                    # Fail closed: ticker may exist as a neighbor (59.5 alert → …-59 is Over 58.5).
+                    if line is not None and not market_floor_strike_matches_alert(market, line):
+                        print(
+                            f"   [FIND_SUBMARKET] ❌ {built_ticker} floor_strike="
+                            f"{market.get('floor_strike')!r} != alert line {line}. "
+                            f"Neighbor/sister strike — fail closed."
+                        )
+                        self._log_mapping_mismatch(
+                            event_ticker, market_type, line, selection, teams_str,
+                            built_ticker, "floor_strike_mismatch",
+                        )
+                        return None
                     print(f"   [FIND_SUBMARKET] ✅ Found market by built ticker: {built_ticker} (attempt {attempt + 1})")
                     print(f"   [FIND_SUBMARKET] ========== MATCHING SUCCESS ==========")
                     
@@ -2450,11 +2469,6 @@ class KalshiClient:
                     # This allows us to infer unknown team codes when we know one team
                     if teams_str:
                         self._learn_team_codes_from_ticker(built_ticker, teams_str)
-                    
-                    # VALIDATION: Verify the market line matches expected line (for totals/spreads)
-                    # Line validation removed - Kalshi uses positive numbers in tickers for favorite spreads
-                    # e.g., -7.5 favorite spread shows as "7" in ticker (KXNCAAMBSPREAD-...-TEAM7)
-                    # This is correct behavior, not a mismatch
                     
                     return market
             

@@ -5,6 +5,7 @@ Use this to test a specific alert before betting on it
 import asyncio
 import sys
 from ev_alert import EvAlert
+from execution_guard import kalshi_line_int
 from kalshi_client import KalshiClient
 from market_matcher import MarketMatcher
 from dotenv import load_dotenv
@@ -110,7 +111,7 @@ async def validate_alert(event_ticker: str, market_type: str, line: float, selec
                 ticker_line_str = ticker_parts[-1]
                 try:
                     ticker_line = int(ticker_line_str)
-                    expected_line_int = int(line) if line else None
+                    expected_line_int = kalshi_line_int(line) if line is not None else None
                     if expected_line_int and ticker_line != expected_line_int:
                         print(f"  ⚠️  WARNING: Line mismatch - ticker has {ticker_line}, expected {expected_line_int}")
                     else:
