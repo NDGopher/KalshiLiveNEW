@@ -4,6 +4,10 @@ Live desk (2026-09-05): /api/alerts shipped autobet_allow=true with
 side=None and GAME event tickers (KXMLBGAME-… / KXNCAAFGAME-…) on
 spread/total takes. find_submarket then Invalid submarket key — no order.
 
+Sheet contract (1382 executed): market tickers like KXNCAAMB*/KXNBATOTAL*/
+KXMLBSPREAD* — never bare GAME event + side=null. All fills EV≥5%
+(median 10.6%). Auto path stays ≥2–20%; do not chase sub-2% crumbs.
+
 Contract lives on KalshiClient.find_submarket. Auto-bet stays OFF here.
 """
 from __future__ import annotations
@@ -349,6 +353,56 @@ def test_check_and_auto_bet_allow_true_ignores_strict_pass(monkeypatch):
     err = str(last.get("error") or "")
     assert "strict_pass" not in err
     assert "Auto-bet disabled" in err or "autobet_allow" not in err
+
+
+def test_auto_path_is_real_ev_not_sub2_crumbs(monkeypatch):
+    """Sheet: 1382 fills, all EV≥5% (median 10.6%). Desk floor stays 2–20, not crumbs."""
+    import asyncio
+
+    import dashboard as dash
+    from ev_calculator import AUTOBET_MAX_EV_PCT, autobet_product_shape
+
+    assert dash.auto_bet_ev_min == 2.0
+    assert AUTOBET_MAX_EV_PCT == 20.0
+    books = [
+        {"name": "DraftKings", "american": 134, "decimal_pick": 2.34, "decimal_opp": 1.65},
+        {"name": "FanDuel", "american": 116, "decimal_pick": 2.16, "decimal_opp": 1.74},
+        {"name": "Caesars", "american": 110, "decimal_pick": 2.10, "decimal_opp": 1.77},
+    ]
+    mid = autobet_product_shape(books, 163, take_book="Kalshi", ev_percent=10.6, plus_alert=True)
+    crumb = autobet_product_shape(books, 163, take_book="Kalshi", ev_percent=1.0, plus_alert=True)
+    assert mid["allow"] is True
+    assert crumb["allow"] is True  # shape is plus + ≤20; order path still floors at 2%
+    assert autobet_product_shape(
+        books, 163, take_book="Kalshi", ev_percent=20.01, plus_alert=True
+    )["allow"] is False
+
+    monkeypatch.setattr(dash, "write_auto_bet_to_sheets", lambda *_a, **_k: None)
+    monkeypatch.setattr(dash, "write_auto_bet_to_csv", lambda *_a, **_k: None)
+    monkeypatch.setattr(dash, "auto_bet_enabled", True)
+    monkeypatch.setattr(dash, "auto_bet_ev_min", 2.0)
+
+    async def run():
+        await dash.check_and_auto_bet(
+            "crumb-1pct-not-a-fill",
+            {
+                "autobet_allow": True,
+                "strict_pass": True,
+                "ticker": ATL_PHI_SPREAD_PHI2,
+                "side": "yes",
+                "ev_percent": 1.0,
+                "market_type": "Point Spread",
+                "pick": "Philadelphia Phillies",
+                "teams": "Atlanta Braves @ Philadelphia Phillies",
+                "line": -1.5,
+            },
+            None,
+        )
+
+    asyncio.run(run())
+    last = dash.failed_auto_bets[-1]
+    assert last["alert_id"] == "crumb-1pct-not-a-fill"
+    assert "below filter minimum" in str(last.get("error") or "")
 
 
 def test_check_and_auto_bet_skips_allow_not_strict_when_allow_false(monkeypatch):
