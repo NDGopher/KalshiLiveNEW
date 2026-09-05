@@ -238,6 +238,103 @@ def parse_fill_price_cents(raw):
     return int(round(dollars * 100))
 
 
+# Stephen lock 2026-09-05: max worse-price slippage stays 1¢ strict. Do not widen to 2–3¢.
+MAX_WORSE_PRICE_CENTS = 1
+
+
+def prob_to_cents(prob):
+    """Convert a 0–1 probability (or dollar ask) to integer cents. Round, do not truncate.
+
+    ``int(0.43 * 100)`` is 42 in IEEE float; a 43¢ ask must read as 43¢.
+    """
+    if prob is None:
+        return None
+    try:
+        p = float(prob)
+    except (TypeError, ValueError):
+        return None
+    if p != p:
+        return None
+    if p > 1.0:
+        return int(round(p))
+    return int(round(p * 100.0))
+
+
+def ev_percent_at_limit_cents(alert_ev_percent, alert_price_cents, new_price_cents):
+    """EV% at a new Kalshi limit: (fair / offer − 1)×100.
+
+    Fair is backed out from the alert EV at the alert cents (same shape as
+    ``EVCalculator.ev_percent_vs_kalshi``). Used only for the 1¢ re-quote gate.
+    """
+    try:
+        ev = float(alert_ev_percent)
+        alert_px = int(alert_price_cents)
+        new_px = int(new_price_cents)
+    except (TypeError, ValueError):
+        return None
+    if alert_px <= 0 or alert_px >= 100 or new_px <= 0 or new_px >= 100:
+        return None
+    fair = (alert_px / 100.0) * (1.0 + ev / 100.0)
+    offer = new_px / 100.0
+    if offer <= 0 or fair <= 0:
+        return None
+    return (fair / offer - 1.0) * 100.0
+
+
+def resolve_worse_price_limit(expected_cents, book_ask_cents, *, ev_percent=None, ev_min=None):
+    """Place-time worse-price policy. Keep 1¢ max worse vs the alert.
+
+    Returns ``(limit_cents, None)`` to place, or ``(None, error_dict)`` to reject.
+
+    * book ≥2¢ worse than alert → fail-closed (do not widen).
+    * book 1¢ worse → re-quote at the new ask if EV at that price still
+      meets ``ev_min`` (when both EV args are provided). Missing EV args
+      still re-quote (manual path).
+    * book same or better → keep the alert limit.
+    """
+    try:
+        expected = int(expected_cents)
+        book = int(book_ask_cents)
+    except (TypeError, ValueError):
+        return None, {
+            "error": "Odds changed",
+            "expected": expected_cents,
+            "current": book_ask_cents,
+            "delta": None,
+            "reason": "Invalid price for slippage check",
+        }
+    worse = book - expected
+    if worse <= 0:
+        return expected, None
+    if worse > MAX_WORSE_PRICE_CENTS:
+        return None, {
+            "error": "Odds changed",
+            "expected": expected,
+            "current": book,
+            "delta": worse,
+            "reason": f"Price got worse by {worse}¢ (max allowed: {MAX_WORSE_PRICE_CENTS}¢)",
+        }
+    if ev_min is not None and ev_percent is not None:
+        new_ev = ev_percent_at_limit_cents(ev_percent, expected, book)
+        try:
+            min_ev = float(ev_min)
+        except (TypeError, ValueError):
+            min_ev = None
+        if new_ev is None or min_ev is None or new_ev + 1e-9 < min_ev:
+            shown = "n/a" if new_ev is None else f"{new_ev:.2f}"
+            return None, {
+                "error": "Odds changed",
+                "expected": expected,
+                "current": book,
+                "delta": worse,
+                "reason": (
+                    f"Price got worse by {worse}¢ and EV {shown}% "
+                    f"below filter min {ev_min}%"
+                ),
+            }
+    return book, None
+
+
 def ws_orderbook_inner(message):
     """Return the WS snapshot/delta body (``msg`` preferred, legacy ``data`` accepted)."""
     if not isinstance(message, dict):
@@ -2757,7 +2854,7 @@ class KalshiClient:
             print(f"Error fetching orderbook for {ticker}: {e}")
             return None
     
-    async def place_order(self, ticker, side, count, price_cents=None, validate_odds=True, expected_price_cents=None, max_liquidity_dollars=None, post_only=False, expiration_ts=None, _retry_count=0, skip_duplicate_check=False):
+    async def place_order(self, ticker, side, count, price_cents=None, validate_odds=True, expected_price_cents=None, max_liquidity_dollars=None, post_only=False, expiration_ts=None, _retry_count=0, skip_duplicate_check=False, ev_min=None, alert_ev_percent=None):
         """
         Place an order on Kalshi - OPTIMIZED FOR SPEED WITH EXTENSIVE LOGGING
         
@@ -2768,6 +2865,8 @@ class KalshiClient:
             price_cents: Price in cents (optional, will use market price if not provided)
             validate_odds: If True, verify odds match before placing
             expected_price_cents: Expected price in cents for validation
+            ev_min: Auto-bet filter EV floor. 1¢-worse re-quote must still clear this.
+            alert_ev_percent: Alert EV% at expected_price_cents (for re-quote EV gate)
             max_liquidity_dollars: Maximum bet amount in dollars
             post_only: If True, order will only post as maker (rejected if would cross)
             expiration_ts: Unix timestamp in milliseconds when order expires (None = no expiration)
@@ -2917,7 +3016,7 @@ class KalshiClient:
                         if best_ask is not None:
                             # For YES side: price in cents = best_ask * 100
                             # best_ask is already the probability (0.0 to 1.0), so multiply by 100 to get cents
-                            current_price_cents = int(best_ask * 100)
+                            current_price_cents = prob_to_cents(best_ask)
                             price_delta = abs(current_price_cents - expected_price_cents)
                             
                             # DIAGNOSTIC: Log full orderbook structure to verify we're reading correct side
@@ -3053,29 +3152,26 @@ class KalshiClient:
                                     "delta": price_delta,
                                     "reason": f"Price delta too large ({price_delta}¢) - likely wrong submarket"
                                 }
-                            elif current_price_cents > expected_price_cents:
-                                # Current price is WORSE than expected - we'd pay more than BB said
-                                price_delta_worse = current_price_cents - expected_price_cents
-                                if price_delta_worse > 1:
-                                    print(f"[ORDER] VALIDATION FAILED: Price got WORSE! Expected {expected_price_cents}¢, got {current_price_cents}¢ (delta: {price_delta_worse}¢ worse)")
+                            decided_limit_cents = expected_price_cents
+                            if current_price_cents > expected_price_cents:
+                                # 1¢ max worse (Stephen lock). 1¢ worse + EV still ≥ ev_min → re-quote.
+                                decided_limit_cents, slip_err = resolve_worse_price_limit(
+                                    expected_price_cents,
+                                    current_price_cents,
+                                    ev_percent=alert_ev_percent,
+                                    ev_min=ev_min,
+                                )
+                                if slip_err:
+                                    print(f"[ORDER] VALIDATION FAILED: {slip_err.get('reason')} Expected {expected_price_cents}¢, got {current_price_cents}¢")
                                     print(f"[ORDER]   📊 DIAGNOSTIC INFO:")
                                     print(f"[ORDER]      Ticker: {ticker}")
                                     print(f"[ORDER]      Side: {side}")
-                                    print(f"[ORDER]      Expected price: {expected_price_cents}¢ ({expected_price_cents/100:.2f}¢)")
-                                    print(f"[ORDER]      Current price: {current_price_cents}¢ ({current_price_cents/100:.2f}¢)")
-                                    print(f"[ORDER]      Price delta: {price_delta_worse}¢ worse ({price_delta_worse/expected_price_cents*100:.1f}% worse)")
+                                    print(f"[ORDER]      Expected price: {expected_price_cents}¢")
+                                    print(f"[ORDER]      Current price: {current_price_cents}¢")
                                     print(f"[ORDER]      Orderbook: YES ask={best_ask:.4f}, NO bid={no_best_bid:.4f}")
-                                    print(f"[ORDER]   🔍 POSSIBLE CAUSES:")
-                                    print(f"[ORDER]      1. Market moved against us (price got worse)")
-                                    print(f"[ORDER]      2. Wrong submarket matched (different line/team)")
-                                    print(f"[ORDER]      3. Stale BookieBeats price data")
-                                    return {
-                                        "error": "Odds changed",
-                                        "expected": expected_price_cents,
-                                        "current": current_price_cents,
-                                        "delta": price_delta_worse,
-                                        "reason": f"Price got worse by {price_delta_worse}¢ (max allowed: 1¢)"
-                                    }
+                                    return slip_err
+                                if decided_limit_cents != expected_price_cents:
+                                    print(f"[ORDER] RE-QUOTE: Ask {current_price_cents}¢ is 1¢ worse than alert {expected_price_cents}¢; placing at {decided_limit_cents}¢")
                             elif current_price_cents < expected_price_cents:
                                 # Current price is BETTER than expected - our limit order will fill immediately at better price
                                 # For manual bets: Allow up to 4¢ better (user is making decision, market may have moved)
@@ -3115,11 +3211,11 @@ class KalshiClient:
                                 print(f"[ORDER] WARNING: Available liquidity ({available_contracts} contracts) is less than requested ({count} contracts) at {expected_price_cents}¢ or better")
                                 # Still allow the order, but it will be capped to available liquidity
                             
-                            # Validation passed! Use EXACT BookieBeats price
-                            price_cents = expected_price_cents
+                            # Validation passed. Same/better → alert limit. 1¢ worse → re-quoted ask.
+                            price_cents = decided_limit_cents
                             
                             # LIQUIDITY FILTER: Skip if available liquidity is under $40
-                            # CRITICAL: We ALWAYS place limit orders at expected_price_cents (no slippage)
+                            # Limit is alert cents, or the 1¢-worse re-quote when EV still clears ev_min.
                             # The order will either fill immediately at expected_price_cents or better, or sit on book
                             # For manual bets, we check if there's sufficient liquidity at best_ask (which may be better than expected)
                             # This allows manual bets when market has moved slightly, but order still fills at our limit price
@@ -3303,7 +3399,7 @@ class KalshiClient:
                     if best_ask is not None:
                         # For NO side: price in cents = best_ask * 100
                         # best_ask is already the probability (0.0 to 1.0), so multiply by 100 to get cents
-                        current_price_cents = int(best_ask * 100)
+                        current_price_cents = prob_to_cents(best_ask)
                         price_delta = abs(current_price_cents - expected_price_cents)
                         
                         # DIAGNOSTIC: Log full orderbook structure to verify we're reading correct side
@@ -3373,19 +3469,21 @@ class KalshiClient:
                         # CRITICAL: Validate price for limit orders
                         # Check direction FIRST (worse vs better), then check absolute delta
                         # This ensures we catch "worse price" cases before checking absolute delta
+                        decided_limit_cents = expected_price_cents
                         if current_price_cents > expected_price_cents:
-                            # Current price is WORSE than expected - we'd pay more than BB said
-                            price_delta_worse = current_price_cents - expected_price_cents
-                            if price_delta_worse > 1:
-                                print(f"[ORDER] VALIDATION FAILED: Price got WORSE! Expected {expected_price_cents}¢, got {current_price_cents}¢ (delta: {price_delta_worse}¢ worse)")
-                                print(f"[ORDER]   ⚠️  Auto-bets only allow 1¢ worse - rejecting to avoid overpaying")
-                                return {
-                                    "error": "Odds changed",
-                                    "expected": expected_price_cents,
-                                    "current": current_price_cents,
-                                    "delta": price_delta_worse,
-                                    "reason": f"Price delta too large ({price_delta_worse}¢) - likely wrong submarket"
-                                }
+                            # 1¢ max worse (Stephen lock). 1¢ worse + EV still ≥ ev_min → re-quote.
+                            decided_limit_cents, slip_err = resolve_worse_price_limit(
+                                expected_price_cents,
+                                current_price_cents,
+                                ev_percent=alert_ev_percent,
+                                ev_min=ev_min,
+                            )
+                            if slip_err:
+                                print(f"[ORDER] VALIDATION FAILED: {slip_err.get('reason')} Expected {expected_price_cents}¢, got {current_price_cents}¢")
+                                print(f"[ORDER]   ⚠️  Auto-bets only allow {MAX_WORSE_PRICE_CENTS}¢ worse")
+                                return slip_err
+                            if decided_limit_cents != expected_price_cents:
+                                print(f"[ORDER] RE-QUOTE: Ask {current_price_cents}¢ is 1¢ worse than alert {expected_price_cents}¢; placing at {decided_limit_cents}¢")
                         elif current_price_cents < expected_price_cents:
                             # Current price is BETTER than expected - our limit order will fill immediately at better price
                             # For both manual and auto-bets: Allow up to 4¢ better (good fill opportunity, unlikely to be wrong market)
@@ -3424,8 +3522,8 @@ class KalshiClient:
                             print(f"[ORDER] WARNING: Available liquidity ({available_contracts} contracts) is less than requested ({count} contracts) at {expected_price_cents}¢ or better")
                             # Still allow the order, but it will be capped to available liquidity
                         
-                        # Validation passed! Use EXACT BookieBeats price
-                        price_cents = expected_price_cents
+                        # Validation passed. Same/better → alert limit. 1¢ worse → re-quoted ask.
+                        price_cents = decided_limit_cents
                         # Store available liquidity for capping
                         orderbook['available_contracts_no'] = available_contracts
                     else:
@@ -3444,7 +3542,7 @@ class KalshiClient:
                                 # Compute best_ask and validate price
                                 best_ask = 1.0 - yes_best_bid_price
                                 print(f"[ORDER] Computed NO best_ask from YES bids: {best_ask:.4f}")
-                                current_price_cents = int(best_ask * 100)
+                                current_price_cents = prob_to_cents(best_ask)
                                 price_delta = abs(current_price_cents - expected_price_cents)
                                 
                                 # Validate price (same logic as when best_ask was available)
@@ -3456,15 +3554,19 @@ class KalshiClient:
                                         "current": current_price_cents,
                                         "delta": price_delta
                                     }
-                                elif current_price_cents > expected_price_cents:
-                                    price_delta_worse = current_price_cents - expected_price_cents
-                                    if price_delta_worse > 1:
-                                        print(f"[ORDER] VALIDATION FAILED: Price got WORSE! Expected {expected_price_cents}¢, got {current_price_cents}¢ (delta: {price_delta_worse}¢ worse)")
-                                        return {
-                                            "error": "Odds changed",
-                                            "expected": expected_price_cents,
-                                            "current": current_price_cents
-                                        }
+                                decided_limit_cents = expected_price_cents
+                                if current_price_cents > expected_price_cents:
+                                    decided_limit_cents, slip_err = resolve_worse_price_limit(
+                                        expected_price_cents,
+                                        current_price_cents,
+                                        ev_percent=alert_ev_percent,
+                                        ev_min=ev_min,
+                                    )
+                                    if slip_err:
+                                        print(f"[ORDER] VALIDATION FAILED: {slip_err.get('reason')} Expected {expected_price_cents}¢, got {current_price_cents}¢")
+                                        return slip_err
+                                    if decided_limit_cents != expected_price_cents:
+                                        print(f"[ORDER] RE-QUOTE: Ask {current_price_cents}¢ is 1¢ worse than alert {expected_price_cents}¢; placing at {decided_limit_cents}¢")
                                 elif current_price_cents < expected_price_cents:
                                     # For both manual and auto-bets: Allow up to 4¢ better (good fill opportunity, unlikely to be wrong market)
                                     max_better_delta = 4
@@ -3478,9 +3580,9 @@ class KalshiClient:
                                             "delta": price_delta_better
                                         }
                                 
-                                # Validation passed - use expected price
-                                price_cents = expected_price_cents
-                                print(f"[ORDER] VALIDATION PASSED: Price validated using computed best_ask (delta: {price_delta}¢)")
+                                # Validation passed. Same/better → alert limit. 1¢ worse → re-quoted ask.
+                                price_cents = decided_limit_cents
+                                print(f"[ORDER] VALIDATION PASSED: Price validated using computed best_ask (delta: {price_delta}¢, limit {price_cents}¢)")
                             else:
                                 print(f"[ORDER] ERROR: No ask price available for NO side and cannot compute from YES bids - cannot validate price match")
                                 return {"error": "No ask price available - cannot validate"}
@@ -4140,7 +4242,9 @@ class KalshiClient:
                                         post_only=False,  # Retry as taker
                                         expiration_ts=None,  # No expiration on taker retry
                                         _retry_count=1,  # Prevent infinite recursion
-                                        skip_duplicate_check=skip_duplicate_check
+                                        skip_duplicate_check=skip_duplicate_check,
+                                        ev_min=ev_min,
+                                        alert_ev_percent=alert_ev_percent,
                                     )
                             except Exception as e:
                                 print(f"[ORDER] Error parsing rejection response: {e}")

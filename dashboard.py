@@ -7081,7 +7081,7 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
                 print(f"[AUTO-BET]   Contracts: {contracts}")
                 print(f"[AUTO-BET]   Bet Amount: ${bet_amount:.2f}")
                 print(f"[AUTO-BET]   Expected Price: {expected_price_cents}¢")
-                print(f"[AUTO-BET]   Price Tolerance: ±2¢ better allowed, ±1¢ worse allowed")
+                print(f"[AUTO-BET]   Price Tolerance: ±2¢ better allowed, 1¢ worse re-quotes if EV still ≥ filter min")
                 print(f"[AUTO-BET] ========== CALLING place_order() NOW ==========")
                 print(f"[AUTO-BET] [TIMING] Order placement started at {format_hms_us(order_placement_start)}")
                 print(f"[AUTO-BET] [TIMING] Step timings so far: {step_timings}")
@@ -7124,7 +7124,9 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
                     expected_price_cents=expected_price_cents,  # BB 'price' field (63¢) - order price BEFORE fees
                     max_liquidity_dollars=bet_amount,
                     post_only=False,  # Taker order - instant fill at BB price
-                    expiration_ts=expiration_ts  # 1 second expiration
+                    expiration_ts=expiration_ts,  # 1 second expiration
+                    ev_min=current_ev_min,
+                    alert_ev_percent=ev_percent,
                 )
                 
                 order_api_end = time.time()
