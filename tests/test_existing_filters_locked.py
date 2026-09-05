@@ -45,11 +45,12 @@ def test_dollar_rules_and_auto_bet_off():
     assert "per_event_max_bet = 404.0" in src
     assert "user_max_bet_amount = 100.0" in src
     assert "px_novig_multiplier = 2.0" in src
-    assert "auto_bet_ev_min = 5.0" in src
+    assert "auto_bet_ev_min = 2.0" in src
     assert "auto_bet_ev_max = 25.0" in src
     assert "auto_bet_odds_min = -200" in src
     assert "auto_bet_odds_max = 200" in src
-    # Per-filter auto-bet: main 5-25%, CBB 10-25%, both disabled.
+    # Per-filter auto-bet: All Sports 2-25%, CBB 10-25%, soccer 5-25%, all disabled.
+    assert "'ev_min': 2.0" in src
     assert "'ev_min': 5.0" in src
     assert "'ev_min': 10.0" in src
     assert "'ev_max': 25.0" in src

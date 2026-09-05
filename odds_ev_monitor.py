@@ -311,6 +311,29 @@ def _display_extra_relaxed() -> bool:
     return os.getenv("ODDS_DISPLAY_PIPELINE_RELAX", "true").lower() in ("1", "true", "yes", "on")
 
 
+def _autobet_card_reasons(
+    shape_reasons: Optional[List[str]],
+    *,
+    display_only: bool = False,
+    take_book: str = "Kalshi",
+    ticker: Optional[str] = None,
+) -> List[str]:
+    """Stable reasons for the card/API. Display-only / paper / PLive never look silently tradeable."""
+    reasons: List[str] = []
+    for r in shape_reasons or []:
+        s = str(r).strip()
+        if s and s not in reasons:
+            reasons.append(s)
+    if str(take_book or "").lower() == "plive" and "take_not_kalshi" not in reasons:
+        reasons.append("take_not_kalshi")
+    if display_only and "display_only" not in reasons:
+        reasons.append("display_only")
+    if str(take_book or "Kalshi").lower() == "kalshi":
+        if ticker and not is_kalshi_ticker(ticker) and "paper_ticker" not in reasons:
+            reasons.append("paper_ticker")
+    return reasons
+
+
 def _vb_is_live_for_bookflow(ev: Dict[str, Any]) -> bool:
     if ev.get("live") is True or ev.get("isLive") is True:
         return True
@@ -1960,6 +1983,7 @@ class OddsEVMonitor:
                 "kalshi_last_trade_ts": bet.get("kalshi_last_trade_ts"),
                 "take_book": str(bet.get("take_book") or "Kalshi"),
                 "autobet_allow": bool(bet.get("autobet_allow", False)),
+                "autobet_reasons": list(bet.get("autobet_reasons") or []),
             }
             ev_ctx = event if isinstance(event, dict) else {}
             clock_fields = clock_fields_for_live_odds(ev_ctx)
@@ -1981,6 +2005,7 @@ class OddsEVMonitor:
             )
             alert = EvAlert(alert_data)
             alert.autobet_allow = bool(bet.get("autobet_allow", False))
+            alert.autobet_reasons = [str(r) for r in (bet.get("autobet_reasons") or [])]
             alert.book_updated_at = alert_data["book_updated_at"]
             alert.kalshi_last_trade_ts = alert_data["kalshi_last_trade_ts"]
             alert.take_book = str(bet.get("take_book") or "Kalshi")
@@ -3896,6 +3921,12 @@ class OddsEVMonitor:
                 and not display_only
                 and take_canon.lower() == "kalshi"
                 and bool(ticker and is_kalshi_ticker(ticker))
+            ),
+            "autobet_reasons": _autobet_card_reasons(
+                shape["reasons"],
+                display_only=display_only,
+                take_book=take_canon,
+                ticker=ticker if take_canon.lower() == "kalshi" else None,
             ),
         }
 

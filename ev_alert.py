@@ -40,8 +40,10 @@ class EvAlert:
         self.kalshi_last_trade_ts = data.get("kalshi_last_trade_ts")
         # Kalshi or PLive — both are take venues. PLive is never a sharp.
         self.take_book = str(data.get("take_book") or "Kalshi")
-        # Royals-shape allowlist for later auto-bet. Default deny. Switch stays OFF.
+        # 3-sharp product allowlist for later auto-bet. Default deny. Switch stays OFF.
         self.autobet_allow = bool(data.get("autobet_allow", False))
+        _reasons = data.get("autobet_reasons") or []
+        self.autobet_reasons = [str(r) for r in _reasons] if isinstance(_reasons, list) else []
         self.live = data.get("live")
         self.clock = data.get("clock")
         self.clock_running = data.get("clock_running")
@@ -80,6 +82,7 @@ class EvAlert:
             "kalshi_last_trade_ts": self.kalshi_last_trade_ts,
             "take_book": self.take_book,
             "autobet_allow": self.autobet_allow,
+            "autobet_reasons": list(self.autobet_reasons),
             "live": self.live,
             "clock": self.clock,
             "clock_running": self.clock_running,
