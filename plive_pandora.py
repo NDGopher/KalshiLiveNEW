@@ -129,7 +129,8 @@ PLIVE_RUN_LINE_MARKET = 6
 PLIVE_GAME_TOTAL_MARKET = 5
 # Soccer match-result 1X2. MLB market 1 is first-5 and must not paint ML.
 _DEFAULT_SOCCER_1X2_MARKETS = (1,)
-_SOCCER_DRAW_OUTCOMES = frozenset({"x", "draw", "d", "tie", "n"})
+# Live Pandora soccer Draw is often outcome "3" (1/2/3). Legacy board keys use X/draw.
+_SOCCER_DRAW_OUTCOMES = frozenset({"x", "draw", "d", "tie", "n", "3"})
 
 
 def _env_bool(name: str, default: str = "false") -> bool:
@@ -653,8 +654,11 @@ def parse_soccer_1x2_outcome(outcome: Any) -> Optional[str]:
 
 
 def soccer_1x2_draw_take_decimal(slots: Any) -> Optional[float]:
-    """Board Draw take is idx0. Never idx1 (MLB Game Winner) and never Kalshi."""
-    return _slot_decimal(slots, 0)
+    """Soccer 1X2 Draw take: prefer idx0 (legacy board), then idx1 (live Pandora).
+
+    Live soccer coeffs often only populate idx1. Never invent a price from Kalshi.
+    """
+    return _slot_decimal(slots, 0) or _slot_decimal(slots, 1)
 
 
 def parse_soccer_total_outcome(outcome: Any) -> Tuple[Optional[float], Optional[str]]:
@@ -1670,10 +1674,15 @@ class PliveStore:
         out: List[Dict[str, Any]] = []
 
         # Game Winner (market 3): outcomes 1/home vs 2/away. idx1 only on MLB.
-        # Soccer Draw is a different 1X2 market — idx0 take, never Kalshi.
+        # Soccer live 1X2 is market 1 with outcomes 1/2/3 — also accept those as ML.
         home = away = None
         ml_mk = None
-        for mk in self.ml_markets:
+        ml_candidates = list(self.ml_markets)
+        if soccer:
+            for mk in _int_csv("PLIVE_MARKET_SOCCER_1X2", _DEFAULT_SOCCER_1X2_MARKETS):
+                if int(mk) not in ml_candidates:
+                    ml_candidates.append(int(mk))
+        for mk in ml_candidates:
             if int(mk) in _TEAM_TOTAL_MARKETS or int(mk) in self.total_markets:
                 continue
             if int(mk) == PLIVE_RUN_LINE_MARKET:
@@ -1682,7 +1691,13 @@ class PliveStore:
             for (market, outcome), slots in coeffs.items():
                 if market != mk:
                     continue
-                dec = _ml_decimal_from_slot(slots) if int(mk) == PLIVE_ML_MARKET else _decimal_from_slot(slots)
+                # Soccer 1X2 (market 1) and MLB ML (market 3) both use idx1 on live Pandora.
+                if int(mk) == PLIVE_ML_MARKET or (soccer and int(mk) in set(
+                    _int_csv("PLIVE_MARKET_SOCCER_1X2", _DEFAULT_SOCCER_1X2_MARKETS)
+                )):
+                    dec = _ml_decimal_from_slot(slots) or _decimal_from_slot(slots)
+                else:
+                    dec = _decimal_from_slot(slots)
                 if dec is None:
                     continue
                 side = parse_soccer_1x2_outcome(outcome) if soccer else None

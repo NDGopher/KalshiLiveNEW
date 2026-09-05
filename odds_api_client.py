@@ -272,6 +272,77 @@ _ODDS_UPDATED_SPORT_NAME_BY_SLUG: Dict[str, str] = {
 }
 
 
+# Prefer these leagues when the live slate is huge (FA Cup / lower leagues flood
+# /events/live). Without this, EPL sits past ODDS_LIVE_SCAN_MAX_EVENTS (55) and
+# never enters odds resolve — zero soccer alerts despite priced majors.
+_PRIORITY_LIVE_LEAGUE_SLUGS: frozenset = frozenset(
+    {
+        "england-premier-league",
+        "spain-laliga",
+        "germany-bundesliga",
+        "italy-serie-a",
+        "france-ligue-1",
+        "usa-mlb",
+        "usa-nba",
+        "usa-nfl",
+        "usa-nhl",
+        "usa-mls",
+        "uefa-champions-league",
+        "uefa-europa-league",
+        "uefa-europa-conference-league",
+    }
+)
+_DEPRIORITIZE_LEAGUE_TOKENS: Tuple[str, ...] = (
+    "amateur",
+    "primavera",
+    "liga-iii",
+    "liga-3",
+    "national-league",
+    "u19",
+    "u20",
+    "u21",
+    "youth",
+    "reserves",
+    "women",
+    "fa-cup",  # huge flood; still soccer but not EPL
+    "championship-round",
+    "qualification",
+)
+
+
+def live_event_league_slug(ev: Dict[str, Any]) -> str:
+    lg = ev.get("league") if isinstance(ev, dict) else None
+    if isinstance(lg, dict):
+        return str(lg.get("slug") or "").strip().lower()
+    return ""
+
+
+def live_event_scan_rank(ev: Dict[str, Any]) -> Tuple[int, int, str]:
+    """Sort key for live scan / WS handoff (lower = earlier).
+
+    0) demote lower-league floods
+    1) promote known major slugs (EPL, MLB, …)
+    2) stable slug for determinism
+    """
+    slug = live_event_league_slug(ev)
+    demote = 1 if any(tok in slug for tok in _DEPRIORITIZE_LEAGUE_TOKENS) else 0
+    major = 0 if slug in _PRIORITY_LIVE_LEAGUE_SLUGS else 1
+    return (demote, major, slug)
+
+
+def prioritize_live_events_for_scan(
+    events: Sequence[Dict[str, Any]],
+    limit: int,
+) -> List[Dict[str, Any]]:
+    """Return up to ``limit`` live events with majors first (EPL before FA Cup flood)."""
+    lim = max(0, int(limit))
+    if lim <= 0:
+        return []
+    indexed = list(enumerate(events or []))
+    indexed.sort(key=lambda pair: (live_event_scan_rank(pair[1]), pair[0]))
+    return [ev for _i, ev in indexed[:lim]]
+
+
 def sport_name_for_odds_updated(sport: Any) -> Optional[str]:
     """Return the Odds-API.io ``sport`` query value for GET /odds/updated.
 
