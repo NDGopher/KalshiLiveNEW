@@ -40,3 +40,35 @@ def test_check_and_auto_bet_entry_does_not_unbound_local(monkeypatch):
     last = dash.failed_auto_bets[-1]
     assert last["alert_id"] == "entry-unbound-regression"
     assert "autobet_allow" in str(last.get("error") or "")
+
+
+def test_strict_pass_false_does_not_skip_when_autobet_allow(monkeypatch):
+    """Product lock is autobet_allow. strict_pass=False must not be a terminal skip."""
+    import dashboard as dash
+
+    monkeypatch.setattr(dash, "write_auto_bet_to_sheets", lambda *_a, **_k: None)
+    monkeypatch.setattr(dash, "write_auto_bet_to_csv", lambda *_a, **_k: None)
+    before = len(dash.failed_auto_bets)
+
+    async def run():
+        await dash.check_and_auto_bet(
+            "strict-pass-not-terminal",
+            {
+                "autobet_allow": True,
+                "strict_pass": False,
+                "ev_percent": 0.1,
+                "teams": "Wyoming vs CSU",
+                "pick": "Wyoming",
+                "ticker": "KXNCAAFGAME-26SEP05WYOCSU-WYO",
+                "side": "yes",
+            },
+            None,
+        )
+
+    asyncio.run(run())
+    assert len(dash.failed_auto_bets) >= before + 1
+    last = dash.failed_auto_bets[-1]
+    assert last["alert_id"] == "strict-pass-not-terminal"
+    err = str(last.get("error") or "")
+    assert "strict_pass" not in err
+    assert "below filter minimum" in err
