@@ -12,7 +12,9 @@ from execution_guard import (
     event_ticker_from_any,
     expected_side_for_alert,
     has_trading_credentials,
+    href_ticker_agrees_with_alert,
     kalshi_line_int,
+    market_floor_strike_matches_alert,
     parse_kalshi_ticker,
     prepare_executable_order,
     public_get_headers,
@@ -23,11 +25,13 @@ from execution_guard import (
 
 # DET @ MIN. Home hdp +1.5 → away Tigers are −1.5 (KalshiBB / BookieBeats rule).
 DET_MIN_EVENT = "KXMLBGAME-26SEP03DETTMIN"
-DET_MINUS_15 = "KXMLBSPREAD-26SEP03DETTMIN-DET1"
-MIN_MINUS_15 = "KXMLBSPREAD-26SEP03DETTMIN-MIN1"
+# Live Kalshi rule: -1.5 favorite is "wins by over 1.5" → suffix 2 (ceil), not 1.
+DET_MINUS_15 = "KXMLBSPREAD-26SEP03DETTMIN-DET2"
+MIN_MINUS_15 = "KXMLBSPREAD-26SEP03DETTMIN-MIN2"
 STL_LAD_ML_STL = "KXMLBGAME-26SEP03STLLAD-STL"
+STL_LAD_TOTAL_8 = "KXMLBTOTAL-26SEP03STLLAD-8"
 STL_LAD_TOTAL_7 = "KXMLBTOTAL-26SEP03STLLAD-7"
-STALE_OTHER_GAME = "KXMLBSPREAD-26SEP03CHCCIN-DET1"
+STALE_OTHER_GAME = "KXMLBSPREAD-26SEP03CHCCIN-DET2"
 
 
 def _tigers_alert(**overrides):
@@ -122,7 +126,7 @@ def test_wrong_side_favorite_yes_on_opponent_ticker():
 
 def test_wrong_side_totals_under_as_yes():
     check = validate_execution_intent(
-        ticker=STL_LAD_TOTAL_7,
+        ticker=STL_LAD_TOTAL_8,
         side="yes",
         price_cents=48,
         market_type="Total Runs",
@@ -164,7 +168,7 @@ def test_wrong_line_spread_and_total():
     assert "wrong_line" in spread.reasons
 
     total = validate_execution_intent(
-        ticker=STL_LAD_TOTAL_7,
+        ticker=STL_LAD_TOTAL_8,
         side="yes",
         price_cents=48,
         market_type="Total Runs",
@@ -279,7 +283,7 @@ def test_limit_order_uses_displayed_price_not_market():
     assert "market" not in payload.get("type", "")
 
     no_side, no_reasons = build_limit_order_payload(
-        ticker=STL_LAD_TOTAL_7,
+        ticker=STL_LAD_TOTAL_8,
         side="no",
         count=4,
         price_cents=41,
@@ -314,7 +318,7 @@ def test_credentials_required_only_for_orders_not_public_reads():
 
 
 def test_good_underdog_is_no_on_favorite_ticker():
-    """Twins +1.5 (home underdog) is NO on DET1, not YES on a +1.5 Twins ticker."""
+    """Twins +1.5 (home underdog) is NO on DET2, not YES on a +1.5 Twins ticker."""
     check = validate_execution_intent(
         ticker=DET_MINUS_15,
         side="no",
@@ -339,7 +343,7 @@ def test_parse_market_vs_event():
     assert mkt.is_market is True
     assert ev.is_market is False
     assert mkt.team_code == "DET"
-    assert mkt.line_int == 1
+    assert mkt.line_int == 2
     assert mkt.family == "spread"
     assert ev.family == "moneyline"
 
@@ -387,27 +391,31 @@ def test_build_market_ticker_does_not_double_suffix_from_href():
 
     client = KalshiClient()
     built = client.build_market_ticker(
-        "KXNBATOTAL-26JAN11ATLGSW-143",
+        "KXNBATOTAL-26JAN11ATLGSW-144",
         "Total Points",
         143.5,
         "Over",
         "Atlanta Hawks @ Golden State Warriors",
     )
-    assert built == "KXNBATOTAL-26JAN11ATLGSW-143"
-    assert built.count("-143") == 1
+    assert built == "KXNBATOTAL-26JAN11ATLGSW-144"
+    assert built.count("-144") == 1
+    assert built.count("-143") == 0
 
 
 BALL_OSU_EVENT = "KXNCAAFGAME-26SEP05BALLOSU"
 BALL_OSU_TOTAL_59 = "KXNCAAFTOTAL-26SEP05BALLOSU-59"
 BALL_OSU_TOTAL_60 = "KXNCAAFTOTAL-26SEP05BALLOSU-60"
+DUQ_AFA_EVENT = "KXNCAAFGAME-26SEP05DUQAFA"
+DUQ_AFA_TOTAL_38 = "KXNCAAFTOTAL-26SEP05DUQAFA-38"
+DUQ_AFA_TOTAL_39 = "KXNCAAFTOTAL-26SEP05DUQAFA-39"
 
 
-def test_ncaaf_total_59_5_encodes_as_59_not_60():
-    """Kalshi totals use the integer part. Under 59.5 is …-59, not href …-60."""
+def test_ncaaf_total_59_5_encodes_as_60_not_59():
+    """Live Kalshi: …BALLOSU-60 title is Over 59.5. …-59 is the 58.5 neighbor."""
     from kalshi_client import KalshiClient
 
-    assert kalshi_line_int(59.5) == 59
-    assert kalshi_line_int(59.5) != 60
+    assert kalshi_line_int(59.5) == 60
+    assert kalshi_line_int(59.5) != 59
     client = KalshiClient()
     built = client.build_market_ticker(
         BALL_OSU_EVENT,
@@ -416,12 +424,12 @@ def test_ncaaf_total_59_5_encodes_as_59_not_60():
         "Under",
         "Ball State @ Ohio State",
     )
-    assert built == BALL_OSU_TOTAL_59
-    assert ticker_line_matches_alert(BALL_OSU_TOTAL_59, 59.5, "59.5") is True
-    assert ticker_line_matches_alert(BALL_OSU_TOTAL_60, 59.5, "59.5") is False
+    assert built == BALL_OSU_TOTAL_60
+    assert ticker_line_matches_alert(BALL_OSU_TOTAL_60, 59.5, "59.5") is True
+    assert ticker_line_matches_alert(BALL_OSU_TOTAL_59, 59.5, "59.5") is False
 
     ok = validate_execution_intent(
-        ticker=BALL_OSU_TOTAL_59,
+        ticker=BALL_OSU_TOTAL_60,
         side="no",
         price_cents=55,
         market_type="Total Points",
@@ -431,13 +439,14 @@ def test_ncaaf_total_59_5_encodes_as_59_not_60():
         qualifier="59.5",
         event_ticker=BALL_OSU_EVENT,
         rebuilt_ticker=built,
+        market_floor_strike=59.5,
     )
     assert ok.ok is True
-    assert ok.ticker == BALL_OSU_TOTAL_59
+    assert ok.ticker == BALL_OSU_TOTAL_60
     assert ok.side == "no"
 
-    href_wrong = validate_execution_intent(
-        ticker=BALL_OSU_TOTAL_60,
+    neighbor = validate_execution_intent(
+        ticker=BALL_OSU_TOTAL_59,
         side="no",
         price_cents=55,
         market_type="Total Points",
@@ -446,16 +455,16 @@ def test_ncaaf_total_59_5_encodes_as_59_not_60():
         line=59.5,
         qualifier="59.5",
         event_ticker=BALL_OSU_EVENT,
-        rebuilt_ticker=BALL_OSU_TOTAL_59,
+        rebuilt_ticker=BALL_OSU_TOTAL_60,
     )
-    assert href_wrong.ok is False
-    assert "wrong_line" in href_wrong.reasons or "stale_or_mismatched_ticker" in href_wrong.reasons
+    assert neighbor.ok is False
+    assert "wrong_line" in neighbor.reasons or "stale_or_mismatched_ticker" in neighbor.reasons
 
 
-def test_href_60_alone_is_wrong_line_for_59_5():
-    """Ordering the href …-60 market for a 59.5 alert must fail closed."""
+def test_floor_59_on_60_ticker_is_wrong_line_for_59_5():
+    """…-59 is a real market (Over 58.5). Ordering it for 59.5 must fail closed."""
     check = validate_execution_intent(
-        ticker=BALL_OSU_TOTAL_60,
+        ticker=BALL_OSU_TOTAL_59,
         side="no",
         price_cents=55,
         market_type="Total Points",
@@ -466,3 +475,93 @@ def test_href_60_alone_is_wrong_line_for_59_5():
     )
     assert check.ok is False
     assert "wrong_line" in check.reasons
+
+
+def test_duquesne_over_38_5_is_39_not_38():
+    """Desk: Odds-API href …DUQAFA-39 is the real Over 38.5. Rebuild …-38 404s."""
+    from kalshi_client import KalshiClient
+
+    assert kalshi_line_int(38.5) == 39
+    client = KalshiClient()
+    built = client.build_market_ticker(
+        DUQ_AFA_EVENT,
+        "Total Points",
+        38.5,
+        "Over",
+        "Duquesne @ Air Force",
+    )
+    assert built == DUQ_AFA_TOTAL_39
+    assert href_ticker_agrees_with_alert(DUQ_AFA_TOTAL_39, 38.5, "38.5") is True
+    assert href_ticker_agrees_with_alert(DUQ_AFA_TOTAL_38, 38.5, "38.5") is False
+    assert ticker_line_matches_alert(DUQ_AFA_TOTAL_39, 38.5) is True
+    assert ticker_line_matches_alert(DUQ_AFA_TOTAL_38, 38.5) is False
+
+    over_yes = validate_execution_intent(
+        ticker=DUQ_AFA_TOTAL_39,
+        side="yes",
+        price_cents=48,
+        market_type="Total Points",
+        pick="Over",
+        teams="Duquesne @ Air Force",
+        line=38.5,
+        qualifier="38.5",
+        event_ticker=DUQ_AFA_EVENT,
+        rebuilt_ticker=built,
+        market_floor_strike=38.5,
+    )
+    assert over_yes.ok is True
+    assert over_yes.side == "yes"
+
+    sister = validate_execution_intent(
+        ticker=DUQ_AFA_TOTAL_39,
+        side="no",
+        price_cents=48,
+        market_type="Total Points",
+        pick="Over",
+        teams="Duquesne @ Air Force",
+        line=38.5,
+        event_ticker=DUQ_AFA_EVENT,
+    )
+    assert sister.ok is False
+    assert "wrong_side" in sister.reasons
+
+    floor_rebuild = validate_execution_intent(
+        ticker=DUQ_AFA_TOTAL_38,
+        side="yes",
+        price_cents=48,
+        market_type="Total Points",
+        pick="Over",
+        teams="Duquesne @ Air Force",
+        line=38.5,
+        event_ticker=DUQ_AFA_EVENT,
+    )
+    assert floor_rebuild.ok is False
+    assert "wrong_line" in floor_rebuild.reasons
+
+
+def test_floor_strike_mismatch_refuses_even_when_suffix_matches():
+    """Ticker …-60 with floor_strike 58.5 is not a 59.5 alert."""
+    check = validate_execution_intent(
+        ticker=BALL_OSU_TOTAL_60,
+        side="no",
+        price_cents=55,
+        market_type="Total Points",
+        pick="Under",
+        teams="Ball State @ Ohio State",
+        line=59.5,
+        event_ticker=BALL_OSU_EVENT,
+        market_floor_strike=58.5,
+    )
+    assert check.ok is False
+    assert "wrong_line" in check.reasons
+    assert market_floor_strike_matches_alert({"floor_strike": 59.5}, 59.5) is True
+    assert market_floor_strike_matches_alert({"floor_strike": 58.5}, 59.5) is False
+
+
+def test_dashboard_href_policy_uses_ceil_not_floor():
+    dash = (Path(__file__).resolve().parents[1] / "dashboard.py").read_text(encoding="utf-8")
+    assert "href_ticker_agrees_with_alert" in dash
+    assert "ceil of |line|" in dash or "ceil(|line|)" in dash or "ceil suffix" in dash
+    assert "integer part (59.5 → 59)" not in dash
+    assert "autobet_allow=False" in dash
+    assert '_terminal_skip(\n                "autobet_allow=False"' in dash or '"autobet_allow=False"' in dash

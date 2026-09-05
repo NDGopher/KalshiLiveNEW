@@ -49,7 +49,7 @@ DOCS_ORDERBOOK_FP = {
     }
 }
 
-# Live GET 2026-09-05 for KXNCAAFTOTAL-26SEP05BALLOSU-59 (keys: ['orderbook_fp']).
+# Live GET 2026-09-05 for KXNCAAFTOTAL-26SEP05BALLOSU-59 (Over 58.5; keys: ['orderbook_fp']).
 LIVE_CFB_ORDERBOOK_FP = {
     "orderbook_fp": {
         "yes_dollars": [["0.3800", "182.00"], ["0.3900", "102.00"]],
@@ -208,3 +208,4 @@ def test_dashboard_records_terminal_auto_bet_outcome():
     assert "except asyncio.CancelledError:" in src
     assert "TERMINAL skip" in src
     assert "auto_bet_enabled = False" in src
+    assert '"autobet_allow=False"' in src

@@ -54,6 +54,7 @@ from kalshi_client import KalshiClient
 from execution_guard import (
     event_ticker_from_any,
     format_hms_us,
+    href_ticker_agrees_with_alert,
     is_kalshi_ticker,
     is_paper_kalshi_ticker,
     kalshi_line_int,
@@ -2652,21 +2653,22 @@ async def handle_new_alert(alert: EvAlert):
         else:
             print(f"[HANDLE ALERT] WARNING: No line value available! qualifier='{alert.qualifier}', alert.line={getattr(alert, 'line', None)}")
 
-        # Odds-API href is often a neighboring Kalshi market (59.5 alert, href …-60).
-        # Kalshi totals/spreads encode the integer part (59.5 → 59). Never adopt the href line.
+        # Odds-API href is a hint. Kalshi suffix is ceil(|line|): 38.5 → …-39,
+        # 59.5 → …-60 (title "Over 59.5"). Trust href only when it already
+        # encodes that suffix. Neighbor href …-59 for a 59.5 alert is Over 58.5.
         href_parsed = parse_kalshi_ticker(raw_ticker)
-        if (
-            href_parsed
-            and href_parsed.is_market
-            and href_parsed.family in ("total", "spread")
-            and line is not None
-            and href_parsed.line_int != kalshi_line_int(line)
-        ):
-            print(
-                f"[HANDLE ALERT] market_url ticker {href_parsed.raw} encodes line "
-                f"{href_parsed.line_int}, alert line {line} encodes as {kalshi_line_int(line)}. "
-                f"Kalshi uses the integer part (59.5 → 59). Matching from alert line, not href."
-            )
+        if href_parsed and href_parsed.is_market and href_parsed.family in ("total", "spread") and line is not None:
+            if href_ticker_agrees_with_alert(raw_ticker, line, alert.qualifier):
+                print(
+                    f"[HANDLE ALERT] href {href_parsed.raw} agrees with alert line {line} "
+                    f"(ceil suffix {kalshi_line_int(line)}). Rebuild will use the same strike."
+                )
+            elif href_parsed.line_int != kalshi_line_int(line):
+                print(
+                    f"[HANDLE ALERT] market_url ticker {href_parsed.raw} encodes line "
+                    f"{href_parsed.line_int}, alert line {line} encodes as {kalshi_line_int(line)} "
+                    f"(ceil of |line|). Ignoring href suffix — match from alert line, not neighbor."
+                )
         
         # Find the exact submarket
         submarket = await kalshi_client.find_submarket(
@@ -3162,7 +3164,8 @@ async def handle_new_alert(alert: EvAlert):
             'autobet_allow': bool(getattr(alert, 'autobet_allow', False)),
             'ev_source': getattr(alert, 'ev_source', 'odds_api_value_bets'),
             'take_book': getattr(alert, 'take_book', 'Kalshi') or 'Kalshi',
-            'line': getattr(alert, 'line', None),
+            'line': getattr(alert, 'line', None) if getattr(alert, 'line', None) is not None else line,
+            'floor_strike': (match_result.get('market') or {}).get('floor_strike'),
             'live': getattr(alert, 'live', None),
             'clock': getattr(alert, 'clock', None),
             'clock_running': getattr(alert, 'clock_running', None),
@@ -5320,7 +5323,13 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
         
         # Log the exact settings being used for this check
         print(f"[AUTO-BET] Using settings: EV={current_ev_min}%-{current_ev_max}%, Odds={current_odds_min}-{current_odds_max}, Enabled={current_enabled}, Amount=${current_amount:.2f}")
-        
+        if not current_enabled:
+            _terminal_skip(
+                "filter auto-bet disabled",
+                "Filter-specific enabled is False (global switch ON does not override)",
+            )
+            return
+
         # EV check already done at function start - just log that it passed
         print(f"[AUTO-BET] ✅ EV check PASSED: {ev_percent:.2f}% (range: {current_ev_min}%-{current_ev_max}%)")
         
@@ -5330,43 +5339,20 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
         american_odds_int = american_odds_to_int(american_odds_str)
         if american_odds_int is None:
             print(f"[AUTO-BET] SKIP: Alert {alert_id} - Could not parse American odds '{american_odds_str}' [ODDS PARSE ERROR]")
-            # Log high-EV alerts that fail due to odds parse error
-            if ev_percent >= current_ev_min:
-                store_failed_auto_bet(
-                    alert_id=alert_id,
-                    alert=alert,
-                    alert_data=alert_data,
-                    error=f"Could not parse American odds '{american_odds_str}'",
-                    reason=f"Alert has {ev_percent:.2f}% EV (>= {current_ev_min}% threshold) but odds parsing failed",
-                    ticker=ticker,
-                    side=side,
-                    ev_percent=ev_percent,
-                    odds=american_odds_str,
-                    filter_name=alert_filter_name
-                )
+            _terminal_skip(
+                f"Could not parse American odds '{american_odds_str}'",
+                f"Alert has {ev_percent:.2f}% EV but odds parsing failed",
+            )
             await cleanup_submarket()
             return
         print(f"[AUTO-BET] Parsed odds: {american_odds_int}")
         if american_odds_int < current_odds_min or american_odds_int > current_odds_max:
             print(f"[AUTO-BET] SKIP: Alert {alert_id} Odds {american_odds_int} outside range ({current_odds_min}-{current_odds_max}) [ODDS OUT OF RANGE]")
             print(f"[AUTO-BET]    📊 Odds: {american_odds_int} not in range [{current_odds_min}, {current_odds_max}]")
-            # Log high-EV alerts that are blocked due to odds out of range
-            if ev_percent >= current_ev_min:
-                store_failed_auto_bet(
-                    alert_id=alert_id,
-                    alert=alert,
-                    alert_data=alert_data,
-                    error=f"Odds {american_odds_int} outside range ({current_odds_min}-{current_odds_max})",
-                    reason=f"Alert has {ev_percent:.2f}% EV (>= {current_ev_min}% threshold) but odds {american_odds_int} outside configured range [{current_odds_min}, {current_odds_max}]",
-                    ticker=ticker,
-                    side=side,
-                    ev_percent=ev_percent,
-                    odds=american_odds_int,
-                    filter_name=alert_filter_name
-                )
-            decision_path_so_far['final_decision'] = 'SKIPPED'
-            decision_path_so_far['skip_reason'] = f'Odds {american_odds_int} outside range ({current_odds_min}-{current_odds_max})'
-            log_alert_passed_threshold(alert_id, alert, alert_data, filter_settings_dict, decision_path_so_far)
+            _terminal_skip(
+                f"Odds {american_odds_int} outside range ({current_odds_min}-{current_odds_max})",
+                f"Alert has {ev_percent:.2f}% EV but odds {american_odds_int} outside configured range [{current_odds_min}, {current_odds_max}]",
+            )
             await cleanup_submarket()
             return
         print(f"[AUTO-BET] Odds check PASSED: {american_odds_int}")
@@ -5376,20 +5362,10 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
         
         if not ticker or not side or not expected_price_cents:
             print(f"[AUTO-BET] SKIP: Alert {alert_id} - Missing ticker, side, or price (ticker={ticker}, side={side}, price={expected_price_cents}) [MISSING DATA]")
-            # Log high-EV alerts that are blocked due to missing data
-            if ev_percent >= current_ev_min:
-                store_failed_auto_bet(
-                    alert_id=alert_id,
-                    alert=alert,
-                    alert_data=alert_data,
-                    error=f"Missing ticker, side, or price (ticker={ticker}, side={side}, price={expected_price_cents})",
-                    reason=f"Alert has {ev_percent:.2f}% EV (>= {current_ev_min}% threshold) but missing required data for bet placement",
-                    ticker=ticker,
-                    side=side,
-                    ev_percent=ev_percent,
-                    odds=alert_data.get('american_odds'),
-                    filter_name=alert_filter_name
-                )
+            _terminal_skip(
+                f"Missing ticker, side, or price (ticker={ticker}, side={side}, price={expected_price_cents})",
+                "Missing required data for bet placement",
+            )
             await cleanup_submarket()
             return
         
@@ -5434,20 +5410,10 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
             is_under = pick == 'UNDER' or 'UNDER' in pick
             if is_moneyline or is_spread or is_under:
                 print(f"[AUTO-BET] SKIP: Alert {alert_id} - NHL exclusion: {market_type} {pick} [NHL EXCLUSION - Manual only]")
-                # Log high-EV NHL alerts that are blocked (user might want to know about these)
-                if ev_percent >= current_ev_min:
-                    store_failed_auto_bet(
-                        alert_id=alert_id,
-                        alert=alert,
-                        alert_data=alert_data,
-                        error=f"NHL exclusion: {market_type} {pick} (manual only)",
-                        reason=f"Alert has {ev_percent:.2f}% EV (>= {current_ev_min}% threshold) but NHL {market_type} {pick} bets are excluded from auto-betting (manual only)",
-                        ticker=ticker,
-                        side=side,
-                        ev_percent=ev_percent,
-                        odds=alert_data.get('american_odds'),
-                        filter_name=alert_filter_name
-                    )
+                _terminal_skip(
+                    f"NHL exclusion: {market_type} {pick} (manual only)",
+                    f"NHL {market_type} {pick} bets are excluded from auto-betting (manual only)",
+                )
                 await cleanup_submarket()
                 return
         
@@ -5461,23 +5427,10 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
             if is_moneyline or is_spread or is_under:
                 league = "EPL" if ticker.upper().startswith('KXEPL') else "UCL"
                 print(f"[AUTO-BET] SKIP: Alert {alert_id} - {league} exclusion: {market_type} {pick} [Soccer overs only - Manual for spreads/moneylines/unders]")
-                # Log high-EV soccer alerts that are blocked
-                if ev_percent >= current_ev_min:
-                    store_failed_auto_bet(
-                        alert_id=alert_id,
-                        alert=alert,
-                        alert_data=alert_data,
-                        error=f"{league} exclusion: {market_type} {pick} (overs only)",
-                        reason=f"Alert has {ev_percent:.2f}% EV (>= {current_ev_min}% threshold) but {league} {market_type} {pick} bets are excluded from auto-betting (overs only)",
-                        ticker=ticker,
-                        side=side,
-                        ev_percent=ev_percent,
-                        odds=alert_data.get('american_odds'),
-                        filter_name=alert_filter_name
-                    )
-                decision_path_so_far['final_decision'] = 'SKIPPED'
-                decision_path_so_far['skip_reason'] = f'{league} exclusion: {market_type} {pick}'
-                log_alert_passed_threshold(alert_id, alert, alert_data, filter_settings_dict, decision_path_so_far)
+                _terminal_skip(
+                    f"{league} exclusion: {market_type} {pick} (overs only)",
+                    f"{league} {market_type} {pick} bets are excluded from auto-betting (overs only)",
+                )
                 await cleanup_submarket()
                 return
         
@@ -6843,17 +6796,9 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
                 )
                 if not intent.ok:
                     print(f"[AUTO-BET] SKIP: Execution identity failed: {intent.reasons}")
-                    store_failed_auto_bet(
-                        alert_id=alert_id,
-                        alert=alert,
-                        alert_data=alert_data,
-                        error="Execution identity failed",
-                        reason=",".join(intent.reasons),
-                        ticker=ticker,
-                        side=side,
-                        ev_percent=ev_percent,
-                        odds=alert_data.get('american_odds'),
-                        filter_name=alert_filter_name,
+                    _terminal_skip(
+                        "Execution identity failed",
+                        ",".join(intent.reasons),
                     )
                     return
                 ticker = intent.ticker

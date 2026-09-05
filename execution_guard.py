@@ -8,6 +8,7 @@ or mismatched. Away spreads must already be -hdp (home-centric).
 """
 from __future__ import annotations
 
+import math
 import re
 import time
 from dataclasses import dataclass, field
@@ -157,17 +158,76 @@ def format_hms_us(ts: Optional[float] = None) -> str:
 
 
 def kalshi_line_int(line: Any) -> Optional[int]:
-    """Kalshi ticker line is the integer part of the sportsbook line.
+    """Kalshi ticker suffix is ``ceil(|line|)`` — the YES-over integer threshold.
 
-    Totals/spreads use floor of abs(line): 59.5 → 59, 143.5 → 143, -1.5 → 1.
-    Rounding 59.5 up to 60 is a different Kalshi market and must fail closed.
+    Live Kalshi Trade API (2026-09-05), titles + ``floor_strike``:
+
+    * ``KXNCAAFTOTAL-26SEP05DUQAFA-39`` — title "Over 38.5 points scored",
+      ``floor_strike=38.5``. Suffix ``-38`` does **not** exist.
+    * ``KXNCAAFTOTAL-26SEP05BALLOSU-60`` — title "Over 59.5 points scored",
+      ``floor_strike=59.5``. Suffix ``-59`` is the **neighbor** "Over 58.5".
+    * Same ceil rule on NFL/MLB/EPL/UCL totals and CFB/NFL/MLB spreads
+      (e.g. "wins by over 1.5" → ``…DET2``, "over 2.5 goals" → ``…-3``).
+
+    ``int(abs(line))`` / floor is the neighboring strike and must fail closed.
+    Exact integers (``7.0``) stay themselves (``ceil(7)=7``). Quarter lines
+    such as 1.75 encode as 2, but ``floor_strike`` validation must still
+    refuse unless the fetched market strike equals the alert line.
+
+    Odds-API href is a hint, not authority: trust it only when its suffix
+    already equals this function. Rebuild from the alert line otherwise.
     """
     try:
         if line is None or line == "":
             return None
-        return int(abs(float(line)))
+        return int(math.ceil(abs(float(line))))
     except (TypeError, ValueError):
         return None
+
+
+def market_floor_strike_matches_alert(
+    market: Any,
+    line: Any = None,
+    qualifier: Any = None,
+) -> bool:
+    """True when Kalshi ``floor_strike`` equals the sportsbook alert line.
+
+    Kalshi titles the contract from ``floor_strike`` (always ``X.5`` in
+    sampled sports markets). A 59.5 alert on a market whose
+    ``floor_strike`` is 58.5 is the sister line — fail closed.
+    Missing ``floor_strike`` is not a pass; caller must already have
+    matched the ticker suffix. This helper returns False if the strike
+    is present and disagrees, True if absent (suffix is the only check).
+    """
+    if not isinstance(market, dict):
+        return True
+    raw = market.get("floor_strike")
+    if raw is None or raw == "":
+        return True
+    alert_line = parse_alert_line(line, qualifier)
+    if alert_line is None:
+        return False
+    try:
+        return abs(float(raw) - abs(float(alert_line))) < 1e-6
+    except (TypeError, ValueError):
+        return False
+
+
+def href_ticker_agrees_with_alert(
+    href_ticker: Any,
+    line: Any = None,
+    qualifier: Any = None,
+) -> bool:
+    """Odds-API href is usable only when it already encodes ceil(|alert line|)."""
+    parsed = parse_kalshi_ticker(href_ticker)
+    if not parsed or not parsed.is_market:
+        return False
+    if parsed.family not in ("spread", "total"):
+        return True
+    alert_line = parse_alert_line(line, qualifier)
+    if alert_line is None or parsed.line_int is None:
+        return False
+    return parsed.line_int == kalshi_line_int(alert_line)
 
 
 def ticker_line_matches_alert(
@@ -175,7 +235,7 @@ def ticker_line_matches_alert(
     line: Any = None,
     qualifier: Any = None,
 ) -> bool:
-    """True when the ticker has no line (ML) or its line_int matches the alert."""
+    """True when the ticker has no line (ML) or its line_int matches ceil(|alert|)."""
     parsed = parse_kalshi_ticker(ticker)
     if not parsed:
         return False
@@ -398,6 +458,7 @@ def validate_execution_intent(
     bet_side: Any = None,
     require_credentials: bool = False,
     has_credentials: bool = False,
+    market_floor_strike: Any = None,
 ) -> ExecutionCheck:
     """Refuse the order unless identity + price are complete and consistent."""
     check = ExecutionCheck(ok=True)
@@ -439,6 +500,11 @@ def validate_execution_intent(
         elif parsed.line_int is None:
             check.deny("ticker_missing_line")
         elif parsed.line_int != kalshi_line_int(alert_line):
+            check.deny("wrong_line")
+        elif not market_floor_strike_matches_alert(
+            {"floor_strike": market_floor_strike} if market_floor_strike is not None else {},
+            alert_line,
+        ):
             check.deny("wrong_line")
 
     if home_hdp is not None and bet_side:
@@ -503,4 +569,9 @@ def prepare_executable_order(
         bet_side=bet_side or alert.get("bet_side"),
         require_credentials=require_credentials,
         has_credentials=has_credentials,
+        market_floor_strike=(
+            alert.get("floor_strike")
+            if alert.get("floor_strike") is not None
+            else (alert.get("market_data") or {}).get("floor_strike")
+        ),
     )
