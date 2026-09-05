@@ -381,6 +381,12 @@ def prefer_market_ticker(
     return None
 
 
+def is_bare_game_event_ticker(ticker: Any) -> bool:
+    """True for a KX*GAME event with no TEAM / line suffix (not executable)."""
+    parsed = parse_kalshi_ticker(ticker)
+    return bool(parsed and not parsed.is_market)
+
+
 def expected_side_for_alert(
     *,
     market_type: Any,
@@ -388,6 +394,7 @@ def expected_side_for_alert(
     line: Optional[float],
     ticker: Any,
     teams: Any = None,
+    qualifier: Any = None,
 ) -> Optional[str]:
     """Locked YES/NO for an executable Kalshi take.
 
@@ -397,6 +404,7 @@ def expected_side_for_alert(
       ``build_market_ticker`` always stamps the fav suffix.
     * Moneyline: pick=YES on the pick's GAME-TEAM ticker. Event-only → YES
       (caller must stamp the pick's market ticker).
+    Never returns '' — unresolved is None. Do not place with an empty side.
     """
     family = _family_from_market_type(market_type)
     pick_u = _upper(pick)
@@ -408,6 +416,8 @@ def expected_side_for_alert(
             return "yes"
         return None
     if family == "spread":
+        if line is None:
+            line = parse_alert_line(None, qualifier)
         if line is None:
             return None
         try:
@@ -662,6 +672,7 @@ def validate_execution_intent(
         line=alert_line,
         ticker=parsed.raw,
         teams=teams,
+        qualifier=qualifier,
     )
     if expected_side is None:
         check.deny("side_unresolved")

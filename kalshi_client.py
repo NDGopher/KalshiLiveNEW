@@ -28,6 +28,7 @@ from execution_guard import (
     is_executable_market_ticker,
     kalshi_line_int,
     market_floor_strike_matches_alert,
+    parse_alert_line,
     prefer_market_ticker,
     public_get_headers,
 )
@@ -1066,7 +1067,7 @@ class KalshiClient:
                         validated_splits.append((code1, code2))
                 elif 'KXNCAAFGAME' in base_series or 'KXNCAAF' in base_series:
                     # NCAAF - similar to NCAAB, use NCAAB validation
-                    known_ncaab_codes = ['WEB', 'SAC', 'IW', 'AMCC', 'KU', 'TTU', 'UNT', 'COOK', 'AAMU', 'UNO', 'TAMC', 'MCNS', 'GRAM', 'ALCN', 'SOU', 'JKST', 'UMES', 'FAU', 'ECU', 'WICH', 'TLSA', 'MINN', 'PSU', 'MSM', 'QUIN', 'FAIR', 'MAN', 'GB', 'WRST', 'COLO', 'TCU', 'HC', 'NCST', 'UNC', 'DUKE', 'VT', 'UGA', 'TENN', 'AUB', 'ALA', 'ARK', 'CLEM', 'MIA', 'ND', 'PUR', 'WIS', 'MD', 'RUTG', 'NEB', 'IOWA', 'CREI', 'VILL', 'PROV', 'GONZ', 'SMC', 'BYU', 'HOU', 'MEM', 'CIN', 'TEM', 'UAB']
+                    known_ncaab_codes = ['WEB', 'SAC', 'IW', 'AMCC', 'KU', 'TTU', 'UNT', 'COOK', 'AAMU', 'UNO', 'TAMC', 'MCNS', 'GRAM', 'ALCN', 'SOU', 'JKST', 'UMES', 'FAU', 'ECU', 'WICH', 'TLSA', 'MINN', 'PSU', 'MSM', 'QUIN', 'FAIR', 'MAN', 'GB', 'WRST', 'COLO', 'TCU', 'HC', 'HCU', 'RICE', 'NCST', 'UNC', 'DUKE', 'VT', 'UGA', 'TENN', 'AUB', 'ALA', 'ARK', 'CLEM', 'MIA', 'ND', 'PUR', 'WIS', 'MD', 'RUTG', 'NEB', 'IOWA', 'CREI', 'VILL', 'PROV', 'GONZ', 'SMC', 'BYU', 'HOU', 'MEM', 'CIN', 'TEM', 'UAB']
                     if (code1 in known_ncaab_codes or code2 in known_ncaab_codes) or (3 <= len(code1) <= 4 and 3 <= len(code2) <= 4):
                         validated_splits.append((code1, code2))
                 elif 'KXMLBGAME' in base_series or 'KXMLB' in base_series:
@@ -1481,7 +1482,9 @@ class KalshiClient:
             ('GONZAGA', 'GONZ'),
             ('SAINT MARY\'S', 'SMC'), ("ST. MARY'S", 'SMC'),
             ('BYU', 'BYU'),
+            ('HOUSTON CHRISTIAN', 'HCU'), ('HCU', 'HCU'),
             ('HOUSTON', 'HOU'),
+            ('RICE OWLS', 'RICE'), ('RICE', 'RICE'),
             ('MEMPHIS', 'MEM'),
             ('CINCINNATI', 'CIN'),
             ('TEMPLE', 'TEM'),
@@ -1650,11 +1653,16 @@ class KalshiClient:
         return None
     
     def _get_ncaaf_team_code(self, selection_upper):
-        """Get NCAAF team code from selection - many overlap with NCAAB"""
-        # NCAAF uses similar codes to NCAAB, but we'll add sport-specific ones here
-        # Most teams can use the NCAAB mapping, but some may differ
-        # For now, return None to fall back to NCAAB logic
-        # This can be expanded with NCAAF-specific mappings if needed
+        """NCAAF codes that must not fall through to NCAAB (Houston ≠ Houston Christian)."""
+        if not selection_upper:
+            return None
+        ncaaf_mappings = [
+            ('HOUSTON CHRISTIAN', 'HCU'), ('HCU HUSKIES', 'HCU'), ('HCU', 'HCU'),
+            ('RICE OWLS', 'RICE'), ('RICE', 'RICE'),
+        ]
+        for pattern, code in sorted(ncaaf_mappings, key=lambda x: len(x[0]), reverse=True):
+            if pattern in selection_upper:
+                return code
         return None
 
     def _get_mlb_team_code(self, selection_upper):
@@ -2519,19 +2527,22 @@ class KalshiClient:
         return None
     
     def resolve_executable_market_identity(
-        self, event_or_market, market_type, line, selection, teams_str=None
+        self, event_or_market, market_type, line, selection, teams_str=None, qualifier=None
     ):
         """Sync. Prefer attached market ticker when family+ceil match; else build.
 
         Returns ``{"ticker", "side", "event_ticker"}`` or ``None``. No network.
-        ``find_submarket`` confirms the contract exists and floor_strike matches.
+        Bare GAME events are never returned. ``find_submarket`` may confirm the
+        contract exists; callers may still place from this identity if GET misses.
         """
+        if line is None:
+            line = parse_alert_line(None, qualifier)
         attached = str(event_or_market or "").strip().upper()
         built = self.build_market_ticker(
             event_or_market, market_type, line, selection, teams_str
         )
         chosen = prefer_market_ticker(
-            attached, built, market_type, line
+            attached, built, market_type, line, qualifier
         )
         if not chosen:
             return None
@@ -2541,10 +2552,11 @@ class KalshiClient:
             line=line,
             ticker=chosen,
             teams=teams_str,
+            qualifier=qualifier,
         )
         if side not in ("yes", "no"):
             return None
-        if not is_executable_market_ticker(chosen, market_type, line):
+        if not is_executable_market_ticker(chosen, market_type, line, qualifier):
             return None
         return {
             "ticker": chosen,

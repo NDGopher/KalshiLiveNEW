@@ -344,7 +344,7 @@ def _autobet_card_reasons(
 _ticker_builder = None
 
 
-def _resolve_kalshi_card_identity(ticker, market_type, line, pick, teams):
+def _resolve_kalshi_card_identity(ticker, market_type, line, pick, teams, qualifier=None):
     """Upgrade a GAME event KX to SPREAD/TOTAL/GAME-TEAM + yes/no. Sync, no network."""
     global _ticker_builder
     if _ticker_builder is None:
@@ -352,7 +352,7 @@ def _resolve_kalshi_card_identity(ticker, market_type, line, pick, teams):
 
         _ticker_builder = KalshiClient()
     return _ticker_builder.resolve_executable_market_identity(
-        ticker, market_type, line, pick, teams
+        ticker, market_type, line, pick, teams, qualifier
     )
 
 
@@ -3924,7 +3924,7 @@ class OddsEVMonitor:
         card_side = None
         if take_canon.lower() == "kalshi" and ticker and is_kalshi_ticker(ticker):
             ident = _resolve_kalshi_card_identity(
-                ticker, market_type_bb, line_val, pick, teams
+                ticker, market_type_bb, line_val, pick, teams, qualifier
             )
             if ident:
                 ticker = ident["ticker"]
@@ -3936,6 +3936,7 @@ class OddsEVMonitor:
                     line=line_val,
                     ticker=ticker,
                     teams=teams,
+                    qualifier=qualifier,
                 )
 
         has_exec = bool(
