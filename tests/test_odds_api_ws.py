@@ -563,8 +563,38 @@ def test_thin_ws_store_skips_rest_when_backfill_disabled(monkeypatch):
         ows._ws_rest_backfill_until = 0.0
 
 
+
+def test_handoff_skips_rest_odds_by_default(monkeypatch):
+    """WS-first: connect-time handoff must not burn REST /odds/multi by default."""
+    monkeypatch.setenv("ODDS_API_KEY", "test-not-a-real-key")
+    monkeypatch.delenv("ODDS_API_WS_HANDOFF_REST_ODDS", raising=False)
+
+    class SpyRest(_DummyRest):
+        def __init__(self):
+            self.live_calls = 0
+            self.multi_calls = 0
+
+        async def list_live_events(self, *args, **kwargs):
+            self.live_calls += 1
+            return [{"id": 1, "league": {"slug": "england-premier-league"}}]
+
+        async def get_odds_multi(self, *args, **kwargs):
+            self.multi_calls += 1
+            raise AssertionError("handoff must not call get_odds_multi by default")
+
+    async def run() -> None:
+        rest = SpyRest()
+        feed = OddsApiWsFeed(rest, api_key="test-not-a-real-key")
+        await feed._handoff_snapshot()
+        assert rest.live_calls == 0
+        assert rest.multi_calls == 0
+        assert feed.store.last_seq is None
+
+    asyncio.run(run())
+
+
 def test_cold_ws_store_seeds_empty_events_via_rest(monkeypatch):
-    """Cold seed (default path): events with zero books get a one-shot REST seed."""
+    """Cold seed (opt-in): events with zero books get a one-shot REST seed."""
     monkeypatch.setenv("ODDS_API_KEY", "test-not-a-real-key")
     monkeypatch.setenv("ODDS_API_WS", "true")
     monkeypatch.setenv("ODDS_API_WS_REST_BACKFILL", "false")
