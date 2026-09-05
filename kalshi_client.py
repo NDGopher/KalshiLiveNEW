@@ -34,6 +34,191 @@ KALSHI_WSS = "wss://api.elections.kalshi.com/trade-api/ws/v2"
 KALSHI_DEMO_WSS = "wss://demo-api.kalshi.com/trade-api/ws/v2"
 
 
+def _fp_number(value):
+    """Parse a Kalshi fixed-point string or numeric level field."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_orderbook_price_dollars(raw_price):
+    """Convert a documented Kalshi price field to dollars.
+
+    REST/WS fixed-point prices are dollar strings (``\"0.4200\"``).
+    Legacy REST ``orderbook.yes`` / ``orderbook.no`` levels use integer cents.
+    """
+    if raw_price is None:
+        return None
+    if isinstance(raw_price, str):
+        return _fp_number(raw_price)
+    if isinstance(raw_price, bool):
+        return None
+    if isinstance(raw_price, int):
+        return float(raw_price) / 100.0
+    if isinstance(raw_price, float):
+        # Legacy cents occasionally arrive as 42.0; dollar floats stay in (0, 1].
+        if raw_price > 1.0:
+            return raw_price / 100.0
+        return raw_price
+    return _fp_number(raw_price)
+
+
+def parse_orderbook_levels(raw_levels):
+    """Parse Kalshi bid levels into ``[{price, quantity}, ...]`` in dollars.
+
+    Accepts documented shapes only:
+    - fixed-point: ``[\"0.4200\", \"13.00\"]`` (dollars string, count_fp string)
+    - legacy cents: ``[42, 13]`` (integer cents, integer count)
+    """
+    bids = []
+    total_qty = 0.0
+    if not raw_levels:
+        return bids, total_qty
+    for level in raw_levels:
+        raw_price = None
+        raw_qty = None
+        if isinstance(level, (list, tuple)) and len(level) >= 2:
+            raw_price, raw_qty = level[0], level[1]
+        elif isinstance(level, dict):
+            raw_price = level.get("price_dollars", level.get("price"))
+            raw_qty = level.get("count_fp", level.get("quantity", level.get("size")))
+        price = parse_orderbook_price_dollars(raw_price)
+        qty = _fp_number(raw_qty)
+        if price is None or qty is None or qty <= 0:
+            continue
+        if price <= 0 or price > 1.0:
+            continue
+        bids.append({"price": price, "quantity": qty})
+        total_qty += qty
+    return bids, total_qty
+
+
+def extract_raw_orderbook_sides(payload):
+    """Return ``(yes_levels, no_levels)`` from REST or WS orderbook envelopes.
+
+    Documented keys (in priority order):
+    - REST: ``orderbook_fp.yes_dollars`` / ``orderbook_fp.no_dollars``
+    - REST legacy: ``orderbook.yes`` / ``orderbook.no``
+    - WS snapshot: ``msg.yes_dollars_fp`` / ``msg.no_dollars_fp``
+      (older envelopes used ``data`` instead of ``msg``)
+    """
+    if not isinstance(payload, dict):
+        return None, None
+
+    candidates = [payload]
+    for wrapper_key in ("msg", "data"):
+        inner = payload.get(wrapper_key)
+        if isinstance(inner, dict):
+            candidates.append(inner)
+
+    for candidate in list(candidates):
+        fp = candidate.get("orderbook_fp")
+        if isinstance(fp, dict):
+            candidates.append(fp)
+        legacy = candidate.get("orderbook")
+        if isinstance(legacy, dict):
+            candidates.append(legacy)
+
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        yes = (
+            candidate.get("yes_dollars")
+            if candidate.get("yes_dollars") is not None
+            else candidate.get("yes_dollars_fp")
+            if candidate.get("yes_dollars_fp") is not None
+            else candidate.get("yes")
+            if candidate.get("yes") is not None
+            else candidate.get("yes_bids")
+        )
+        no = (
+            candidate.get("no_dollars")
+            if candidate.get("no_dollars") is not None
+            else candidate.get("no_dollars_fp")
+            if candidate.get("no_dollars_fp") is not None
+            else candidate.get("no")
+            if candidate.get("no") is not None
+            else candidate.get("no_bids")
+        )
+        if yes is not None or no is not None:
+            return yes or [], no or []
+    return None, None
+
+
+def build_normalized_orderbook(yes_bids, no_bids, *, fetched_at=None):
+    """Build the yes/no book ``place_order`` reads (bids + complementary asks)."""
+    yes_best_bid = yes_bids[-1]["price"] if yes_bids else None
+    no_best_bid = no_bids[-1]["price"] if no_bids else None
+    yes_best_ask = (1.0 - no_bids[-1]["price"]) if no_bids else None
+    no_best_ask = (1.0 - yes_bids[-1]["price"]) if yes_bids else None
+
+    yes_asks = [
+        {"price": 1.0 - bid["price"], "quantity": bid["quantity"]}
+        for bid in no_bids
+    ]
+    yes_asks.sort(key=lambda level: level["price"])
+    no_asks = [
+        {"price": 1.0 - bid["price"], "quantity": bid["quantity"]}
+        for bid in yes_bids
+    ]
+    no_asks.sort(key=lambda level: level["price"])
+
+    now = time.time() if fetched_at is None else fetched_at
+    return {
+        "yes": {
+            "best_bid": yes_best_bid,
+            "best_ask": yes_best_ask,
+            "best_ask_size": yes_asks[0]["quantity"] if yes_asks else 0,
+            "bids": yes_bids,
+            "asks": yes_asks,
+            "total_liquidity": sum(level["quantity"] for level in yes_bids),
+        },
+        "no": {
+            "best_bid": no_best_bid,
+            "best_ask": no_best_ask,
+            "best_ask_size": no_asks[0]["quantity"] if no_asks else 0,
+            "bids": no_bids,
+            "asks": no_asks,
+            "total_liquidity": sum(level["quantity"] for level in no_bids),
+        },
+        "timestamp": datetime.now().isoformat(),
+        "fetched_at": now,
+    }
+
+
+def normalize_kalshi_orderbook(payload, *, fetched_at=None):
+    """Normalize REST ``orderbook_fp`` / legacy ``orderbook`` (or WS snapshot) for trading."""
+    yes_raw, no_raw = extract_raw_orderbook_sides(payload)
+    if yes_raw is None and no_raw is None:
+        return None
+    yes_bids, _ = parse_orderbook_levels(yes_raw)
+    no_bids, _ = parse_orderbook_levels(no_raw)
+    return build_normalized_orderbook(yes_bids, no_bids, fetched_at=fetched_at)
+
+
+def ws_orderbook_inner(message):
+    """Return the WS snapshot/delta body (``msg`` preferred, legacy ``data`` accepted)."""
+    if not isinstance(message, dict):
+        return {}
+    inner = message.get("msg")
+    if isinstance(inner, dict):
+        return inner
+    inner = message.get("data")
+    if isinstance(inner, dict):
+        return inner
+    return {}
+
+
 class KalshiAuth:
     """Kalshi authentication handler using RSA private key signing"""
     
@@ -2353,106 +2538,35 @@ class KalshiClient:
                     traceback.print_exc()
                 return None
             
-            # Parse orderbook
+            # Parse orderbook_fp (current Trade API) or legacy orderbook
             try:
-                orderbook = data.get('orderbook', {})
-                if not orderbook:
-                    print(f"   No 'orderbook' key in response for {ticker}, keys: {list(data.keys())[:10]}")
+                orderbook_data = normalize_kalshi_orderbook(data)
+                if not orderbook_data:
+                    print(f"   No orderbook/orderbook_fp in response for {ticker}, keys: {list(data.keys())[:10]}")
                     return None
-                
-                # Check for alternative key names (yes_bids/no_bids vs yes/no)
-                yes_bids_raw = orderbook.get('yes', []) or orderbook.get('yes_bids', []) or []
-                no_bids_raw = orderbook.get('no', []) or orderbook.get('no_bids', []) or []
-                
-                # Debug: Log orderbook structure (only on first fetch to reduce noise)
+
+                yes_bids = orderbook_data["yes"]["bids"]
+                no_bids = orderbook_data["no"]["bids"]
+                yes_asks = orderbook_data["yes"]["asks"]
+                no_asks = orderbook_data["no"]["asks"]
+
                 if not hasattr(self, '_ob_structure_logged'):
-                    print(f"[ORDERBOOK] Raw orderbook keys: {list(orderbook.keys())}")
-                    if yes_bids_raw:
-                        print(f"[ORDERBOOK] YES sample (first 2): {yes_bids_raw[:2]}")
-                    if no_bids_raw:
-                        print(f"[ORDERBOOK] NO sample (first 2): {no_bids_raw[:2]}")
+                    source = "orderbook_fp" if data.get("orderbook_fp") is not None else "orderbook"
+                    print(f"[ORDERBOOK] Raw response keys: {list(data.keys())} (using {source})")
+                    if yes_bids:
+                        print(f"[ORDERBOOK] YES sample (first 2): {yes_bids[:2]}")
+                    if no_bids:
+                        print(f"[ORDERBOOK] NO sample (first 2): {no_bids[:2]}")
                     self._ob_structure_logged = True
-                
-                # Parse YES side
-                yes_bids = []
-                yes_total_liq = 0
-                for bid in yes_bids_raw:
-                    if isinstance(bid, list) and len(bid) >= 2:
-                        price_cents = bid[0]
-                        quantity = bid[1]
-                        price = price_cents / 100.0
-                        yes_bids.append({'price': price, 'quantity': quantity})
-                        yes_total_liq += quantity
-                
-                # Parse NO side
-                no_bids = []
-                no_total_liq = 0
-                for bid in no_bids_raw:
-                    if isinstance(bid, list) and len(bid) >= 2:
-                        price_cents = bid[0]
-                        quantity = bid[1]
-                        price = price_cents / 100.0
-                        no_bids.append({'price': price, 'quantity': quantity})
-                        no_total_liq += quantity
-                
-                # Get best bid/ask
-                # Bids are sorted by price (ascending), so last element is highest (best bid)
-                # For YES: best_ask = 1 - NO best_bid (complementary pricing)
-                yes_best_bid = yes_bids[-1]['price'] if yes_bids else None
-                yes_best_ask = (1.0 - no_bids[-1]['price']) if no_bids else None
-                
-                no_best_bid = no_bids[-1]['price'] if no_bids else None
-                no_best_ask = (1.0 - yes_bids[-1]['price']) if yes_bids else None
-                
-                # Debug: Verify orderbook structure
-                if yes_bids and no_bids:
+
+                yes_best_bid = orderbook_data["yes"]["best_bid"]
+                yes_best_ask = orderbook_data["yes"]["best_ask"]
+                no_best_bid = orderbook_data["no"]["best_bid"]
+                no_best_ask = orderbook_data["no"]["best_ask"]
+                if yes_bids and no_bids and yes_best_ask is not None and no_best_bid is not None:
                     print(f"[ORDERBOOK] YES best_bid={yes_best_bid:.4f}, YES best_ask={yes_best_ask:.4f}, NO best_bid={no_best_bid:.4f}, NO best_ask={no_best_ask:.4f}")
                     print(f"[ORDERBOOK] Verification: YES ask + NO bid = {yes_best_ask + no_best_bid:.4f} (should be ~1.0)")
-                
-                # CRITICAL: Calculate asks from bids (complementary pricing)
-                # YES asks = implied from NO bids (YES ask = 1 - NO bid)
-                # NO asks = implied from YES bids (NO ask = 1 - YES bid)
-                yes_asks = []
-                for no_bid in no_bids:
-                    yes_ask_price = 1.0 - no_bid['price']
-                    yes_asks.append({'price': yes_ask_price, 'quantity': no_bid['quantity']})
-                
-                # CRITICAL: Sort YES asks ascending by price (lowest ask first) for liquidity calculation
-                yes_asks.sort(key=lambda x: x['price'])
-                
-                no_asks = []
-                for yes_bid in yes_bids:
-                    no_ask_price = 1.0 - yes_bid['price']
-                    no_asks.append({'price': no_ask_price, 'quantity': yes_bid['quantity']})
-                
-                # CRITICAL: Sort NO asks ascending by price (lowest ask first) for liquidity calculation
-                no_asks.sort(key=lambda x: x['price'])
-                
-                # Get best_ask_size from asks
-                yes_best_ask_size = yes_asks[0]['quantity'] if yes_asks else 0
-                no_best_ask_size = no_asks[0]['quantity'] if no_asks else 0
-                
-                orderbook_data = {
-                    'yes': {
-                        'best_bid': yes_best_bid,
-                        'best_ask': yes_best_ask,
-                        'best_ask_size': yes_best_ask_size,
-                        'bids': yes_bids,
-                        'asks': yes_asks,  # CRITICAL: Include asks for liquidity checks
-                        'total_liquidity': yes_total_liq
-                    },
-                    'no': {
-                        'best_bid': no_best_bid,
-                        'best_ask': no_best_ask,
-                        'best_ask_size': no_best_ask_size,
-                        'bids': no_bids,
-                        'asks': no_asks,  # CRITICAL: Include asks for liquidity checks
-                        'total_liquidity': no_total_liq
-                    },
-                    'timestamp': datetime.now().isoformat(),
-                    'fetched_at': time.time()  # Unix timestamp for age checking
-                }
-                
+
                 self.orderbooks[ticker.upper()] = orderbook_data
                 fetch_duration = (time.time() - fetch_start) * 1000
                 print(f"[ORDERBOOK] [TIMING] Orderbook fetch completed in {fetch_duration:.1f}ms")
@@ -4368,7 +4482,7 @@ class KalshiClient:
                             print(f"[WS DEBUG] Received message type: {msg_type}")
                     
                     if msg_type in ["orderbook_snapshot", "orderbook_delta"]:
-                        ticker = data.get("data", {}).get("market_ticker", "").upper()
+                        ticker = (ws_orderbook_inner(data).get("market_ticker") or "").upper()
                         if not ticker:
                             continue
                         
@@ -4499,120 +4613,65 @@ class KalshiClient:
             await self.close_ws()
     
     def _apply_orderbook_update(self, data):
-        """Parse and apply snapshot/delta to orderbook"""
+        """Parse and apply snapshot/delta to orderbook (orderbook_fp and legacy)."""
         msg_type = data.get("type")
-        ticker = data.get("data", {}).get("market_ticker", "").upper()
-        
+        inner = ws_orderbook_inner(data)
+        ticker = (inner.get("market_ticker") or "").upper()
+
         if msg_type == "orderbook_snapshot":
-            # Full replace with orderbook data
-            orderbook_data = data.get("data", {}).get("orderbook", {})
-            if not orderbook_data:
-                return None
-            
-            # Parse into our format
-            yes_bids_raw = orderbook_data.get("yes", []) or []
-            no_bids_raw = orderbook_data.get("no", []) or []
-            
-            # Parse YES side
-            yes_bids = []
-            yes_total_liq = 0
-            for bid in yes_bids_raw:
-                if isinstance(bid, list) and len(bid) >= 2:
-                    price_cents = bid[0]
-                    quantity = bid[1]
-                    price = price_cents / 100.0
-                    yes_bids.append({'price': price, 'quantity': quantity})
-                    yes_total_liq += quantity
-            
-            # Parse NO side
-            no_bids = []
-            no_total_liq = 0
-            for bid in no_bids_raw:
-                if isinstance(bid, list) and len(bid) >= 2:
-                    price_cents = bid[0]
-                    quantity = bid[1]
-                    price = price_cents / 100.0
-                    no_bids.append({'price': price, 'quantity': quantity})
-                    no_total_liq += quantity
-            
-            # Get best bid/ask
-            yes_best_bid = yes_bids[-1]['price'] if yes_bids else None
-            yes_best_ask = (1.0 - no_bids[-1]['price']) if no_bids else None
-            no_best_bid = no_bids[-1]['price'] if no_bids else None
-            no_best_ask = (1.0 - yes_bids[-1]['price']) if yes_bids else None
-            
-            return {
-                'yes': {
-                    'best_bid': yes_best_bid,
-                    'best_ask': yes_best_ask,
-                    'bids': yes_bids,
-                    'total_liquidity': yes_total_liq
-                },
-                'no': {
-                    'best_bid': no_best_bid,
-                    'best_ask': no_best_ask,
-                    'bids': no_bids,
-                    'total_liquidity': no_total_liq
-                }
-            }
-        
-        elif msg_type == "orderbook_delta":
+            # Full replace: REST-shaped orderbook_fp, WS yes_dollars_fp, or legacy orderbook.
+            return normalize_kalshi_orderbook(data) or normalize_kalshi_orderbook(inner)
+
+        if msg_type == "orderbook_delta":
             if ticker not in self.orderbooks:
                 return None  # No snapshot yet, ignore delta
-            
+
             current = self.orderbooks[ticker].copy()
-            deltas = data.get("data", {}).get("deltas", [])
-            
-            # Apply deltas (simplified - Kalshi format may vary)
+            deltas = inner.get("deltas")
+            if not isinstance(deltas, list) or not deltas:
+                if inner.get("price_dollars") is not None or inner.get("price") is not None:
+                    deltas = [inner]
+                else:
+                    deltas = []
+
+            yes_bids = list(current.get("yes", {}).get("bids") or [])
+            no_bids = list(current.get("no", {}).get("bids") or [])
+            sides = {"yes": yes_bids, "no": no_bids}
+
             for delta in deltas:
-                side = delta.get("side", "").lower()  # "yes" or "no"
-                action = delta.get("action", "")  # "add", "update", "remove"
-                price_cents = delta.get("price")
-                size = delta.get("size", 0)
-                
-                if side not in ["yes", "no"] or not action or price_cents is None:
+                if not isinstance(delta, dict):
                     continue
-                
-                price = price_cents / 100.0
-                bids = current[side].get("bids", [])
-                
-                if action in ["add", "update"]:
-                    # Remove existing at this price
-                    bids = [b for b in bids if abs(b['price'] - price) > 0.001]
-                    if size > 0:
-                        bids.append({'price': price, 'quantity': size})
-                    # Sort by price (descending for bids)
-                    bids.sort(key=lambda x: x['price'], reverse=True)
-                    current[side]['bids'] = bids
-                    
-                    # Recalculate best bid and total liquidity
-                    if bids:
-                        current[side]['best_bid'] = bids[0]['price']
-                        current[side]['total_liquidity'] = sum(b['quantity'] for b in bids)
-                    
-                    # Recalculate best ask (opposite side)
-                    if side == "yes":
-                        no_bids = current['no'].get('bids', [])
-                        if no_bids:
-                            current['yes']['best_ask'] = 1.0 - no_bids[0]['price']
-                    else:
-                        yes_bids = current['yes'].get('bids', [])
-                        if yes_bids:
-                            current['no']['best_ask'] = 1.0 - yes_bids[0]['price']
-                
+                side = str(delta.get("side") or "").lower()
+                if side not in ("yes", "no"):
+                    continue
+                price = parse_orderbook_price_dollars(
+                    delta.get("price_dollars", delta.get("price"))
+                )
+                if price is None:
+                    continue
+                bids = sides[side]
+                action = str(delta.get("action") or "").lower()
+                if "delta_fp" in delta or "delta" in delta:
+                    change = _fp_number(delta.get("delta_fp", delta.get("delta")))
+                    if change is None:
+                        continue
+                    existing = next((b for b in bids if abs(b["price"] - price) <= 0.0001), None)
+                    new_qty = (existing["quantity"] if existing else 0.0) + change
+                    bids = [b for b in bids if abs(b["price"] - price) > 0.0001]
+                    if new_qty > 0:
+                        bids.append({"price": price, "quantity": new_qty})
                 elif action == "remove":
-                    bids = [b for b in bids if abs(b['price'] - price) > 0.001]
-                    current[side]['bids'] = bids
-                    
-                    if bids:
-                        current[side]['best_bid'] = bids[0]['price']
-                        current[side]['total_liquidity'] = sum(b['quantity'] for b in bids)
-                    else:
-                        current[side]['best_bid'] = None
-                        current[side]['total_liquidity'] = 0
-            
-            return current
-        
+                    bids = [b for b in bids if abs(b["price"] - price) > 0.0001]
+                else:
+                    size = _fp_number(delta.get("size", delta.get("count_fp", 0))) or 0.0
+                    bids = [b for b in bids if abs(b["price"] - price) > 0.0001]
+                    if size > 0:
+                        bids.append({"price": price, "quantity": size})
+                bids.sort(key=lambda level: level["price"])
+                sides[side] = bids
+
+            return build_normalized_orderbook(sides["yes"], sides["no"])
+
         return None
     
     async def subscribe_orderbook(self, ticker):
