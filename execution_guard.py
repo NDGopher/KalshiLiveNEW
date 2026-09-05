@@ -292,7 +292,11 @@ def name_matches_code(name: Any, code: Any) -> bool:
     if c and c in compact:
         return True
     words = [w for w in re.split(r"[^A-Z0-9]+", n) if w]
-    if words and "".join(w[0] for w in words)[: len(c)] == c:
+    initials = "".join(w[0] for w in words) if words else ""
+    if words and initials[: len(c)] == c:
+        return True
+    # Air Force → AFA, Ohio State → OSU: code starts with the initials.
+    if len(initials) >= 2 and (c.startswith(initials) or initials.startswith(c)):
         return True
     for w in words:
         if w == c or (len(w) >= 3 and (c.startswith(w[:3]) or w.startswith(c))):
@@ -329,6 +333,49 @@ def _family_from_market_type(market_type: Any) -> str:
     return "moneyline"
 
 
+def is_executable_market_ticker(
+    ticker: Any,
+    market_type: Any = None,
+    line: Any = None,
+    qualifier: Any = None,
+) -> bool:
+    """True only for a real market KX (GAME-TEAM / SPREAD-TEAM{ceil} / TOTAL-{ceil}).
+
+    Bare GAME event tickers are not executable identity. Neighbor ceil suffixes fail.
+    """
+    parsed = parse_kalshi_ticker(ticker)
+    if not parsed or not parsed.is_market:
+        return False
+    if market_type:
+        family = _family_from_market_type(market_type)
+        if parsed.family != family:
+            return False
+        if family in ("spread", "total"):
+            return ticker_line_matches_alert(parsed.raw, line, qualifier)
+    return True
+
+
+def prefer_market_ticker(
+    attached: Any,
+    built: Any,
+    market_type: Any,
+    line: Any = None,
+    qualifier: Any = None,
+) -> Optional[str]:
+    """Prefer public-attach / catalog market ticker when family+ceil match.
+
+    Else the built ticker. Event-only is not returned — find_submarket must
+    rebuild from the GAME event. Never invent a neighbor line.
+    """
+    if is_executable_market_ticker(attached, market_type, line, qualifier):
+        parsed = parse_kalshi_ticker(attached)
+        return parsed.raw if parsed else None
+    if is_executable_market_ticker(built, market_type, line, qualifier):
+        parsed = parse_kalshi_ticker(built)
+        return parsed.raw if parsed else None
+    return None
+
+
 def expected_side_for_alert(
     *,
     market_type: Any,
@@ -337,6 +384,15 @@ def expected_side_for_alert(
     ticker: Any,
     teams: Any = None,
 ) -> Optional[str]:
+    """Locked YES/NO for an executable Kalshi take.
+
+    * Totals: Over=YES, Under=NO (same TOTAL-{ceil} ticker).
+    * Spreads: favorite (line<0)=YES on that team's ticker; dog (line>0)=NO
+      on the favorite's ticker. Event-only still uses that convention because
+      ``build_market_ticker`` always stamps the fav suffix.
+    * Moneyline: pick=YES on the pick's GAME-TEAM ticker. Event-only → YES
+      (caller must stamp the pick's market ticker).
+    """
     family = _family_from_market_type(market_type)
     pick_u = _upper(pick)
     parsed = parse_kalshi_ticker(ticker)
@@ -346,23 +402,32 @@ def expected_side_for_alert(
         if "OVER" in pick_u:
             return "yes"
         return None
-    if not parsed:
-        return None
     if family == "spread":
         if line is None:
             return None
-        pick_on_ticker = bool(parsed.team_code and name_matches_code(pick, parsed.team_code))
-        if line < 0:
-            # Favorite: Kalshi ticker is this team's market. YES = favorite covers.
-            return "yes" if pick_on_ticker else None
-        if line > 0:
-            # Underdog: ticker is the favorite (opponent). NO = underdog covers.
-            return "no" if (parsed.team_code and not pick_on_ticker) else None
+        try:
+            lf = float(line)
+        except (TypeError, ValueError):
+            return None
+        if parsed and parsed.is_market and parsed.team_code:
+            pick_on_ticker = bool(name_matches_code(pick, parsed.team_code))
+            if lf < 0:
+                # Favorite: Kalshi ticker is this team's market. YES = favorite covers.
+                return "yes" if pick_on_ticker else None
+            if lf > 0:
+                # Underdog: ticker is the favorite (opponent). NO = underdog covers.
+                return "no" if not pick_on_ticker else None
+            return None
+        # Event-only / no team suffix: we always stamp the favorite's ticker.
+        if lf < 0:
+            return "yes"
+        if lf > 0:
+            return "no"
         return None
     # moneyline: suffix is the YES team
-    if parsed.team_code and name_matches_code(pick, parsed.team_code):
-        return "yes"
-    if parsed.team_code:
+    if parsed and parsed.team_code:
+        if name_matches_code(pick, parsed.team_code):
+            return "yes"
         away, home = split_home_away(teams)
         opp = None
         if away and home:
@@ -374,6 +439,10 @@ def expected_side_for_alert(
             return "no"
         if not name_matches_code(pick, parsed.team_code):
             return "no"
+        return None
+    # Event-only: ML pick is YES once the pick's GAME-TEAM ticker is stamped.
+    if pick_u:
+        return "yes"
     return None
 
 

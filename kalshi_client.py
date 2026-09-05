@@ -19,10 +19,13 @@ from pathlib import Path
 from execution_guard import (
     build_limit_order_payload,
     event_ticker_from_any,
+    expected_side_for_alert,
     format_hms_us,
     has_trading_credentials,
+    is_executable_market_ticker,
     kalshi_line_int,
     market_floor_strike_matches_alert,
+    prefer_market_ticker,
     public_get_headers,
 )
 
@@ -987,13 +990,15 @@ class KalshiClient:
         # Pattern: numbers + letters (month) + numbers (day/year) + team codes
         import re
         
-        # Try to find date pattern and extract team codes part
-        # Common patterns: 26JAN31, 31JAN26, etc.
-        # After date, we have team codes concatenated
-        date_match = re.match(r'(\d{1,2}[A-Z]{3}\d{1,2})', event_suffix)
-        if date_match:
-            date_part = date_match.group(1)
-            team_codes_part = event_suffix[len(date_part):]  # Everything after date
+        # Date [HHMM] TEAMCODES. MLB live events include kickoff time
+        # (KXMLBGAME-26SEP051805ATLPHI → date 26SEP05, time 1805, codes ATLPHI).
+        # Stripping only the date left "1805ATLPHI" and broke find_submarket.
+        suffix_match = re.match(
+            r"^(?P<date>\d{2}[A-Z]{3}\d{2})(?P<time>\d{4})?(?P<codes>[A-Z]+)$",
+            event_suffix,
+        )
+        if suffix_match:
+            team_codes_part = suffix_match.group("codes") or ""
             
             # Now we need to split team_codes_part into two team codes
             # Team codes are typically 2-5 characters each
@@ -1037,6 +1042,15 @@ class KalshiClient:
                     # NCAAF - similar to NCAAB, use NCAAB validation
                     known_ncaab_codes = ['WEB', 'SAC', 'IW', 'AMCC', 'KU', 'TTU', 'UNT', 'COOK', 'AAMU', 'UNO', 'TAMC', 'MCNS', 'GRAM', 'ALCN', 'SOU', 'JKST', 'UMES', 'FAU', 'ECU', 'WICH', 'TLSA', 'MINN', 'PSU', 'MSM', 'QUIN', 'FAIR', 'MAN', 'GB', 'WRST', 'COLO', 'TCU', 'HC', 'NCST', 'UNC', 'DUKE', 'VT', 'UGA', 'TENN', 'AUB', 'ALA', 'ARK', 'CLEM', 'MIA', 'ND', 'PUR', 'WIS', 'MD', 'RUTG', 'NEB', 'IOWA', 'CREI', 'VILL', 'PROV', 'GONZ', 'SMC', 'BYU', 'HOU', 'MEM', 'CIN', 'TEM', 'UAB']
                     if (code1 in known_ncaab_codes or code2 in known_ncaab_codes) or (3 <= len(code1) <= 4 and 3 <= len(code2) <= 4):
+                        validated_splits.append((code1, code2))
+                elif 'KXMLBGAME' in base_series or 'KXMLB' in base_series:
+                    known_mlb_codes = [
+                        'ATL', 'PHI', 'BAL', 'BOS', 'NYY', 'NYM', 'CHC', 'CWS', 'CIN', 'CLE',
+                        'COL', 'DET', 'HOU', 'KC', 'LAA', 'LAD', 'MIA', 'MIL', 'MIN', 'ATH',
+                        'OAK', 'PIT', 'SD', 'SF', 'SEA', 'STL', 'TB', 'TEX', 'TOR', 'WSH',
+                        'AZ', 'ARI',
+                    ]
+                    if code1 in known_mlb_codes or code2 in known_mlb_codes:
                         validated_splits.append((code1, code2))
             
             # If we found validated splits, prefer those (they're more likely correct)
@@ -1616,6 +1630,58 @@ class KalshiClient:
         # For now, return None to fall back to NCAAB logic
         # This can be expanded with NCAAF-specific mappings if needed
         return None
+
+    def _get_mlb_team_code(self, selection_upper):
+        """Kalshi MLB codes from the live GAME/SPREAD suffix (ATL, PHI, BAL, …)."""
+        if not selection_upper:
+            return None
+        mlb_mappings = [
+            ('ARIZONA DIAMONDBACKS', 'AZ'), ('DIAMONDBACKS', 'AZ'), ('D-BACKS', 'AZ'), ('DBACKS', 'AZ'),
+            ('ATLANTA BRAVES', 'ATL'), ('BRAVES', 'ATL'), ('ATLANTA', 'ATL'),
+            ('BALTIMORE ORIOLES', 'BAL'), ('ORIOLES', 'BAL'), ('BALTIMORE', 'BAL'),
+            ('BOSTON RED SOX', 'BOS'), ('RED SOX', 'BOS'),
+            ('CHICAGO CUBS', 'CHC'), ('CUBS', 'CHC'),
+            ('CHICAGO WHITE SOX', 'CWS'), ('WHITE SOX', 'CWS'),
+            ('CINCINNATI REDS', 'CIN'), ('REDS', 'CIN'), ('CINCINNATI', 'CIN'),
+            ('CLEVELAND GUARDIANS', 'CLE'), ('GUARDIANS', 'CLE'), ('CLEVELAND', 'CLE'),
+            ('COLORADO ROCKIES', 'COL'), ('ROCKIES', 'COL'),
+            ('DETROIT TIGERS', 'DET'), ('TIGERS', 'DET'),
+            ('HOUSTON ASTROS', 'HOU'), ('ASTROS', 'HOU'), ('HOUSTON', 'HOU'),
+            ('KANSAS CITY ROYALS', 'KC'), ('ROYALS', 'KC'), ('KANSAS CITY', 'KC'),
+            ('LOS ANGELES ANGELS', 'LAA'), ('LA ANGELS', 'LAA'), ('ANGELS', 'LAA'),
+            ('LOS ANGELES DODGERS', 'LAD'), ('LA DODGERS', 'LAD'), ('DODGERS', 'LAD'),
+            ('MIAMI MARLINS', 'MIA'), ('MARLINS', 'MIA'),
+            ('MILWAUKEE BREWERS', 'MIL'), ('BREWERS', 'MIL'), ('MILWAUKEE', 'MIL'),
+            ('MINNESOTA TWINS', 'MIN'), ('TWINS', 'MIN'),
+            ('NEW YORK METS', 'NYM'), ('NY METS', 'NYM'), ('METS', 'NYM'),
+            ('NEW YORK YANKEES', 'NYY'), ('NY YANKEES', 'NYY'), ('YANKEES', 'NYY'),
+            ('OAKLAND ATHLETICS', 'ATH'), ('ATHLETICS', 'ATH'), ("A'S", 'ATH'),
+            ('PHILADELPHIA PHILLIES', 'PHI'), ('PHILLIES', 'PHI'),
+            ('PITTSBURGH PIRATES', 'PIT'), ('PIRATES', 'PIT'),
+            ('SAN DIEGO PADRES', 'SD'), ('PADRES', 'SD'), ('SAN DIEGO', 'SD'),
+            ('SAN FRANCISCO GIANTS', 'SF'), ('GIANTS', 'SF'), ('SAN FRANCISCO', 'SF'),
+            ('SEATTLE MARINERS', 'SEA'), ('MARINERS', 'SEA'),
+            ('ST. LOUIS CARDINALS', 'STL'), ('ST LOUIS CARDINALS', 'STL'), ('CARDINALS', 'STL'),
+            ('TAMPA BAY RAYS', 'TB'), ('RAYS', 'TB'),
+            ('TEXAS RANGERS', 'TEX'), ('RANGERS', 'TEX'),
+            ('TORONTO BLUE JAYS', 'TOR'), ('BLUE JAYS', 'TOR'), ('TORONTO', 'TOR'),
+            ('WASHINGTON NATIONALS', 'WSH'), ('NATIONALS', 'WSH'),
+            ('BOSTON', 'BOS'), ('DETROIT', 'DET'), ('MIAMI', 'MIA'),
+            ('MINNESOTA', 'MIN'), ('PHILADELPHIA', 'PHI'), ('PITTSBURGH', 'PIT'),
+            ('SEATTLE', 'SEA'), ('TEXAS', 'TEX'), ('WASHINGTON', 'WSH'),
+        ]
+        for pattern, code in sorted(mlb_mappings, key=lambda x: len(x[0]), reverse=True):
+            if pattern in selection_upper:
+                return code
+        compact = selection_upper.replace(' ', '')
+        for code in (
+            'ATL', 'PHI', 'BAL', 'BOS', 'NYY', 'NYM', 'CHC', 'CWS', 'CIN', 'CLE',
+            'COL', 'DET', 'HOU', 'LAA', 'LAD', 'MIA', 'MIL', 'MIN', 'ATH', 'PIT',
+            'STL', 'TEX', 'TOR', 'WSH', 'KC', 'SD', 'SF', 'TB', 'AZ',
+        ):
+            if compact == code:
+                return code
+        return None
     
     def _log_mapping_mismatch(self, event_ticker, market_type, line, selection, teams_str, built_ticker, reason):
         """Log team mapping mismatches to help identify incorrect mappings"""
@@ -1747,6 +1813,8 @@ class KalshiClient:
                                 team_code = self._get_nfl_team_code(favorite_team)
                             elif 'KXNCAAFGAME' in base_series or 'KXNCAAF' in base_series:
                                 team_code = self._get_ncaaf_team_code(favorite_team) or self._get_ncaab_team_code(favorite_team)
+                            elif 'KXMLBGAME' in base_series or 'KXMLB' in base_series:
+                                team_code = self._get_mlb_team_code(favorite_team)
                             else:
                                 team_code = self._get_ncaab_team_code(favorite_team)
                             
@@ -1764,6 +1832,8 @@ class KalshiClient:
                             team_code = self._get_nfl_team_code(selection_upper)
                         elif 'KXNCAAFGAME' in base_series or 'KXNCAAF' in base_series:
                             team_code = self._get_ncaaf_team_code(selection_upper) or self._get_ncaab_team_code(selection_upper)
+                        elif 'KXMLBGAME' in base_series or 'KXMLB' in base_series:
+                            team_code = self._get_mlb_team_code(selection_upper)
                         else:
                             team_code = self._get_ncaab_team_code(selection_upper)
                         
@@ -1896,6 +1966,12 @@ class KalshiClient:
                     if team_code and base_series and event_suffix:
                         built_ticker = f"{base_series}-{event_suffix}-{team_code}"
                         print(f"   🔨 [MONEYLINE] Built ticker immediately after NCAAF mapping: {built_ticker}")
+                        return built_ticker
+                elif 'KXMLBGAME' in base_series or 'KXMLB' in base_series:
+                    team_code = self._get_mlb_team_code(selection_upper)
+                    if team_code and base_series and event_suffix:
+                        built_ticker = f"{base_series}-{event_suffix}-{team_code}"
+                        print(f"   🔨 [MONEYLINE] Built ticker immediately after MLB mapping: {built_ticker}")
                         return built_ticker
                 else:
                     # Default to NCAAB for backwards compatibility
@@ -2164,6 +2240,12 @@ class KalshiClient:
                         built_ticker = f"{base_series}-{event_suffix}-{team_code}"
                         print(f"   🔨 [MONEYLINE] Built ticker immediately after NCAAF mapping: {built_ticker}")
                         return built_ticker
+                elif 'KXMLBGAME' in base_series or 'KXMLB' in base_series:
+                    team_code = self._get_mlb_team_code(selection_upper)
+                    if team_code and base_series and event_suffix:
+                        built_ticker = f"{base_series}-{event_suffix}-{team_code}"
+                        print(f"   🔨 [MONEYLINE] Built ticker immediately after MLB mapping: {built_ticker}")
+                        return built_ticker
                 else:
                     # Default to NCAAB for backwards compatibility
                     team_code = self._get_ncaab_team_code(selection_upper)
@@ -2410,24 +2492,64 @@ class KalshiClient:
         
         return None
     
+    def resolve_executable_market_identity(
+        self, event_or_market, market_type, line, selection, teams_str=None
+    ):
+        """Sync. Prefer attached market ticker when family+ceil match; else build.
+
+        Returns ``{"ticker", "side", "event_ticker"}`` or ``None``. No network.
+        ``find_submarket`` confirms the contract exists and floor_strike matches.
+        """
+        attached = str(event_or_market or "").strip().upper()
+        built = self.build_market_ticker(
+            event_or_market, market_type, line, selection, teams_str
+        )
+        chosen = prefer_market_ticker(
+            attached, built, market_type, line
+        )
+        if not chosen:
+            return None
+        side = expected_side_for_alert(
+            market_type=market_type,
+            pick=selection,
+            line=line,
+            ticker=chosen,
+            teams=teams_str,
+        )
+        if side not in ("yes", "no"):
+            return None
+        if not is_executable_market_ticker(chosen, market_type, line):
+            return None
+        return {
+            "ticker": chosen,
+            "side": side,
+            "event_ticker": event_ticker_from_any(chosen)
+            or event_ticker_from_any(attached),
+        }
+
     async def find_submarket(self, event_ticker, market_type, line, selection, teams_str=None):
+        """Resolve a GAME event (or attached market KX) to one Kalshi contract.
+
+        Contract (fail-closed, no fuzzy neighbor lines):
+
+        * ``event_ticker`` may be a GAME event (``KXMLBGAME-…`` / ``KXNCAAFGAME-…``)
+          or a market ticker. Market hrefs are coerced to the GAME event, then
+          rebuilt so a stale ``…-59`` cannot pin a 59.5 alert.
+        * Totals → ``{SERIES}TOTAL-{event}-{ceil(|line|)}``. Over=YES, Under=NO.
+        * Spreads → ``{SERIES}SPREAD-{event}-{FAV}{ceil(|line|)}``. Favorite
+          (line<0)=YES on that team's ticker; dog (line>0)=NO on the fav ticker.
+        * Moneyline → ``{SERIES}GAME-{event}-{PICK}``. Pick=YES.
+        * GET must return that ticker. If ``floor_strike`` disagrees with the
+          alert line (sister 58.5 vs 59.5), return None.
+        * A built ticker that 404s is not a match. No catalog scan fallback.
+
+        Returns the market dict (ticker set) or None.
+        """
         # CRITICAL: Log the line value received at the start of find_submarket
         print(f"   [FIND_SUBMARKET] ========== STARTING MATCHING ==========")
         print(f"   [FIND_SUBMARKET] event_ticker={event_ticker}, market_type='{market_type}', line={line}, selection='{selection}', teams_str='{teams_str}'")
         if line is not None:
             print(f"   [FIND_SUBMARKET] Received line={line} for market_type='{market_type}', selection='{selection}'")
-        """
-        Find the exact submarket within an event
-        
-        Args:
-            event_ticker: Event ticker (e.g., "KXNFLGAME-26JAN04BALPIT")
-            market_type: Market type ("Total Points", "Point Spread", "Moneyline")
-            line: Line value (e.g., 40.5 for totals, -11.5 for spreads)
-            selection: Selection ("Over", "Under", team name, etc.)
-        
-        Returns:
-            Submarket dict with ticker, or None if not found
-        """
         # ONLY METHOD: Build ticker directly and fetch it (LIGHTNING FAST - NO FALLBACK SEARCH!)
         print(f"   [FIND_SUBMARKET] Calling build_market_ticker...")
         built_ticker = self.build_market_ticker(event_ticker, market_type, line, selection, teams_str)

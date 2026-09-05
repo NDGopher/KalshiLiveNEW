@@ -57,7 +57,9 @@ and websockets) — event-level only, not per-outcome market tickers:
     YES-ask overlay / orderbook depth when Odds-API last is stale
 
 An event ticker is enough for handle_alert → find_submarket (fail-closed ceil
-line / Under=NO / dog=NO). Public attach remains the market-ticker enricher.
+line / Under=NO / dog=NO). Cards still upgrade to the market ticker
+(SPREAD/TOTAL-{ceil} or GAME-TEAM) plus yes/no before autobet_allow.
+Public attach remains the preferred market-ticker enricher.
 """
 from __future__ import annotations
 

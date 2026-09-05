@@ -992,7 +992,7 @@ function createAlertCard(alert) {
     const filterNameDisplay = filterName
         ? `<div class="filter-name-badge-block">${escapeHtml(filterName)}</div>`
         : '';
-    const autobetAllow = alert.autobet_allow === true && strictOk;
+    const autobetAllow = alert.autobet_allow === true;
     const autobetReasons = Array.isArray(alert.autobet_reasons) ? alert.autobet_reasons : [];
     const autobetWhy = autobetReasons.length ? autobetReasons.join(', ') : (strictOk ? 'shape' : 'display only');
     const autobetBadge = autobetAllow

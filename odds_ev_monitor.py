@@ -38,7 +38,12 @@ import aiohttp
 
 from auto_bet_sheet import live_context_from_event
 from ev_alert import EvAlert, alert_presence_key
-from execution_guard import is_kalshi_ticker, paper_kalshi_ticker
+from execution_guard import (
+    expected_side_for_alert,
+    is_executable_market_ticker,
+    is_kalshi_ticker,
+    paper_kalshi_ticker,
+)
 from ev_calculator import (
     EVCalculator,
     LIVE_REC_POWER_MAX_AGE_SEC,
@@ -305,7 +310,8 @@ def _diagnostic_mode() -> bool:
 def _display_extra_relaxed() -> bool:
     """
     Extra dashboard candidates (same relaxed gates as diagnostic for strict_pass=False rows).
-    Auto-bettor still requires strict_pass=True (see dashboard.check_and_auto_bet).
+    Auto-bettor uses autobet_allow (product shape + executable ticker/side).
+    strict_pass is display-only and does not block the order path when allow is True.
     Set ODDS_DISPLAY_PIPELINE_RELAX=false to disable.
     """
     return os.getenv("ODDS_DISPLAY_PIPELINE_RELAX", "true").lower() in ("1", "true", "yes", "on")
@@ -329,9 +335,25 @@ def _autobet_card_reasons(
     if display_only and "display_only" not in reasons:
         reasons.append("display_only")
     if str(take_book or "Kalshi").lower() == "kalshi":
+        # paper_ticker is KALSHI|… only. Real KX event ids are not paper.
         if ticker and not is_kalshi_ticker(ticker) and "paper_ticker" not in reasons:
             reasons.append("paper_ticker")
     return reasons
+
+
+_ticker_builder = None
+
+
+def _resolve_kalshi_card_identity(ticker, market_type, line, pick, teams):
+    """Upgrade a GAME event KX to SPREAD/TOTAL/GAME-TEAM + yes/no. Sync, no network."""
+    global _ticker_builder
+    if _ticker_builder is None:
+        from kalshi_client import KalshiClient
+
+        _ticker_builder = KalshiClient()
+    return _ticker_builder.resolve_executable_market_identity(
+        ticker, market_type, line, pick, teams
+    )
 
 
 def _vb_is_live_for_bookflow(ev: Dict[str, Any]) -> bool:
@@ -1984,6 +2006,7 @@ class OddsEVMonitor:
                 "take_book": str(bet.get("take_book") or "Kalshi"),
                 "autobet_allow": bool(bet.get("autobet_allow", False)),
                 "autobet_reasons": list(bet.get("autobet_reasons") or []),
+                "side": bet.get("side"),
             }
             ev_ctx = event if isinstance(event, dict) else {}
             clock_fields = clock_fields_for_live_odds(ev_ctx)
@@ -2022,6 +2045,16 @@ class OddsEVMonitor:
                     alert.ticker = link_t
                 else:
                     alert.ticker = paper_kalshi_ticker(teams, selection, qualifier)
+            if bet.get("side") in ("yes", "no"):
+                alert.side = bet.get("side")
+            elif alert.take_book.lower() == "kalshi" and is_kalshi_ticker(alert.ticker):
+                alert.side = expected_side_for_alert(
+                    market_type=market_type,
+                    pick=selection,
+                    line=line,
+                    ticker=alert.ticker,
+                    teams=teams,
+                )
             alert.price_cents = price_cents
             alert.line = line
             alert.live = alert_data.get("live")
@@ -2831,7 +2864,7 @@ class OddsEVMonitor:
                     sp = built.get("strict_pass", True)
                     print(
                         f"[PIPELINE] Candidate LIVE-SCAN kept | {teams} | {mname} | side={bet_side} | "
-                        f"take={take} | strict_pass={sp} (auto-bet only if strict_pass=True)"
+                        f"take={take} | strict_pass={sp} (auto-bet if autobet_allow=True)"
                     )
                 ev_obj = vb.get("event") or {}
                 alert = self.parse_bet_to_alert(built, ev_obj)
@@ -3888,6 +3921,34 @@ class OddsEVMonitor:
 
         liq_usd = float(kal_li) if kal_li is not None else 0.0
 
+        card_side = None
+        if take_canon.lower() == "kalshi" and ticker and is_kalshi_ticker(ticker):
+            ident = _resolve_kalshi_card_identity(
+                ticker, market_type_bb, line_val, pick, teams
+            )
+            if ident:
+                ticker = ident["ticker"]
+                card_side = ident["side"]
+            elif card_side not in ("yes", "no"):
+                card_side = expected_side_for_alert(
+                    market_type=market_type_bb,
+                    pick=pick,
+                    line=line_val,
+                    ticker=ticker,
+                    teams=teams,
+                )
+
+        has_exec = bool(
+            take_canon.lower() == "kalshi"
+            and card_side in ("yes", "no")
+            and is_executable_market_ticker(ticker, market_type_bb, line_val)
+        )
+        shape_allow = bool(shape["allow"])
+        # Product shape already passed: do not let display_only / strict_pass
+        # hide an executable Kalshi take. allow=true implies not display_only.
+        if shape_allow and has_exec:
+            display_only = False
+
         return {
             "market": market_type_bb,
             "teams": teams,
@@ -3909,6 +3970,7 @@ class OddsEVMonitor:
                 if take_canon.lower() == "plive"
                 else (ticker if ticker and is_kalshi_ticker(ticker) else paper_kalshi_ticker(teams, pick, qualifier))
             ),
+            "side": card_side,
             "strict_pass": bool(strict_ok) and not display_only,
             "ev_source": (
                 "plive_take"
@@ -3916,12 +3978,7 @@ class OddsEVMonitor:
                 else str(vb.get("_ev_source") or "odds_api_value_bets")
             ),
             "take_book": take_canon,
-            "autobet_allow": (
-                bool(shape["allow"])
-                and not display_only
-                and take_canon.lower() == "kalshi"
-                and bool(ticker and is_kalshi_ticker(ticker))
-            ),
+            "autobet_allow": bool(shape_allow and has_exec),
             "autobet_reasons": _autobet_card_reasons(
                 shape["reasons"],
                 display_only=display_only,

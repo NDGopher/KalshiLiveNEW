@@ -563,17 +563,18 @@ def test_odds_api_event_ticker_paints_take_card_without_attach():
     assert bo.get("eventTicker") == IOWA_EVENT
     built = mon._value_bet_to_normalized_bet(spr[0], doc, take_book="Kalshi")
     assert built is not None
-    assert built["ticker"] == IOWA_EVENT
+    # Event KX is upgraded to the SPREAD market ticker (ceil 27.5 → 28).
+    assert built["ticker"] == IOWA_SPR_28
     assert is_kalshi_ticker(built["ticker"])
     assert not is_paper_kalshi_ticker(built["ticker"])
+    assert built.get("side") == "yes"
     assert IOWA_EVENT in str(built.get("link") or "")
-    # Product-shape may still deny auto-bet; paper identity is no longer the blocker.
-    # handle_alert treats KX event tickers as real (not KALSHI|…) and calls find_submarket.
     alert = mon.parse_bet_to_alert(built, doc)
     if alert is not None:
-        assert alert.ticker == IOWA_EVENT
+        assert alert.ticker == IOWA_SPR_28
         assert is_kalshi_ticker(alert.ticker)
         assert not is_paper_kalshi_ticker(alert.ticker)
+        assert alert.side == "yes"
 
 
 def test_public_attach_market_href_wins_over_odds_api_event_ticker():
