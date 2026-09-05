@@ -181,8 +181,17 @@ def _gameline_mon(*, min_sharp: int = 2) -> OddsEVMonitor:
 def test_parse_soccer_1x2_draw_keys():
     assert parse_soccer_1x2_outcome("X") == "draw"
     assert parse_soccer_1x2_outcome("draw") == "draw"
+    assert parse_soccer_1x2_outcome("3") == "draw"  # live Pandora 1/2/3
     assert parse_soccer_1x2_outcome("1") == "home"
     assert parse_soccer_1x2_outcome("2") == "away"
+
+
+def test_soccer_1x2_draw_take_prefers_idx0_then_idx1():
+    from plive_pandora import soccer_1x2_draw_take_decimal
+
+    assert soccer_1x2_draw_take_decimal({0: 3.1, 1: None}) == 3.1
+    assert soccer_1x2_draw_take_decimal({0: None, 1: 4.2}) == 4.2
+    assert soccer_1x2_draw_take_decimal({0: 3.1, 1: 4.2}) == 3.1
 
 
 def test_kortrijk_draw_live_311_not_kalshi_400():

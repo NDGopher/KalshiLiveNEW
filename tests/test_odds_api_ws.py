@@ -628,6 +628,40 @@ def test_sport_name_for_odds_updated_maps_slug_and_object():
     assert odds_updated_sport_names(["baseball", "Baseball", "soccer"]) == ["Baseball", "Football"]
 
 
+def test_prioritize_live_events_promotes_epl_over_fa_cup_flood():
+    from odds_api_client import prioritize_live_events_for_scan
+
+    # Mimic /events/live: FA Cup / amateur flood first, EPL buried past scan max.
+    events = []
+    for i in range(100):
+        events.append({"id": 1000 + i, "league": {"slug": "fa-cup" if i % 2 == 0 else "amateur-foo"}})
+    for i, slug in enumerate(
+        [
+            "england-premier-league",
+            "england-premier-league",
+            "spain-laliga",
+            "usa-mlb",
+            "germany-bundesliga",
+        ]
+    ):
+        events.append({"id": 2000 + i, "league": {"slug": slug}})
+
+    raw_top = [e["league"]["slug"] for e in events[:80]]
+    assert "england-premier-league" not in raw_top
+
+    picked = prioritize_live_events_for_scan(events, 80)
+    slugs = [e["league"]["slug"] for e in picked]
+    assert slugs.count("england-premier-league") == 2
+    assert "spain-laliga" in slugs
+    assert "usa-mlb" in slugs
+    assert picked[0]["league"]["slug"] in {
+        "england-premier-league",
+        "spain-laliga",
+        "usa-mlb",
+        "germany-bundesliga",
+    }
+
+
 def test_rest_updated_fallback_requires_sport_display_name(monkeypatch):
     monkeypatch.setenv("ODDS_API_SPORTS", "baseball")
     monkeypatch.setenv("ODDS_API_REST_UPDATED_FALLBACK", "true")

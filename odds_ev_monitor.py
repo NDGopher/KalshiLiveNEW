@@ -2841,17 +2841,28 @@ class OddsEVMonitor:
             multi_books = ["Kalshi", self._reference_book]
         self._pipeline_disp_book_count = len(multi_books)
 
-        max_ids = int(os.getenv("ODDS_LIVE_SCAN_MAX_EVENTS", "55"))
+        max_ids = int(os.getenv("ODDS_LIVE_SCAN_MAX_EVENTS", "80"))
+        # Majors first (EPL / MLB / …). Unsorted /events/live puts FA Cup & lower
+        # leagues ahead of england-premier-league (~index 130+), so a raw first-N
+        # cut never prices EPL and soccer alerts stay at zero.
+        from odds_api_client import prioritize_live_events_for_scan
+
+        prioritized = prioritize_live_events_for_scan(filtered, max_ids)
         event_ids: List[int] = []
-        for e in filtered:
+        for e in prioritized:
             if e.get("id") is None:
                 continue
             try:
                 event_ids.append(int(e["id"]))
             except (TypeError, ValueError):
                 continue
-            if len(event_ids) >= max_ids:
-                break
+        if prioritized and filtered:
+            top = prioritized[0]
+            lg = (top.get("league") or {}) if isinstance(top.get("league"), dict) else {}
+            print(
+                f"[PIPELINE] Live scan window={len(event_ids)}/{len(filtered)} "
+                f"(max={max_ids}, majors-first; sample={lg.get('slug') or lg.get('name') or '?'})"
+            )
 
         odds_by_id: Dict[int, Dict[str, Any]] = {}
         if event_ids:

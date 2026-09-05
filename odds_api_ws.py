@@ -1134,18 +1134,25 @@ class OddsApiWsFeed:
         try:
             liv = await self.rest.list_live_events(None)
             self.store.apply_slate(liv or [])
+            # Majors first — raw /events/live order buries EPL under FA Cup floods,
+            # so a first-50 cut never seeds soccer majors into the WS store.
+            from odds_api_client import prioritize_live_events_for_scan
+
+            seed = prioritize_live_events_for_scan(list(liv or []), MAX_EVENT_IDS)
             ids: List[int] = []
-            for ev in liv or []:
+            for ev in seed:
                 eid = _event_id(ev.get("id") if isinstance(ev, dict) else None)
                 if eid is not None:
                     ids.append(eid)
-                if len(ids) >= MAX_EVENT_IDS:
-                    break
             if ids:
                 await self.rest_snapshot(ids, include_seq=True)
+                sample_slug = ""
+                if seed:
+                    lg = seed[0].get("league") if isinstance(seed[0].get("league"), dict) else {}
+                    sample_slug = str((lg or {}).get("slug") or "")
                 print(
                     f"[ODDS-API WS] REST→WS handoff: snapshot {len(ids)} live ids "
-                    f"seq={self.store.last_seq}"
+                    f"seq={self.store.last_seq} majors-first sample={sample_slug or '?'}"
                 )
         except Exception as ex:
             print(f"[ODDS-API WS] [WARN] handoff snapshot failed (connecting without lastSeq): {ex}")
