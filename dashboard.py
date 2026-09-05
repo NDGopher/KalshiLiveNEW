@@ -5230,17 +5230,17 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
     auto_bet_outcome = {"kind": None}  # fill | skip | fail — finally records if still None
     alert_data = alert_data if isinstance(alert_data, dict) else {}
 
-    _real_store_failed_auto_bet = store_failed_auto_bet
-    _real_store_successful_auto_bet = store_successful_auto_bet
-
-    def store_failed_auto_bet(*args, **kwargs):
+    # Do not name these store_failed_auto_bet / store_successful_auto_bet.
+    # Nested defs with those names make the names locals for the whole function,
+    # so `_real = store_failed_auto_bet` UnboundLocalErrors on every task entry.
+    def _track_store_failed_auto_bet(*args, **kwargs):
         if auto_bet_outcome["kind"] is None:
             auto_bet_outcome["kind"] = "fail"
-        return _real_store_failed_auto_bet(*args, **kwargs)
+        return store_failed_auto_bet(*args, **kwargs)
 
-    def store_successful_auto_bet(*args, **kwargs):
+    def _track_store_successful_auto_bet(*args, **kwargs):
         auto_bet_outcome["kind"] = "fill"
-        return _real_store_successful_auto_bet(*args, **kwargs)
+        return store_successful_auto_bet(*args, **kwargs)
 
     alert_filter_name = getattr(alert, 'filter_name', None) or alert_data.get('filter_name')
     if alert_filter_name and alert_filter_name in auto_bet_settings_by_filter:
@@ -5260,7 +5260,7 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
     def _terminal_skip(error, reason=None):
         auto_bet_outcome["kind"] = auto_bet_outcome["kind"] or "skip"
         print(f"[AUTO-BET] TERMINAL skip: alert={alert_id} {error}")
-        store_failed_auto_bet(
+        _track_store_failed_auto_bet(
             alert_id=alert_id,
             alert=alert,
             alert_data=alert_data,
@@ -5612,7 +5612,7 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
                         if event_base:
                             current_total = auto_bet_event_totals.get(event_base, 0.0)
                             auto_bet_event_totals[event_base] = max(0.0, current_total - bet_amount)
-                    store_failed_auto_bet(
+                    _track_store_failed_auto_bet(
                         alert_id=alert_id,
                         alert=alert,
                         alert_data=alert_data,
@@ -5673,7 +5673,7 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
                     # CRITICAL: Log high-EV alerts (>= 10%) that are blocked because submarket was already bet
                     # This helps identify when alerts increase above threshold after initial bet
                     if ev_percent >= 10.0:
-                        store_failed_auto_bet(
+                        _track_store_failed_auto_bet(
                             alert_id=alert_id,
                             alert=alert,
                             alert_data=alert_data,
@@ -5746,7 +5746,7 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
                     auto_bet_submarkets.discard(submarket_key)
                     error_msg = f"Per-event max bet reached: ${current_total:.2f} + ${bet_amount:.2f} > ${per_event_max_bet:.2f}"
                     # Always log per-event max failures (regardless of EV threshold) for debugging
-                    store_failed_auto_bet(
+                    _track_store_failed_auto_bet(
                         alert_id=alert_id,
                         alert=alert,
                         alert_data=alert_data,
@@ -5801,7 +5801,7 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
                     auto_bet_lock_holder = None
                     auto_bet_lock_acquired_at = None
                 # Log this critical error
-                store_failed_auto_bet(
+                _track_store_failed_auto_bet(
                     alert_id=alert_id,
                     alert=alert,
                     alert_data=alert_data,
@@ -5894,7 +5894,7 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
                 error_msg = 'Spread NO bets are blocked due to poor historical performance (-30.44% ROI)'
                 # Log this as an intentional block (not a failure, but we want to track it)
                 # Use a different error type so it's clear this is intentional
-                store_failed_auto_bet(
+                _track_store_failed_auto_bet(
                     alert_id=alert_id,
                     alert=alert,
                     alert_data=alert_data,
@@ -5922,7 +5922,7 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
                 error_msg = f"Missing line value for {market_type_lower} market - required for safety checks"
                 # Log high-EV alerts that are blocked due to missing line
                 if ev_percent >= current_ev_min:
-                    store_failed_auto_bet(
+                    _track_store_failed_auto_bet(
                         alert_id=alert_id,
                         alert=alert,
                         alert_data=alert_data,
@@ -6642,7 +6642,7 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
                             # This shouldn't happen, but if it does, it's wrong
                             print(f"[AUTO-BET]   🚨 CRITICAL: Under pick but side is YES - REJECTING!")
                             error_msg = "CRITICAL: Under pick but side is YES - wrong side!"
-                            store_failed_auto_bet(
+                            _track_store_failed_auto_bet(
                                 alert_id=alert_id,
                                 alert=alert,
                                 alert_data=alert_data,
@@ -6665,7 +6665,7 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
                             # This shouldn't happen, but if it does, it's wrong
                             print(f"[AUTO-BET]   🚨 CRITICAL: Over pick but side is NO - REJECTING!")
                             error_msg = "CRITICAL: Over pick but side is NO - wrong side!"
-                            store_failed_auto_bet(
+                            _track_store_failed_auto_bet(
                                 alert_id=alert_id,
                                 alert=alert,
                                 alert_data=alert_data,
@@ -6709,7 +6709,7 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
                             if no_contains_pick:
                                 print(f"[AUTO-BET]   ✅ CORRECTION: NO subtitle contains pick - would change to NO, but REJECTING for safety")
                             error_msg = f"CRITICAL: Side validation failed. YES subtitle doesn't contain pick '{alert.pick}'"
-                            store_failed_auto_bet(
+                            _track_store_failed_auto_bet(
                                 alert_id=alert_id,
                                 alert=alert,
                                 alert_data=alert_data,
@@ -6767,7 +6767,7 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
                                     if yes_contains_pick:
                                         print(f"[AUTO-BET]   ✅ CORRECTION: YES subtitle contains pick - would change to YES, but REJECTING for safety")
                                     error_msg = f"CRITICAL: Side validation failed. NO subtitle doesn't contain pick '{alert.pick}'"
-                                    store_failed_auto_bet(
+                                    _track_store_failed_auto_bet(
                                         alert_id=alert_id,
                                         alert=alert,
                                         alert_data=alert_data,
@@ -6987,7 +6987,7 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
                             if submarket_key in auto_bet_games[game_name][market_type][pick_direction]:
                                 auto_bet_games[game_name][market_type][pick_direction].remove(submarket_key)
                 error_msg = "Order placement timed out"
-                store_failed_auto_bet(
+                _track_store_failed_auto_bet(
                     alert_id=alert_id,
                     alert=alert,
                     alert_data=alert_data,
@@ -7038,7 +7038,7 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
                 error_msg = str(order_error)
                 import traceback
                 traceback_str = traceback.format_exc()
-                store_failed_auto_bet(
+                _track_store_failed_auto_bet(
                     alert_id=alert_id,
                     alert=alert,
                     alert_data=alert_data,
@@ -7145,7 +7145,7 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
                         f"====================================="
                     ]
                     
-                    store_failed_auto_bet(
+                    _track_store_failed_auto_bet(
                         alert_id=alert_id,
                         alert=alert,
                         alert_data=alert_data,
@@ -7267,7 +7267,7 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
                         f"====================================="
                     ])
                     
-                    store_failed_auto_bet(
+                    _track_store_failed_auto_bet(
                         alert_id=alert_id,
                         alert=alert,
                         alert_data=alert_data,
@@ -7447,7 +7447,7 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
                     auto_bet_processing_submarkets.discard(submarket_key)
                     auto_bet_submarket_to_alert_id.pop(submarket_key, None)
                     auto_bet_submarket_tasks.pop(submarket_key, None)
-                    store_failed_auto_bet(
+                    _track_store_failed_auto_bet(
                         alert_id=alert_id,
                         alert=alert,
                         alert_data=alert_data,
@@ -7636,7 +7636,7 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
                 
                 print(f"[AUTO-BET] 📝 Calling store_successful_auto_bet with alert_id={alert_id}")
                 try:
-                    store_successful_auto_bet(
+                    _track_store_successful_auto_bet(
                         alert_id=alert_id,
                         alert=alert,
                         alert_data=alert_data,
@@ -7849,7 +7849,7 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
                     if submarket_key in auto_bet_submarket_data:
                         auto_bet_submarket_data.pop(submarket_key, None)
                 
-                store_failed_auto_bet(
+                _track_store_failed_auto_bet(
                     alert_id=alert_id,
                     alert=alert,
                     alert_data=alert_data,
@@ -7871,7 +7871,7 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
         except asyncio.CancelledError:
             print(f"[AUTO-BET] TERMINAL fail: alert={alert_id} task cancelled")
             if auto_bet_outcome["kind"] is None:
-                store_failed_auto_bet(
+                _track_store_failed_auto_bet(
                     alert_id=alert_id,
                     alert=alert,
                     alert_data=alert_data,
@@ -7899,7 +7899,7 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
             if ev_pct >= 10.0:
                 print(f"[AUTO-BET] 🚨 CRITICAL: High-EV alert ({ev_pct:.2f}%) failed with exception - logging to failed-bets")
             
-            store_failed_auto_bet(
+            _track_store_failed_auto_bet(
             alert_id=alert_id,
             alert=alert,
             alert_data=alert_data,
@@ -7979,7 +7979,7 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
         if auto_bet_outcome["kind"] is None:
             print(f"[AUTO-BET] TERMINAL fail: alert={alert_id} ended without fill/skip/fail record")
             try:
-                store_failed_auto_bet(
+                _track_store_failed_auto_bet(
                     alert_id=alert_id,
                     alert=alert,
                     alert_data=alert_data,
