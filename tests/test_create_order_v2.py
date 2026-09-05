@@ -45,6 +45,8 @@ def test_v2_fp_helpers():
     assert yes_leg_limit_cents(side="yes", price_cents=43) == 43
     assert yes_leg_limit_cents(side="no", price_cents=43) == 57
     assert yes_leg_limit_cents(side="no", price_cents=41) == 59
+    assert yes_leg_limit_cents(side="no", price_cents=34) == 66
+    assert yes_leg_limit_cents(side="yes", price_cents=47) == 47
 
 
 def test_wyoming_class_buy_yes_is_bid_at_alert_dollars():
