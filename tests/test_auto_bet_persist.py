@@ -61,7 +61,7 @@ def _reset_process_defaults(dash) -> None:
     """Simulate a fresh process: fail-closed OFF, $25 stake."""
     dash.auto_bet_enabled = False
     dash.auto_bet_amount = dash.DEFAULT_AUTO_BET_AMOUNT
-    dash.auto_bet_ev_min = 5.0
+    dash.auto_bet_ev_min = 2.0
     dash.auto_bet_ev_max = 25.0
     dash.auto_bet_odds_min = -200
     dash.auto_bet_odds_max = 200

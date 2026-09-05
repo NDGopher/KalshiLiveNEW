@@ -1150,6 +1150,30 @@ details.auto-bet-setting[open] summary::before {
     border: 1px solid var(--border);
 }
 
+.autobet-badge {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    padding: 2px 7px;
+    border-radius: 999px;
+    white-space: nowrap;
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.autobet-badge--ok {
+    color: #0a8f6a;
+    background: rgba(31, 213, 154, 0.14);
+    border: 1px solid rgba(31, 213, 154, 0.4);
+}
+
+.autobet-badge--no {
+    color: #64748b;
+    background: rgba(100, 116, 139, 0.12);
+    border: 1px solid var(--border);
+}
+
 body.dark .ev-source-sub {
     background: rgba(148, 163, 184, 0.12);
 }
