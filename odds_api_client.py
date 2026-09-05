@@ -371,9 +371,22 @@ _PRIORITY_LIVE_LEAGUE_SLUGS: frozenset = frozenset(
         "usa-nfl",
         "usa-nhl",
         "usa-mls",
+        "usa-college",  # NCAAF / college football on Odds-API
+        "usa-ncaaf",
         "uefa-champions-league",
         "uefa-europa-league",
         "uefa-europa-conference-league",
+    }
+)
+
+# Prefer liquidity sports so Angola/ATP junk does not crowd out soccer/CFB majors.
+_PRIORITY_LIVE_SPORT_SLUGS: frozenset = frozenset(
+    {
+        "football",  # soccer
+        "american-football",
+        "baseball",
+        "basketball",
+        "ice-hockey",
     }
 )
 _DEPRIORITIZE_LEAGUE_TOKENS: Tuple[str, ...] = (
@@ -401,17 +414,29 @@ def live_event_league_slug(ev: Dict[str, Any]) -> str:
     return ""
 
 
-def live_event_scan_rank(ev: Dict[str, Any]) -> Tuple[int, int, str]:
+def live_event_sport_slug(ev: Dict[str, Any]) -> str:
+    sp = ev.get("sport") if isinstance(ev, dict) else None
+    if isinstance(sp, dict):
+        return sport_slug_query_for_api(str(sp.get("slug") or sp.get("name") or ""))
+    if sp is not None:
+        return sport_slug_query_for_api(str(sp))
+    return ""
+
+
+def live_event_scan_rank(ev: Dict[str, Any]) -> Tuple[int, int, int, str]:
     """Sort key for live scan / WS handoff (lower = earlier).
 
     0) demote lower-league floods
-    1) promote known major slugs (EPL, MLB, …)
-    2) stable slug for determinism
+    1) promote known major slugs (EPL, NCAAF, MLB, …)
+    2) prefer liquidity sports (soccer / CFB / majors) over tennis/esports junk
+    3) stable slug for determinism
     """
     slug = live_event_league_slug(ev)
+    sport = live_event_sport_slug(ev)
     demote = 1 if any(tok in slug for tok in _DEPRIORITIZE_LEAGUE_TOKENS) else 0
     major = 0 if slug in _PRIORITY_LIVE_LEAGUE_SLUGS else 1
-    return (demote, major, slug)
+    sport_tier = 0 if sport in _PRIORITY_LIVE_SPORT_SLUGS else 1
+    return (demote, major, sport_tier, slug)
 
 
 def prioritize_live_events_for_scan(

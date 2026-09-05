@@ -2721,14 +2721,23 @@ class OddsEVMonitor:
                 f"[MONITOR] MLB slice slate: live={len(liv or [])} pregame={len(pre_all or [])} "
                 f"league={mlb_lg} (WS prematch+live; REST slate only)"
             )
-        elif OddsEVMonitor.broad_scan_include_pregame:
-            liv, pre_all = await asyncio.gather(
-                _resolve_live_events_slate(client, None),
-                _diag_fetch_pregame_by_sports(client, pre_cap),
-            )
         else:
-            liv = await _resolve_live_events_slate(client, None)
-            pre_all = []
+            # Pregame ON when Settings toggle is set, broad-scan flag is set, or
+            # ODDS_BROAD_SCAN_INCLUDE_PREGAME (default true) — CFB tip-off must not
+            # wait until /events/live flips while boards stay empty.
+            include_pregame = bool(
+                OddsEVMonitor.broad_scan_include_pregame
+                or OddsEVMonitor.include_pregame_value_bets
+                or _env_bool("ODDS_BROAD_SCAN_INCLUDE_PREGAME", "true")
+            )
+            if include_pregame:
+                liv, pre_all = await asyncio.gather(
+                    _resolve_live_events_slate(client, None),
+                    _diag_fetch_pregame_by_sports(client, pre_cap),
+                )
+            else:
+                liv = await _resolve_live_events_slate(client, None)
+                pre_all = []
         liv = list(liv or [])
         pre_all = list(pre_all or [])
         _ws_feed = peek_shared_odds_ws_feed()

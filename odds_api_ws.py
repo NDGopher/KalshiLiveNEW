@@ -1,12 +1,13 @@
 """
 Odds-API.io WebSocket feed (https://docs.odds-api.io/guides/websockets).
 
-Primary live-odds path. WS streams the **same selected bookmakers** as REST, as
-real-time deltas (a book appears when it ticks — there is no full odds replay on
-connect). REST is reserved for slate (``/events``, ``/events/live``), optional
-``includeSeq`` handoff (``ODDS_API_WS_HANDOFF_REST_ODDS=true``), ``resync_required``,
-and fail-closed fallback (prefer ``/odds/updated``). Default is WS-first to
-protect the ~5k/hr REST budget.
+Primary live-odds path. Pattern: **REST snapshot once** (includeSeq handoff) to
+seed every selected book into the store, then **WebSocket deltas** keep those
+books live. Same bookmakers as REST — WS does not replay a full board on connect
+without that handoff. Slate still uses ``/events`` / ``/events/live``; 
+``resync_required`` / fail-closed ``/odds/updated`` remain REST. ~80 handoff calls
+per connect is fine within a 5k/hr budget; set ``ODDS_API_WS_HANDOFF_REST_ODDS=false``
+only if you intentionally want a WS-warm-only connect.
 
 Official contract (do not invent):
 - ``wss://api.odds-api.io/v3/ws?apiKey=...`` plus query filters.
@@ -1160,22 +1161,17 @@ class OddsApiWsFeed:
     async def _handoff_snapshot(self) -> None:
         """Optional REST includeSeq snapshot before connect (official gapless handoff).
 
-        Default is **WS-first**: skip the multi-book REST odds snapshot and let the
-        socket warm from live ticks. Odds-API WS streams the same selected books as
-        REST; it just does not replay a full snapshot on connect — books appear as
-        they tick (EPL typically fills DraftKings/FanDuel/Bet365/etc. within a
-        minute). A full handoff snapshot is ~1 REST call per book × event chunk and
-        burns the 5k/hr REST budget on every reconnect.
+        Default **ON** (``ODDS_API_WS_HANDOFF_REST_ODDS``): one REST includeSeq multi
+        snapshot seeds all selected books, then WS updates them live — no missing
+        opening lines. Odds-API WS alone only pushes books when they tick.
 
-        Set ``ODDS_API_WS_HANDOFF_REST_ODDS=true`` to restore the official REST
-        includeSeq seed (gapless lastSeq). Slate metadata still comes from the
-        monitor's live-events polls, not from this path when odds handoff is off.
+        Set ``ODDS_API_WS_HANDOFF_REST_ODDS=false`` to skip the seed (WS-warm only).
+        Slate metadata still comes from the monitor's live-events polls.
         """
-        if not _env_bool("ODDS_API_WS_HANDOFF_REST_ODDS", "false"):
+        if not _env_bool("ODDS_API_WS_HANDOFF_REST_ODDS", "true"):
             print(
-                "[ODDS-API WS] WS-first connect (no REST odds handoff) — "
-                "store warms from live book ticks; set ODDS_API_WS_HANDOFF_REST_ODDS=true "
-                "for official includeSeq snapshot"
+                "[ODDS-API WS] REST odds handoff disabled — "
+                "store warms from live book ticks only (ODDS_API_WS_HANDOFF_REST_ODDS=false)"
             )
             return
         try:
@@ -1458,15 +1454,15 @@ async def _maybe_rest_backfill_thin_ws_docs(
     the store at connect, then live updates on WS
     (https://docs.odds-api.io/guides/websockets).
 
-    Defaults (WS-first — conserve the 5k/hr REST budget):
-    - ``ODDS_API_WS_COLD_SEED`` (default false): one-shot REST only for events with
-      *zero* priced master books. Prefer waiting for WS ticks instead.
+    Defaults (full board, REST seed then WS):
+    - ``ODDS_API_WS_COLD_SEED`` (default true): one-shot REST for events with
+      *zero* priced master books (pregame CFB / handoff miss).
     - ``ODDS_API_WS_REST_BACKFILL`` (default false): optional thin-store fill when
-      any event is below ``ODDS_API_WS_REST_BACKFILL_MIN_BOOKS`` (legacy safety net).
+      any event is below ``ODDS_API_WS_REST_BACKFILL_MIN_BOOKS``.
     """
     global _ws_rest_backfill_until
     thin = _env_bool("ODDS_API_WS_REST_BACKFILL", "false")
-    cold = _env_bool("ODDS_API_WS_COLD_SEED", "false")
+    cold = _env_bool("ODDS_API_WS_COLD_SEED", "true")
     if not thin and not cold:
         return docs, "websocket"
     if thin:
