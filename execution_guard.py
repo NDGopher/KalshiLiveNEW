@@ -510,6 +510,69 @@ def yes_leg_limit_cents(*, side: str, price_cents: int) -> int:
     return 100 - int(price_cents)
 
 
+def yes_leg_to_side_cents(*, side: Any, yes_leg_cents: Any) -> Optional[int]:
+    """Map a V2 YES-leg fill/quote to yes/no cost-basis cents.
+
+    Official BookSide (docs.kalshi.com/api-reference/orders/create-order-v2):
+    everything is quoted on the YES book. ``average_fill_price`` for an ask
+    that bought NO @ 34¢ is ``0.6600`` (YES-leg). The NO cost basis is 34¢,
+    not 66¢. Reporting 66 as executed_price was the 2026-09-05 Under incident.
+    """
+    px = validate_limit_price(yes_leg_cents)
+    if px is None:
+        return None
+    side_l = _clean(side).lower()
+    if side_l == "yes":
+        return px
+    if side_l == "no":
+        return validate_limit_price(100 - px)
+    return None
+
+
+def v2_fill_side_economics(
+    *,
+    side: Any,
+    yes_leg_cents: Any,
+    fill_count: Any,
+    fees_cents: Any = 0,
+) -> Tuple[Optional[int], Optional[int]]:
+    """YES-leg fill → ``(side_cents, total_cost_cents)`` including fees.
+
+    Buy NO @ 34¢ filling at YES-leg 66¢ → executed 34, cost ``34 * n + fees``.
+    Never ``66 * n``. Buy YES @ 47¢ is unchanged.
+    """
+    side_cents = yes_leg_to_side_cents(side=side, yes_leg_cents=yes_leg_cents)
+    try:
+        n = float(fill_count)
+    except (TypeError, ValueError):
+        n = 0.0
+    try:
+        fees = int(fees_cents or 0)
+    except (TypeError, ValueError):
+        fees = 0
+    if side_cents is None or n <= 0:
+        return side_cents, None
+    return side_cents, int(round(side_cents * n)) + max(0, fees)
+
+
+def no_payload_quotes_yes_leg_complement(price_cents: Any, payload: Any) -> bool:
+    """Fail-closed: NO take at P¢ must be V2 ``ask`` at ``(100-P)/100`` dollars."""
+    px = validate_limit_price(price_cents)
+    if px is None or not isinstance(payload, dict):
+        return False
+    want = dollars_fp_from_cents(yes_leg_limit_cents(side="no", price_cents=px))
+    return payload.get("side") == "ask" and payload.get("price") == want
+
+
+def is_complement_no_cost(take_cents: Any, executed_side_cents: Any) -> bool:
+    """True if executed NO cost is ``100 − T`` (never allowed for a T take)."""
+    take = validate_limit_price(take_cents)
+    exe = validate_limit_price(executed_side_cents)
+    if take is None or exe is None:
+        return False
+    return exe == 100 - take
+
+
 def build_limit_order_payload(
     *,
     ticker: Any,

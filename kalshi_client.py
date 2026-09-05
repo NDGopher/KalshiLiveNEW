@@ -28,9 +28,11 @@ from execution_guard import (
     is_executable_market_ticker,
     kalshi_line_int,
     market_floor_strike_matches_alert,
+    no_payload_quotes_yes_leg_complement,
     parse_alert_line,
     prefer_market_ticker,
     public_get_headers,
+    v2_fill_side_economics,
 )
 
 load_dotenv(Path(__file__).resolve().parent / ".env", override=True, encoding="utf-8-sig")
@@ -3711,6 +3713,15 @@ class KalshiClient:
                 if not order_payload:
                     print(f"[ORDER] ERROR: Refusing order — {payload_reasons}")
                     return {"error": "Invalid limit order", "reasons": payload_reasons}
+                if str(side).lower() == "no" and not no_payload_quotes_yes_leg_complement(price_cents, order_payload):
+                    print(
+                        f"[ORDER] ERROR: Refusing NO order — V2 payload must be ask at "
+                        f"YES-leg complement of {price_cents}¢, got {order_payload}"
+                    )
+                    return {
+                        "error": "Invalid NO V2 mapping",
+                        "reasons": ["no_must_ask_at_yes_leg_complement"],
+                    }
                 print(f"[ORDER] Limit order: Will fill at {price_cents}¢ or BETTER (never worse)")
                 
                 print(f"[ORDER] Order payload:")
@@ -3980,16 +3991,22 @@ class KalshiClient:
                             # Kalshi may return: executed_price, avg_fill_price, fill_price, or we calculate from cost
                             executed_price_cents = None
                             total_cost_cents = None
-                            
+                            # V2 average_fill_price / fill[].price are YES-leg quotes (docs BookSide).
+                            yes_leg_fill = False
+
                             # Try to get executed price directly (V2 average_fill_price is a dollar fp string)
                             if 'executed_price' in order_data:
                                 executed_price_cents = parse_fill_price_cents(order_data['executed_price'])
+                                yes_leg_fill = executed_price_cents is not None
                             elif 'avg_fill_price' in order_data:
                                 executed_price_cents = parse_fill_price_cents(order_data['avg_fill_price'])
+                                yes_leg_fill = executed_price_cents is not None
                             elif 'fill_price' in order_data:
                                 executed_price_cents = parse_fill_price_cents(order_data['fill_price'])
+                                yes_leg_fill = executed_price_cents is not None
                             elif 'average_fill_price' in order_data:
                                 executed_price_cents = parse_fill_price_cents(order_data['average_fill_price'])
+                                yes_leg_fill = executed_price_cents is not None
                             
                             # Try to calculate from total cost
                             if executed_price_cents is None:
@@ -4035,11 +4052,19 @@ class KalshiClient:
                                 if total_cost_cents and fill_count > 0:
                                     executed_price_cents = int(total_cost_cents / fill_count)
                                     print(f"[ORDER] Calculated executed price from cost: {total_cost_cents}¢ / {fill_count} contracts = {executed_price_cents}¢")
+                                    # Cost/count is YES-leg when it equals the complement of our NO take.
+                                    if (
+                                        str(side).lower() == "no"
+                                        and price_cents
+                                        and executed_price_cents == 100 - int(price_cents)
+                                    ):
+                                        yes_leg_fill = True
                             
                             # Use fills array if we calculated from it above (most accurate)
                             if fills_array and actual_fill_count > 0:
                                 executed_price_cents = int(actual_fill_cost_cents / actual_fill_count)
                                 fill_cost_cents = actual_fill_cost_cents
+                                yes_leg_fill = True
                                 print(f"[ORDER] Executed price from fills array: {actual_fill_cost_cents}¢ / {actual_fill_count} contracts = {executed_price_cents}¢")
                             # Fallback: calculate from fills array if available (old method)
                             elif executed_price_cents is None and 'fills' in order_data and order_data['fills']:
@@ -4059,10 +4084,12 @@ class KalshiClient:
                                 if total_fill_count > 0:
                                     executed_price_cents = int(total_fill_cost / total_fill_count)
                                     fill_cost_cents = total_fill_cost
+                                    yes_leg_fill = True
                             
                             # Final fallback: use limit price (but this is not the actual executed price)
                             if executed_price_cents is None:
                                 executed_price_cents = price_cents
+                                yes_leg_fill = False
                                 print(f"[ORDER] WARNING: Could not extract executed price, using limit price {price_cents}¢")
                             
                             # CRITICAL: Calculate total cost correctly
@@ -4106,6 +4133,30 @@ class KalshiClient:
                             else:
                                 print(f"[ORDER] ✅ Fee-free maker fill! (taker_fees=0, maker_fees={maker_fees_cents/100:.2f})")
                             print(f"[ORDER] Fill cost: ${fill_cost_cents/100:.2f}, Total cost (with fees): ${total_cost_cents/100:.2f}")
+
+                            # V2 fills are YES-leg. Convert ask fills to NO cost basis (34 not 66).
+                            if yes_leg_fill and executed_price_cents and fill_count:
+                                yes_leg_reported = executed_price_cents
+                                side_cents, side_cost = v2_fill_side_economics(
+                                    side=side,
+                                    yes_leg_cents=executed_price_cents,
+                                    fill_count=fill_count,
+                                    fees_cents=total_fees_cents,
+                                )
+                                if side_cents is not None:
+                                    if str(side).lower() == "no" and side_cents != yes_leg_reported:
+                                        print(
+                                            f"[ORDER] V2 YES-leg fill {yes_leg_reported}¢ → NO cost basis "
+                                            f"{side_cents}¢ (never book {yes_leg_reported}¢ as NO price)"
+                                        )
+                                    executed_price_cents = side_cents
+                                    if side_cost is not None:
+                                        total_cost_cents = side_cost
+                                        fill_cost_cents = int(round(side_cents * float(fill_count)))
+                                    print(
+                                        f"[ORDER] Side economics: {executed_price_cents}¢ × {fill_count} "
+                                        f"+ fees ${total_fees_cents/100:.2f} = ${total_cost_cents/100:.2f}"
+                                    )
                             
                             # CRITICAL: Verify actual cost doesn't exceed max bet amount (if specified)
                             if max_liquidity_dollars:
