@@ -7,6 +7,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from execution_guard import (
+    KALSHI_CREATE_ORDER_V2_PATH,
     away_inverted_line,
     build_limit_order_payload,
     event_ticker_from_any,
@@ -275,12 +276,16 @@ def test_limit_order_uses_displayed_price_not_market():
     )
     assert reasons == []
     assert payload is not None
-    assert payload["type"] == "limit"
-    assert payload["action"] == "buy"
-    assert payload["yes_price"] == 63
+    assert payload["side"] == "bid"
+    assert payload["price"] == "0.6300"
+    assert payload["count"] == "10.00"
+    assert payload["time_in_force"] == "immediate_or_cancel"
+    assert payload["self_trade_prevention_type"] == "taker_at_cross"
+    assert "yes_price" not in payload
     assert "no_price" not in payload
+    assert "action" not in payload
+    assert payload.get("type") != "market"
     assert payload.get("post_only") is None
-    assert "market" not in payload.get("type", "")
 
     no_side, no_reasons = build_limit_order_payload(
         ticker=STL_LAD_TOTAL_8,
@@ -290,9 +295,13 @@ def test_limit_order_uses_displayed_price_not_market():
         post_only=True,
     )
     assert no_reasons == []
-    assert no_side["no_price"] == 41
-    assert no_side["type"] == "limit"
+    assert no_side["side"] == "ask"
+    assert no_side["price"] == "0.5900"
+    assert no_side["count"] == "4.00"
+    assert no_side["time_in_force"] == "good_till_canceled"
     assert no_side["post_only"] is True
+    assert "no_price" not in no_side
+    assert "yes_price" not in no_side
 
     missing, miss_reasons = build_limit_order_payload(
         ticker=DET_MINUS_15,
@@ -302,6 +311,24 @@ def test_limit_order_uses_displayed_price_not_market():
     )
     assert missing is None
     assert "missing_or_invalid_price" in miss_reasons
+
+    no_ticker, ticker_reasons = build_limit_order_payload(
+        ticker="",
+        side="yes",
+        count=10,
+        price_cents=43,
+    )
+    assert no_ticker is None
+    assert "missing_or_invalid_ticker" in ticker_reasons
+
+    no_side_arg, side_reasons = build_limit_order_payload(
+        ticker=DET_MINUS_15,
+        side="",
+        count=10,
+        price_cents=43,
+    )
+    assert no_side_arg is None
+    assert "missing_or_invalid_side" in side_reasons
 
 
 def test_credentials_required_only_for_orders_not_public_reads():

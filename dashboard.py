@@ -5396,8 +5396,9 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
 
     # Wrap gates + main logic so every path hits except/finally terminal logging.
     try:
-        # strict_pass is display-only. Product shape already decided autobet_allow.
-        # Do not require strict_pass on the order path when allow is True.
+        # Product lock is autobet_allow (#34). strict_pass is display-only.
+        # Do not _terminal_skip solely for strict_pass=False when allow is True.
+        # Fail-closed ticker/line/side stays in execution_guard / prepare_executable_order.
         autobet_ok = False
         if alert is not None:
             autobet_ok = bool(getattr(alert, "autobet_allow", False))

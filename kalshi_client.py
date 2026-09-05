@@ -9,6 +9,7 @@ import os
 import time
 import base64
 import re
+import uuid
 from datetime import datetime
 from dotenv import load_dotenv
 from cryptography.hazmat.primitives import serialization, hashes
@@ -17,6 +18,8 @@ import websockets
 from pathlib import Path
 
 from execution_guard import (
+    KALSHI_CANCEL_ORDER_V2_PATH_TMPL,
+    KALSHI_CREATE_ORDER_V2_PATH,
     build_limit_order_payload,
     event_ticker_from_any,
     expected_side_for_alert,
@@ -209,6 +212,29 @@ def normalize_kalshi_orderbook(payload, *, fetched_at=None):
     yes_bids, _ = parse_orderbook_levels(yes_raw)
     no_bids, _ = parse_orderbook_levels(no_raw)
     return build_normalized_orderbook(yes_bids, no_bids, fetched_at=fetched_at)
+
+
+def parse_order_count_fp(raw, default=0.0):
+    """Parse Create Order V2 ``fill_count`` / ``remaining_count`` fp strings."""
+    n = _fp_number(raw)
+    return default if n is None else float(n)
+
+
+def parse_fill_price_cents(raw):
+    """Parse a V2 fill/average price (dollar fp string or legacy cents) to cents."""
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, str):
+        dollars = _fp_number(raw)
+        if dollars is None:
+            return None
+        if dollars <= 1.0:
+            return int(round(dollars * 100))
+        return int(round(dollars))
+    dollars = parse_orderbook_price_dollars(raw)
+    if dollars is None:
+        return None
+    return int(round(dollars * 100))
 
 
 def ws_orderbook_inner(message):
@@ -2767,6 +2793,9 @@ class KalshiClient:
         
         if not self.session:
             await self.init()
+
+        # Reuse across retries so a timed-out create does not double-place.
+        client_order_id = str(uuid.uuid4())
         
         # Retry logic for order placement
         for attempt in range(3):
@@ -3540,58 +3569,47 @@ class KalshiClient:
                         "details": error_msg
                     }
                 
-                # Limit at the displayed actionable price. Never a market order.
-                # Kalshi requires yes_price / no_price. Fills at price_cents or better.
+                # Create Order V2: bid/ask + dollar fp price. Limit at alert cents, never market.
+                # Taker: immediate_or_cancel. Post-only: good_till_canceled + expiration_time.
+                exp_seconds = None
+                if expiration_ts is not None:
+                    if expiration_ts > 1e10:
+                        expiration_ts = int(expiration_ts / 1000)
+                    exp_seconds = int(expiration_ts)
+                elif post_only:
+                    exp_seconds = int(time.time() + 2.5)
+                    print(f"[ORDER] ⏱️  Set short expiration: 2.5s (snipe strategy - immediate fill or cancel)")
+                if post_only and exp_seconds:
+                    print(f"[ORDER] Post-only mode: Order will only post as maker (rejected if would cross)")
+                    print(f"[ORDER] Order expires in {exp_seconds - int(time.time()):.1f}s (at {exp_seconds})")
+                elif exp_seconds and not post_only:
+                    print(f"[ORDER] ⚠️  Skipping expiration_time for IOC taker (V2 forbids combining with immediate_or_cancel)")
+
                 order_payload, payload_reasons = build_limit_order_payload(
                     ticker=ticker,
                     side=side,
                     count=final_count,
                     price_cents=price_cents,
                     post_only=bool(post_only),
+                    client_order_id=client_order_id,
+                    expiration_time=exp_seconds if post_only else None,
                 )
                 if not order_payload:
                     print(f"[ORDER] ERROR: Refusing order — {payload_reasons}")
                     return {"error": "Invalid limit order", "reasons": payload_reasons}
                 print(f"[ORDER] Limit order: Will fill at {price_cents}¢ or BETTER (never worse)")
                 
-                # Add post-only flag if requested (maker order - won't cross, may rest on book)
-                if post_only:
-                    order_payload["post_only"] = True
-                    print(f"[ORDER] Post-only mode: Order will only post as maker (rejected if would cross)")
-                
-                # CRITICAL: Only set expiration_ts for post-only (maker) orders
-                # Taker orders (non-post-only) execute immediately or get rejected - expiration doesn't apply
-                # Kalshi API may reject taker orders with expiration_ts, so only use it for post-only orders
-                # NOTE: Kalshi expects expiration_ts in SECONDS (Unix timestamp), not milliseconds!
-                if expiration_ts is not None:
-                    # Ensure expiration_ts is in seconds (convert from milliseconds if needed)
-                    if expiration_ts > 1e10:  # If it's in milliseconds (13+ digits)
-                        expiration_ts = int(expiration_ts / 1000)
-                    # Only add expiration_ts for post-only orders (maker orders)
-                    if post_only:
-                        order_payload["expiration_ts"] = int(expiration_ts)
-                        exp_seconds = expiration_ts - int(time.time())
-                        print(f"[ORDER] Order expires in {exp_seconds:.1f}s (at {expiration_ts})")
-                    else:
-                        print(f"[ORDER] ⚠️  Skipping expiration_ts for taker order (Kalshi doesn't accept it for non-post-only orders)")
-                elif post_only:
-                    # For post-only orders, set short expiration (2.5 seconds) to prevent late fills
-                    # This ensures orders don't sit in the orderbook and get filled when price is no longer +EV
-                    expiration_ts = int(time.time() + 2.5)
-                    order_payload["expiration_ts"] = expiration_ts
-                    print(f"[ORDER] ⏱️  Set short expiration: 2.5s (snipe strategy - immediate fill or cancel)")
-                
                 print(f"[ORDER] Order payload:")
                 print(f"[ORDER]   Ticker: {order_payload['ticker']}")
-                print(f"[ORDER]   Side: {order_payload['side']}")
+                print(f"[ORDER]   Book side: {order_payload['side']} (alert {side})")
                 print(f"[ORDER]   Count: {order_payload['count']}")
-                price_field = "yes_price" if side.lower() == "yes" else "no_price"
-                print(f"[ORDER]   {price_field}: {order_payload[price_field]} cents ({order_payload[price_field]/100:.2f}¢)")
-                print(f"[ORDER]   Type: {order_payload['type']}")
+                print(f"[ORDER]   Price: {order_payload['price']} (YES-leg dollars; alert {price_cents}¢)")
+                print(f"[ORDER]   time_in_force: {order_payload['time_in_force']}")
+                print(f"[ORDER]   self_trade_prevention_type: {order_payload['self_trade_prevention_type']}")
                 
-                # CRITICAL FIX: All v2 API paths must include /trade-api/v2 prefix for signing
-                # This matches what Kalshi's server sees and expects in the signature
-                path = "/trade-api/v2/portfolio/orders"
+                # Create Order V2 — legacy POST /portfolio/orders returns HTTP 410.
+                # Sign the full path from root (same as GET /trade-api/v2/markets/…).
+                path = KALSHI_CREATE_ORDER_V2_PATH
                 
                 # CRITICAL: Serialize JSON ONCE and use for both signature AND request body
                 # This ensures 100% match between what we sign and what we send
@@ -3702,12 +3720,10 @@ class KalshiClient:
                             if fills_array:
                                 # Calculate actual fill from fills array (most accurate)
                                 for fill in fills_array:
-                                    fill_qty = fill.get('count', 0) or fill.get('fill_count', 0)
-                                    fill_price_cents = fill.get('price', 0) or fill.get('fill_price', 0)
-                                    if fill_price_cents < 1:  # Decimal format (0.45)
-                                        fill_price_cents = int(fill_price_cents * 100)
-                                    else:
-                                        fill_price_cents = int(fill_price_cents)
+                                    fill_qty = parse_order_count_fp(fill.get('count') or fill.get('fill_count'), 0)
+                                    fill_price_cents = parse_fill_price_cents(
+                                        fill.get('price', fill.get('fill_price'))
+                                    ) or 0
                                     actual_fill_count += fill_qty
                                     actual_fill_cost_cents += fill_price_cents * fill_qty
                                 
@@ -3715,19 +3731,32 @@ class KalshiClient:
                                     fill_count = actual_fill_count
                                     print(f"[ORDER] Using fills array: {actual_fill_count} contracts, ${actual_fill_cost_cents/100:.2f} total")
                                 else:
-                                    # Fallback to fill_count field
-                                    fill_count = order_data.get('fill_count') or order_data.get('filled', 0)
+                                    fill_count = parse_order_count_fp(
+                                        order_data.get('fill_count'),
+                                        parse_order_count_fp(order_data.get('filled'), 0),
+                                    )
                                     print(f"[ORDER] WARNING: fills array empty, using fill_count field: {fill_count}")
                             else:
-                                # No fills array, use fill_count field
-                                fill_count = order_data.get('fill_count') or order_data.get('filled', 0)
+                                fill_count = parse_order_count_fp(
+                                    order_data.get('fill_count'),
+                                    parse_order_count_fp(order_data.get('filled'), 0),
+                                )
                                 print(f"[ORDER] No fills array, using fill_count field: {fill_count}")
                             
-                            initial_count = order_data.get('initial_count') or order_data.get('count', final_count)
+                            remaining_count = parse_order_count_fp(order_data.get('remaining_count'), None)
+                            initial_count = parse_order_count_fp(order_data.get('initial_count'), None)
+                            if initial_count is None:
+                                initial_count = parse_order_count_fp(order_data.get('count'), None)
+                            if initial_count is None:
+                                if remaining_count is not None:
+                                    initial_count = fill_count + remaining_count
+                                else:
+                                    initial_count = float(final_count)
+                            if remaining_count is None:
+                                remaining_count = max(0.0, initial_count - fill_count)
                             # Determine status: 'executed' = fully filled, 'pending'/'queued' = not filled, 'partial' = partially filled
                             is_fully_filled = (fill_count >= initial_count)
                             status = order_data.get('status', 'executed' if is_fully_filled else 'pending')
-                            remaining_count = order_data.get('remaining_count', 0) or max(0, initial_count - fill_count)
                             queue_position = order_data.get('queue_position', None)
                             
                             # Log all fill-related fields for debugging
@@ -3838,15 +3867,15 @@ class KalshiClient:
                             executed_price_cents = None
                             total_cost_cents = None
                             
-                            # Try to get executed price directly
+                            # Try to get executed price directly (V2 average_fill_price is a dollar fp string)
                             if 'executed_price' in order_data:
-                                executed_price_cents = int(order_data['executed_price'])
+                                executed_price_cents = parse_fill_price_cents(order_data['executed_price'])
                             elif 'avg_fill_price' in order_data:
-                                executed_price_cents = int(order_data['avg_fill_price'] * 100) if order_data['avg_fill_price'] < 1 else int(order_data['avg_fill_price'])
+                                executed_price_cents = parse_fill_price_cents(order_data['avg_fill_price'])
                             elif 'fill_price' in order_data:
-                                executed_price_cents = int(order_data['fill_price'] * 100) if order_data['fill_price'] < 1 else int(order_data['fill_price'])
+                                executed_price_cents = parse_fill_price_cents(order_data['fill_price'])
                             elif 'average_fill_price' in order_data:
-                                executed_price_cents = int(order_data['average_fill_price'] * 100) if order_data['average_fill_price'] < 1 else int(order_data['average_fill_price'])
+                                executed_price_cents = parse_fill_price_cents(order_data['average_fill_price'])
                             
                             # Try to calculate from total cost
                             if executed_price_cents is None:
@@ -3904,12 +3933,12 @@ class KalshiClient:
                                 total_fill_cost = 0
                                 total_fill_count = 0
                                 for fill in fills:
-                                    fill_price = fill.get('price', 0) or fill.get('fill_price', 0)
-                                    fill_count_fill = fill.get('count', 0) or fill.get('fill_count', 0)
-                                    if fill_price < 1:  # Likely in decimal (0.48), convert to cents
-                                        fill_price_cents = int(fill_price * 100)
-                                    else:
-                                        fill_price_cents = int(fill_price)
+                                    fill_price_cents = parse_fill_price_cents(
+                                        fill.get('price', fill.get('fill_price'))
+                                    ) or 0
+                                    fill_count_fill = parse_order_count_fp(
+                                        fill.get('count') or fill.get('fill_count'), 0
+                                    )
                                     total_fill_cost += fill_price_cents * fill_count_fill
                                     total_fill_count += fill_count_fill
                                 
@@ -4142,12 +4171,11 @@ class KalshiClient:
         if not self.session:
             await self.init()
         
-        # Try both possible endpoint formats
-        # Format 1: /trade-api/v2/portfolio/orders/{order_id}/cancel
-        # Format 2: /trade-api/v2/portfolio/orders/{order_id} (DELETE method)
+        # Cancel Order V2 first; keep legacy mutation paths as fallback.
         paths_to_try = [
-            (f"/trade-api/v2/portfolio/orders/{order_id}/cancel", "POST"),
+            (KALSHI_CANCEL_ORDER_V2_PATH_TMPL.format(order_id=order_id), "DELETE"),
             (f"/trade-api/v2/portfolio/orders/{order_id}", "DELETE"),
+            (f"/trade-api/v2/portfolio/orders/{order_id}/cancel", "POST"),
         ]
         
         for path, method in paths_to_try:

@@ -5,6 +5,11 @@ Private-key credentials are required only to submit orders.
 
 Never place when ticker, side, line, event identity, or price is missing
 or mismatched. Away spreads must already be -hdp (home-centric).
+
+Create Order V2 mapping (see ``build_limit_order_payload``):
+POST /trade-api/v2/portfolio/events/orders. Buy YES → bid at yes dollars;
+buy NO → ask at 1 − no dollars. ``price``/``count`` are fp strings. Taker
+IOC. Legacy ``yes_price`` / ``POST /portfolio/orders`` is 410.
 """
 from __future__ import annotations
 
@@ -457,6 +462,12 @@ def public_get_headers(priv: Any, key_id: Any, signed_headers: Optional[Dict[str
     return {}
 
 
+# Official Create Order V2 (docs.kalshi.com/api-reference/orders/create-order-v2).
+# Servers are …/trade-api/v2; this repo signs and POSTs the full path from root.
+KALSHI_CREATE_ORDER_V2_PATH = "/trade-api/v2/portfolio/events/orders"
+KALSHI_CANCEL_ORDER_V2_PATH_TMPL = "/trade-api/v2/portfolio/events/orders/{order_id}"
+
+
 def validate_limit_price(price_cents: Any) -> Optional[int]:
     try:
         n = int(price_cents)
@@ -467,6 +478,28 @@ def validate_limit_price(price_cents: Any) -> Optional[int]:
     return n
 
 
+def dollars_fp_from_cents(price_cents: int) -> str:
+    """Fixed-point dollar string for Create Order V2 (e.g. 43 → ``\"0.4300\"``)."""
+    return f"{int(price_cents) / 100:.4f}"
+
+
+def count_fp(count: int) -> str:
+    """Fixed-point contract count for Create Order V2 (e.g. 10 → ``\"10.00\"``)."""
+    return f"{int(count):.2f}"
+
+
+def yes_leg_limit_cents(*, side: str, price_cents: int) -> int:
+    """YES-leg cents for V2 ``price``.
+
+    Create Order V2 quotes the YES book only: ``bid`` = buy YES, ``ask`` = sell YES
+    (economically buy NO at ``1 - price``). Buy YES at P¢ → bid P¢. Buy NO at P¢
+    → ask at (100 − P)¢.
+    """
+    if side == "yes":
+        return int(price_cents)
+    return 100 - int(price_cents)
+
+
 def build_limit_order_payload(
     *,
     ticker: Any,
@@ -474,8 +507,25 @@ def build_limit_order_payload(
     count: Any,
     price_cents: Any,
     post_only: bool = False,
+    client_order_id: Any = None,
+    expiration_time: Any = None,
 ) -> Tuple[Optional[Dict[str, Any]], List[str]]:
-    """Limit at the displayed actionable price. Never a market order."""
+    """Create Order V2 limit at the displayed actionable price. Never a market order.
+
+    Official request (https://docs.kalshi.com/api-reference/orders/create-order-v2):
+    ``POST /trade-api/v2/portfolio/events/orders`` with required
+    ``ticker``, ``side`` (``bid``|``ask``), ``count`` (fp string), ``price``
+    (dollar fp string), ``time_in_force``, ``self_trade_prevention_type``.
+
+    Mapping from this bot's yes/no + alert cents:
+
+    * buy YES @ P¢ → ``side=bid``, ``price="{P/100:.4f}"``
+    * buy NO  @ P¢ → ``side=ask``, ``price="{(100-P)/100:.4f}"`` (YES-leg quote)
+
+    Taker path uses ``immediate_or_cancel`` (limit-at-alert-cents, not market).
+    Post-only uses ``good_till_canceled`` and may set ``expiration_time``.
+    Fail-closed if ticker, side, count, or price is missing/invalid.
+    """
     reasons: List[str] = []
     parsed = parse_kalshi_ticker(ticker)
     if not parsed:
@@ -494,19 +544,30 @@ def build_limit_order_payload(
         reasons.append("missing_or_invalid_price")
     if reasons:
         return None, reasons
+    yes_cents = yes_leg_limit_cents(side=side_l, price_cents=px)
+    if validate_limit_price(yes_cents) is None:
+        return None, ["missing_or_invalid_price"]
+    book_side = "bid" if side_l == "yes" else "ask"
     payload: Dict[str, Any] = {
         "ticker": parsed.raw,
-        "side": side_l,
-        "action": "buy",
-        "count": n,
-        "type": "limit",
+        "side": book_side,
+        "count": count_fp(n),
+        "price": dollars_fp_from_cents(yes_cents),
+        "time_in_force": "good_till_canceled" if post_only else "immediate_or_cancel",
+        "self_trade_prevention_type": "taker_at_cross",
     }
-    if side_l == "yes":
-        payload["yes_price"] = px
-    else:
-        payload["no_price"] = px
+    cid = _clean(client_order_id)
+    if cid:
+        payload["client_order_id"] = cid
     if post_only:
         payload["post_only"] = True
+        if expiration_time is not None:
+            try:
+                exp = int(expiration_time)
+            except (TypeError, ValueError):
+                exp = 0
+            if exp > 0:
+                payload["expiration_time"] = exp
     return payload, []
 
 
