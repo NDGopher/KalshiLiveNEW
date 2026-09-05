@@ -3945,9 +3945,21 @@ class OddsEVMonitor:
             and is_executable_market_ticker(ticker, market_type_bb, line_val)
         )
         shape_allow = bool(shape["allow"])
-        # Product shape already passed: do not let display_only / strict_pass
-        # hide an executable Kalshi take. allow=true implies not display_only.
+        # Product shape already passed: do not let display_only / sister_required /
+        # strict_pass hide an executable Kalshi take. allow=true implies not display_only.
         if shape_allow and has_exec:
+            display_only = False
+        elif (
+            has_exec
+            and is_plus_print_ev(ev_percent, 2.0)
+            and float(ev_percent) <= 20.0 + 1e-9
+            and int(shape.get("same_sign_recs") or 0) >= 3
+            and "spread_label_mismatch" not in (shape.get("reasons") or [])
+            and "spread_hdp_mismatch" not in (shape.get("reasons") or [])
+            and take_canon.lower() == "kalshi"
+        ):
+            # EV≥2 + executable ticker/side + 3 same-LINE books: do not silently kill.
+            shape_allow = True
             display_only = False
 
         return {

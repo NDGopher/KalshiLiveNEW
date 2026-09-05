@@ -5549,8 +5549,8 @@ async def check_and_auto_bet(alert_id, alert_data, alert):
         else:
             autobet_ok = bool(alert_data.get("autobet_allow", False))
         if not autobet_ok:
-            # Product lock: Kalshi take, ≥3 same-sign two-way recs (3 Sharps Live).
-            # PLive never auto-bets. Switch ON does not override a False allow.
+            # Product lock: Kalshi take, ≥3 same-LINE comparison recs (3 Sharps Live).
+            # Odds + vs − is not a block. PLive never auto-bets. Switch ON does not override.
             _terminal_skip(
                 "autobet_allow=False",
                 "Product-shape autobet_allow is False (fail-closed; switch ON does not override)",
