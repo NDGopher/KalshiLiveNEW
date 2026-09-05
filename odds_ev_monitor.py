@@ -1417,6 +1417,14 @@ def _board_books_for_side(
             "decimal_pick": d_pick,
             "decimal_opp": d_opp,
         }
+        rec_line = (
+            side_signed_line(row, bet_side)
+            if _market_is_spread(mname)
+            else (total_line_value(row) if _market_is_total(mname) else None)
+        )
+        if rec_line is not None:
+            blob["side_hdp"] = rec_line
+            blob["line"] = rec_line
         ts = row.get("updated_at") or row.get("book_updated_at")
         if ts is not None:
             blob["book_updated_at"] = ts
@@ -3546,16 +3554,24 @@ class OddsEVMonitor:
                         rec_ts = (odds_doc.get("book_updated_at") or {}).get(sn)
                     if not _rec_quote_in_power(rec_ts, clock_ev):
                         continue
-                    panels.append((d_pick, d_opp, sn))
-                panel_books: List[Dict[str, Any]] = [
-                    {
+                    rec_line = (
+                        side_signed_line(row, bet_side)
+                        if _market_is_spread(mname)
+                        else (total_line_value(row) if _market_is_total(mname) else None)
+                    )
+                    panels.append((d_pick, d_opp, sn, rec_line))
+                panel_books: List[Dict[str, Any]] = []
+                for d_pick, d_opp, sn, rec_line in panels:
+                    blob: Dict[str, Any] = {
                         "name": sn,
                         "american": decimal_to_american(d_pick),
                         "decimal_pick": d_pick,
                         "decimal_opp": d_opp,
                     }
-                    for d_pick, d_opp, sn in panels
-                ]
+                    if rec_line is not None:
+                        blob["side_hdp"] = rec_line
+                        blob["line"] = rec_line
+                    panel_books.append(blob)
                 take_american = decimal_to_american(k_dec)
                 # Baseline = hold/freshness/two-way only (no take-junk screen).
                 # A flipped/stale take can wipe every real sharp; that is a bad TAKE,
@@ -3796,6 +3812,19 @@ class OddsEVMonitor:
             return None
         plus_ok = is_plus_print_ev(ev_percent)
         shape_books = list(panel_books or [])
+        seen_shape = {
+            str(b.get("name") or "").strip().lower()
+            for b in shape_books
+            if isinstance(b, dict)
+        }
+        for blob in board_books or []:
+            if not isinstance(blob, dict):
+                continue
+            nm = str(blob.get("name") or "").strip().lower()
+            if not nm or nm in seen_shape:
+                continue
+            seen_shape.add(nm)
+            shape_books.append(blob)
         if bks and isinstance(bks, dict):
             pl_mk = _find_market_block(_markets_list_for_book(bks, "PLive"), mname)
             pl_row = (
@@ -3815,7 +3844,11 @@ class OddsEVMonitor:
                             "decimal_opp": d_pl_opp,
                         }
                     )
-        actual_h = side_signed_line(row_for_pick, bet_side) if _market_is_spread(mname) else None
+        actual_h = (
+            side_signed_line(row_for_pick, bet_side)
+            if _market_is_spread(mname)
+            else (total_line_value(row_for_pick) if _market_is_total(mname) else None)
+        )
         shape = autobet_product_shape(
             shape_books,
             kalshi_am,
@@ -3944,8 +3977,9 @@ class OddsEVMonitor:
             and is_executable_market_ticker(ticker, market_type_bb, line_val)
         )
         shape_allow = bool(shape["allow"])
-        # Product shape already passed: do not let display_only / strict_pass
-        # hide an executable Kalshi take. allow=true implies not display_only.
+        # Product shape already passed: do not let display_only / sister_required
+        # / strict_pass hide an executable Kalshi take. Odds-sign disagreement
+        # is not an allow reject. allow=true implies not display_only.
         if shape_allow and has_exec:
             display_only = False
 

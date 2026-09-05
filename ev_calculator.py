@@ -54,8 +54,9 @@ MEDIAN_GATE_TOL = 0.005
 TIGHT_CLUSTER_BAND = 0.04
 TIGHT_CLUSTER_EV_ABS = 2.0
 # Auto-bet product lock (switch stays OFF). Kalshi All Sports (3 Sharps Live):
-# ≥3 tight same-sign two-way recs, junk/Poly out, PLive never a take.
-# Kalshi need not be best. EV ≤20% is fine; >20 is ev_teens.
+# ≥3 comparison books on the same LINE (not American-odds sign). Junk/Poly
+# out of the count when far-implied. PLive never a take. Kalshi need not
+# be best. EV ≤20% is fine; >20 is ev_teens.
 # Fail-closed ticker/line/side stays outside this function.
 AUTOBET_MIN_SAME_SIGN_RECS = 3
 AUTOBET_TIGHT_PACK_CENTS = 0.15
@@ -209,15 +210,51 @@ def two_way_power_fair(pick_american: int, opp_american: int) -> Optional[float]
     return float(fair[0])
 
 
+def _book_side_line(book: Dict[str, Any]) -> Optional[float]:
+    """Spread/total strike on a rec row. ML books have no line."""
+    for key in ("side_hdp", "line", "hdp", "max"):
+        raw = book.get(key)
+        if raw is None or raw == "":
+            continue
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _same_line_vs_take(book: Dict[str, Any], take_line: Optional[float]) -> bool:
+    """same_sign is LINE identity, never American odds sign.
+
+    Take +110 vs pack −107/−110/−112 is the same moneyline. Take −7.5 vs
+    a rec on +7.5 is a real line flip and must not count.
+    """
+    if take_line is None:
+        return True
+    book_line = _book_side_line(book)
+    if book_line is None:
+        return True
+    return abs(float(book_line) - float(take_line)) <= 1e-6
+
+
 def _tight_same_sign_vs_take(book_american: int, take_american: int) -> bool:
-    """Same-sign (or pick'em) and within the auto-bet pack window. Not a real flip."""
-    if is_real_sign_flip(int(book_american), int(take_american)):
-        return False
+    """On-market comparison rec. Odds-sign disagreement is not a reject.
+
+    Far implied (> AUTOBET_TIGHT_PACK_CENTS) is still out — way-off junk,
+    not juice. American plus vs minus around the same line is +EV.
+    """
     bp = implied_prob_from_american(int(book_american))
     kp = implied_prob_from_american(int(take_american))
     if bp is None or kp is None:
         return False
     return abs(bp - kp) <= AUTOBET_TIGHT_PACK_CENTS + 1e-12
+
+
+def _allow_blocking_reasons(reasons: List[str]) -> List[str]:
+    """display_only never fails allow. sister_required is omitted earlier when
+    the card already has line consensus and plus EV.
+    """
+    return [r for r in reasons if r != "display_only"]
 
 
 def autobet_product_shape(
@@ -232,13 +269,16 @@ def autobet_product_shape(
 ) -> Dict[str, Any]:
     """Allowlist for later auto-bet. Does not flip the live switch.
 
-    3 Sharps Live: Kalshi take, ≥3 tight same-sign two-way recs, junk/Poly out.
-    PLive is never a take. Kalshi need not be best. EV ≤20% is fine.
-    Plus-only (missing sisters) and a wrong away hdp fail.
+    3 Sharps Live: Kalshi take, ≥3 comparison books on the same LINE.
+    American-odds sign (+110 vs −110 pack) never kills allow. PLive is
+    never a take. Kalshi need not be best. EV ≤20% is fine.
+    sister_required / display_only stay informational when line consensus
+    and EV already pass. A wrong away hdp still fails.
     """
     reasons: List[str] = []
     if _book_name_key(take_book or "Kalshi") != "kalshi":
         reasons.append("take_not_kalshi")
+    take_line = actual_side_hdp if actual_side_hdp is not None else painted_side_hdp
     recs: List[Dict[str, Any]] = []
     for raw in books or []:
         if not isinstance(raw, dict):
@@ -255,18 +295,35 @@ def autobet_product_shape(
             continue
         if is_polymarket_book(raw.get("name")) and is_junk_vs_kalshi(am, int(take_american)):
             continue
+        if not _same_line_vs_take(raw, take_line):
+            continue
         if _tight_same_sign_vs_take(am, int(take_american)):
             recs.append(raw)
     if len(recs) < AUTOBET_MIN_SAME_SIGN_RECS:
         reasons.append("same_sign_recs")
     sisters = sum(1 for b in recs if float(b.get("decimal_opp") or 0) > 1.0)
     have_sister_field = any(b.get("decimal_opp") is not None for b in recs)
-    if have_sister_field and sisters < AUTOBET_MIN_SAME_SIGN_RECS:
-        reasons.append("sister_required")
-    if plus_alert is False:
-        reasons.append("no_plus")
+    line_consensus = len(recs) >= AUTOBET_MIN_SAME_SIGN_RECS
+    ev: Optional[float] = None
     if ev_percent is not None:
         ev = float(ev_percent)
+    # POWER/paint may zero EV on an odds-sign flip. Allow uses the same-line
+    # two-way pack so +110 vs −110 juice still grades as plus.
+    if (ev is None or ev <= 0) and sisters >= AUTOBET_MIN_SAME_SIGN_RECS:
+        fair = power_average_fair_prob(recs, take_american=int(take_american))
+        if fair is not None:
+            computed = ev_percent_vs_take_american(fair, int(take_american))
+            if computed is not None and float(computed) > 0:
+                ev = float(computed)
+    ev_ok = ev is not None and ev > 0 and ev <= AUTOBET_MAX_EV_PCT + 1e-12
+    # Missing sisters are informational when 3 same-line recs already meet EV.
+    # They still fail allow when there is no line consensus or no plus EV.
+    if have_sister_field and sisters < AUTOBET_MIN_SAME_SIGN_RECS:
+        if not (line_consensus and ev_ok):
+            reasons.append("sister_required")
+    if plus_alert is False and not (line_consensus and ev_ok):
+        reasons.append("no_plus")
+    if ev is not None:
         if ev <= 0:
             reasons.append("no_plus")
         elif ev > AUTOBET_MAX_EV_PCT:
@@ -285,8 +342,9 @@ def autobet_product_shape(
         if r not in seen:
             seen.add(r)
             uniq.append(r)
+    blocking = _allow_blocking_reasons(uniq)
     return {
-        "allow": not uniq,
+        "allow": not blocking,
         "reasons": uniq,
         "same_sign_recs": len(recs),
         "sisters": sisters,
@@ -961,12 +1019,17 @@ def evaluate_sharp_panel_ev(
         plus_alert = False
         ev_out = min(ev_out, 0.0)
         reasons.extend(hdp_gate["reasons"])
+    # Allow grades juice vs the same-line pack. POWER/paint may zero the
+    # printed EV on an odds-sign flip; that must not fail the allow gate.
+    allow_ev = ev_out
+    if (allow_ev <= 0 or not plus_alert) and ev > 0:
+        allow_ev = float(ev)
     shape = autobet_product_shape(
         books,
         int(kalshi_american),
         take_book=take_book,
-        ev_percent=ev_out,
-        plus_alert=plus_alert,
+        ev_percent=allow_ev,
+        plus_alert=True if allow_ev > 0 else plus_alert,
         painted_side_hdp=painted_side_hdp,
         actual_side_hdp=kalshi_side_hdp,
     )
